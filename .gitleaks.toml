@@ -1,0 +1,13 @@
+title = "ALMS Server secret scanning"
+
+[extend]
+useDefault = true
+
+# This exact public prose phrase in a comment is not a credential.
+# Keep the rule and path constraints together so other findings remain visible.
+[[allowlists]]
+description = "Authentication cache documentation phrase"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''(?:^|/)src/auth-inflight\.ts$''']
+regexes = ['''^completion/expiry$''']

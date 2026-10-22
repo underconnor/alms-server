@@ -1,0 +1,58 @@
+name: Backend checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: alms
+          POSTGRES_PASSWORD: local-ci-only
+          POSTGRES_DB: alms_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U alms -d alms_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm run test:integration
+        env:
+          TEST_DATABASE_URL: postgres://alms:local-ci-only@localhost:5432/alms_test
+      - name: Validate resolved API and worker Compose isolation
+        env:
+          POSTGRES_PASSWORD: local-ci-only
+        run: |
+          docker compose --env-file /dev/null config --format json > "$RUNNER_TEMP/alms-compose.json"
+          node --input-type=commonjs - "$RUNNER_TEMP/alms-compose.json" <<'NODE'
+          const assert = require('node:assert/strict');
+          const { readFileSync } = require('node:fs');
+          const { api, worker } = JSON.parse(readFileSync(process.argv[2], 'utf8')).services;
+          for (const service of [api, worker]) {
+            assert.deepEqual(service.tmpfs, ['/tmp:rw,nosuid,nodev,size=256m']);
+            assert.equal(Number(service.cpus), 2);
+            assert.equal(Number(service.mem_limit), 2 * 1024 ** 3);
+            assert.equal(service.pids_limit, 256);
+            assert.equal(Number(service.shm_size), 256 * 1024 ** 2);
+            assert.equal(service.read_only, true);
+            assert.deepEqual(service.cap_drop, ['ALL']);
+            assert.deepEqual(service.security_opt, ['no-new-privileges:true', 'seccomp=./scripts/playback-seccomp.json']);
+            assert.equal(service.environment.SSU_PLAYBACK_ENABLED, 'false');
+          }
+          assert.equal(api.build.target, 'syllabus-api');
+          assert.equal(worker.build.target, 'playback');
+          assert.equal(worker.ports, undefined);
+          assert.equal(worker.stop_grace_period, '40s');
+          console.log('API and worker Compose isolation passed');
+          NODE
+      - run: docker build -t alms-backend:ci .

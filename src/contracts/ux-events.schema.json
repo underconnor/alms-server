@@ -1,0 +1,760 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:alms:ux-events:1",
+  "title": "ALMS manual UX event contract — required durable collection",
+  "description": "DEC-29: required manual behavior events, stored durably by Backend with server-issued analytics identity and an optional PostHog Cloud EU delivery outbox. Only the allowlisted page/category/button/duration/normalized-error properties are accepted. No school content, credentials, URLs, IP, replay, automatic DOM capture or person profiles.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_id",
+    "analytics_id",
+    "session_id",
+    "occurred_minute",
+    "session_sequence",
+    "ui_version",
+    "screen",
+    "event_name",
+    "properties"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1"
+    },
+    "event_id": {
+      "$ref": "#/$defs/randomUuid"
+    },
+    "analytics_id": {
+      "$ref": "#/$defs/randomUuid"
+    },
+    "session_id": {
+      "$ref": "#/$defs/randomUuid"
+    },
+    "occurred_minute": {
+      "$ref": "#/$defs/minuteTime"
+    },
+    "session_sequence": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100000
+    },
+    "ui_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+      "description": "Public release label only; no user, school, token, URL or arbitrary content."
+    },
+    "screen": {
+      "$ref": "#/$defs/screen"
+    },
+    "event_name": {
+      "enum": [
+        "page_view",
+        "category_select",
+        "button_click",
+        "interaction_duration",
+        "normalized_error"
+      ]
+    },
+    "properties": {
+      "type": "object"
+    }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "event_name": {
+          "const": "page_view"
+        },
+        "properties": {
+          "$ref": "#/$defs/pageProperties"
+        }
+      }
+    },
+    {
+      "properties": {
+        "event_name": {
+          "const": "category_select"
+        },
+        "properties": {
+          "$ref": "#/$defs/categoryProperties"
+        },
+        "screen": {
+          "const": "course"
+        }
+      }
+    },
+    {
+      "properties": {
+        "event_name": {
+          "const": "button_click"
+        },
+        "properties": {
+          "$ref": "#/$defs/buttonProperties"
+        }
+      }
+    },
+    {
+      "properties": {
+        "event_name": {
+          "const": "interaction_duration"
+        },
+        "properties": {
+          "$ref": "#/$defs/durationProperties"
+        }
+      }
+    },
+    {
+      "properties": {
+        "event_name": {
+          "const": "normalized_error"
+        },
+        "properties": {
+          "$ref": "#/$defs/errorProperties"
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "randomUuid": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "description": "Independently random analytics-only UUID v4. No school/student/user IDs, hashes, cookies or tokens. Shape checks cannot prove independent generation."
+    },
+    "minuteTime": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:00Z$",
+      "description": "UTC rounded down to one minute; no school deadline."
+    },
+    "screen": {
+      "enum": [
+        "login",
+        "dashboard",
+        "courses",
+        "course",
+        "attendance",
+        "tasks",
+        "settings"
+      ]
+    },
+    "courseTab": {
+      "enum": [
+        "weeks",
+        "syllabus",
+        "materials",
+        "notices",
+        "assignments",
+        "quizzes",
+        "attendance"
+      ]
+    },
+    "activityType": {
+      "enum": [
+        "all",
+        "video",
+        "material",
+        "assignment",
+        "quiz"
+      ]
+    },
+    "operation": {
+      "enum": [
+        "load_dashboard",
+        "load_course",
+        "load_tasks",
+        "load_attendance",
+        "navigate_course",
+        "switch_category",
+        "open_dialog",
+        "open_school_link",
+        "control_job",
+        "load_calendar",
+        "load_learning_completion",
+        "save_learning_completion"
+      ]
+    },
+    "pageProperties": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {}
+    },
+    "categoryProperties": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "group",
+        "previous",
+        "selected",
+        "selection_source",
+        "interaction"
+      ],
+      "properties": {
+        "group": {
+          "enum": [
+            "course_tab",
+            "activity_type"
+          ]
+        },
+        "previous": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "selected": {
+          "type": "string"
+        },
+        "selection_source": {
+          "enum": [
+            "tab_click",
+            "filter_click",
+            "context_link"
+          ]
+        },
+        "interaction": {
+          "const": "user_explicit"
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "group": {
+              "const": "course_tab"
+            },
+            "previous": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/courseTab"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "selected": {
+              "$ref": "#/$defs/courseTab"
+            },
+            "selection_source": {
+              "enum": [
+                "tab_click",
+                "context_link"
+              ]
+            }
+          }
+        },
+        {
+          "properties": {
+            "group": {
+              "const": "activity_type"
+            },
+            "previous": {
+              "$ref": "#/$defs/activityType"
+            },
+            "selected": {
+              "$ref": "#/$defs/activityType"
+            },
+            "selection_source": {
+              "const": "filter_click"
+            }
+          }
+        }
+      ]
+    },
+    "buttonProperties": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action",
+        "surface"
+      ],
+      "properties": {
+        "action": {
+          "enum": [
+            "school_login",
+            "open_course",
+            "select_course_year",
+            "select_course_term",
+            "view_material",
+            "open_assignment",
+            "open_quiz",
+            "open_notice",
+            "open_attendance_detail",
+            "open_school_source",
+            "select_lecture",
+            "run_now",
+            "schedule",
+            "pause",
+            "resume",
+            "cancel",
+            "retry",
+            "show_task_list",
+            "show_calendar",
+            "calendar_previous_month",
+            "calendar_next_month",
+            "calendar_today",
+            "calendar_select_course",
+            "calendar_select_day",
+            "open_calendar_entry",
+            "set_learning_complete",
+            "set_learning_incomplete",
+            "reset_learning_completion"
+          ]
+        },
+        "surface": {
+          "enum": [
+            "login",
+            "navigation",
+            "dashboard",
+            "course_header",
+            "course_row",
+            "course_toolbar",
+            "lecture_drawer",
+            "tasks_detail",
+            "attendance_detail"
+          ]
+        },
+        "source_destination": {
+          "enum": [
+            "verified_target",
+            "mypage_fallback"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "const": "open_school_source"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "source_destination"
+            ]
+          },
+          "else": {
+            "properties": {
+              "source_destination": false
+            }
+          }
+        }
+      ],
+      "description": "A school source button records only verified target vs normal mypage fallback, without any URL. A fallback is not an error."
+    },
+    "durationProperties": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation",
+        "duration_ms",
+        "outcome"
+      ],
+      "properties": {
+        "operation": {
+          "$ref": "#/$defs/uiTimedOperation"
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 300000,
+          "multipleOf": 100
+        },
+        "outcome": {
+          "enum": [
+            "ui_shown",
+            "ui_failed",
+            "abandoned"
+          ]
+        }
+      },
+      "description": "UI response latency from explicit start to UI shown, failure shown, or abandonment; control_job ends when job acceptance is displayed, never at school playback/submission/attendance completion. Use a monotonic clock; discard hidden-tab/over-5-minute samples. New-tab school page load time is not observed and open_school_link is excluded."
+    },
+    "errorProperties": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "operation",
+        "retryable"
+      ],
+      "properties": {
+        "code": {
+          "enum": [
+            "auth_required",
+            "network_unavailable",
+            "school_fetch_failed",
+            "unsupported",
+            "source_missing",
+            "unknown"
+          ]
+        },
+        "operation": {
+          "$ref": "#/$defs/operation"
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      },
+      "description": "Normalized code only. source_missing is a real failure to offer both a target and fallback destination, not the expected nullable sourceUrl/mypage fallback case. No raw message, stack, headers, URL or response."
+    },
+    "posthogEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event",
+        "distinct_id",
+        "timestamp",
+        "properties"
+      ],
+      "properties": {
+        "event": {
+          "enum": [
+            "alms_page_view",
+            "alms_category_select",
+            "alms_button_click",
+            "alms_interaction_duration",
+            "alms_normalized_error"
+          ]
+        },
+        "distinct_id": {
+          "$ref": "#/$defs/randomUuid"
+        },
+        "timestamp": {
+          "$ref": "#/$defs/minuteTime"
+        },
+        "properties": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema_version",
+            "event_id",
+            "session_id",
+            "session_sequence",
+            "ui_version",
+            "screen",
+            "$process_person_profile",
+            "$geoip_disable",
+            "details"
+          ],
+          "properties": {
+            "schema_version": {
+              "const": "1"
+            },
+            "event_id": {
+              "$ref": "#/$defs/randomUuid"
+            },
+            "session_id": {
+              "$ref": "#/$defs/randomUuid"
+            },
+            "session_sequence": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 100000
+            },
+            "ui_version": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+              "description": "Public release label only; no user, school, token, URL or arbitrary content."
+            },
+            "screen": {
+              "$ref": "#/$defs/screen"
+            },
+            "$process_person_profile": {
+              "const": false
+            },
+            "$geoip_disable": {
+              "const": true
+            },
+            "details": {
+              "type": "object"
+            },
+            "client_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+              "description": "Server-owned registered frontend identifier from the authenticated ALMS session. Never accepted in an event body."
+            }
+          }
+        }
+      },
+      "description": "Logical PostHog event projection. Backend validates and stores the allowlisted event before acknowledgement. Transport adds only the configured project token and a stable server-generated event UUID for retries. URL/referrer/IP/browser/person/header/raw-exception/GeoIP auto-properties are excluded. Cloud receipt requires separate operational verification.",
+      "oneOf": [
+        {
+          "properties": {
+            "event": {
+              "const": "alms_page_view"
+            },
+            "properties": {
+              "properties": {
+                "details": {
+                  "$ref": "#/$defs/pageProperties"
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "event": {
+              "const": "alms_category_select"
+            },
+            "properties": {
+              "properties": {
+                "details": {
+                  "$ref": "#/$defs/categoryProperties"
+                },
+                "screen": {
+                  "const": "course"
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "event": {
+              "const": "alms_button_click"
+            },
+            "properties": {
+              "properties": {
+                "details": {
+                  "$ref": "#/$defs/buttonProperties"
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "event": {
+              "const": "alms_interaction_duration"
+            },
+            "properties": {
+              "properties": {
+                "details": {
+                  "$ref": "#/$defs/durationProperties"
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "event": {
+              "const": "alms_normalized_error"
+            },
+            "properties": {
+              "properties": {
+                "details": {
+                  "$ref": "#/$defs/errorProperties"
+                }
+              }
+            }
+          }
+        }
+      ],
+      "examples": [
+        {
+          "event": "alms_page_view",
+          "distinct_id": "20000000-0000-4000-8000-000000000001",
+          "timestamp": "2026-09-30T09:00:00Z",
+          "properties": {
+            "schema_version": "1",
+            "event_id": "10000000-0000-4000-8000-000000000001",
+            "session_id": "30000000-0000-4000-8000-000000000001",
+            "session_sequence": 0,
+            "ui_version": "wireframe-v5",
+            "screen": "dashboard",
+            "$process_person_profile": false,
+            "$geoip_disable": true,
+            "details": {}
+          }
+        },
+        {
+          "event": "alms_category_select",
+          "distinct_id": "20000000-0000-4000-8000-000000000001",
+          "timestamp": "2026-09-30T09:00:00Z",
+          "properties": {
+            "schema_version": "1",
+            "event_id": "10000000-0000-4000-8000-000000000002",
+            "session_id": "30000000-0000-4000-8000-000000000001",
+            "session_sequence": 1,
+            "ui_version": "wireframe-v5",
+            "screen": "course",
+            "$process_person_profile": false,
+            "$geoip_disable": true,
+            "details": {
+              "group": "course_tab",
+              "previous": null,
+              "selected": "assignments",
+              "selection_source": "context_link",
+              "interaction": "user_explicit"
+            }
+          }
+        },
+        {
+          "event": "alms_button_click",
+          "distinct_id": "20000000-0000-4000-8000-000000000001",
+          "timestamp": "2026-09-30T09:00:00Z",
+          "properties": {
+            "schema_version": "1",
+            "event_id": "10000000-0000-4000-8000-000000000003",
+            "session_id": "30000000-0000-4000-8000-000000000001",
+            "session_sequence": 2,
+            "ui_version": "wireframe-v5",
+            "screen": "course",
+            "$process_person_profile": false,
+            "$geoip_disable": true,
+            "details": {
+              "action": "run_now",
+              "surface": "course_toolbar"
+            }
+          }
+        },
+        {
+          "event": "alms_interaction_duration",
+          "distinct_id": "20000000-0000-4000-8000-000000000001",
+          "timestamp": "2026-09-30T09:00:00Z",
+          "properties": {
+            "schema_version": "1",
+            "event_id": "10000000-0000-4000-8000-000000000004",
+            "session_id": "30000000-0000-4000-8000-000000000001",
+            "session_sequence": 3,
+            "ui_version": "wireframe-v5",
+            "screen": "course",
+            "$process_person_profile": false,
+            "$geoip_disable": true,
+            "details": {
+              "operation": "navigate_course",
+              "duration_ms": 1200,
+              "outcome": "ui_shown"
+            }
+          }
+        },
+        {
+          "event": "alms_normalized_error",
+          "distinct_id": "20000000-0000-4000-8000-000000000001",
+          "timestamp": "2026-09-30T09:00:00Z",
+          "properties": {
+            "schema_version": "1",
+            "event_id": "10000000-0000-4000-8000-000000000005",
+            "session_id": "30000000-0000-4000-8000-000000000001",
+            "session_sequence": 4,
+            "ui_version": "wireframe-v5",
+            "screen": "attendance",
+            "$process_person_profile": false,
+            "$geoip_disable": true,
+            "details": {
+              "code": "school_fetch_failed",
+              "operation": "load_attendance",
+              "retryable": true
+            }
+          }
+        }
+      ]
+    },
+    "uiTimedOperation": {
+      "enum": [
+        "load_dashboard",
+        "load_course",
+        "load_tasks",
+        "load_attendance",
+        "navigate_course",
+        "switch_category",
+        "open_dialog",
+        "control_job",
+        "load_calendar",
+        "load_learning_completion",
+        "save_learning_completion"
+      ]
+    }
+  },
+  "examples": [
+    {
+      "schema_version": "1",
+      "analytics_id": "20000000-0000-4000-8000-000000000001",
+      "session_id": "30000000-0000-4000-8000-000000000001",
+      "occurred_minute": "2026-09-30T09:00:00Z",
+      "ui_version": "wireframe-v5",
+      "event_id": "10000000-0000-4000-8000-000000000001",
+      "session_sequence": 0,
+      "event_name": "page_view",
+      "screen": "dashboard",
+      "properties": {}
+    },
+    {
+      "schema_version": "1",
+      "analytics_id": "20000000-0000-4000-8000-000000000001",
+      "session_id": "30000000-0000-4000-8000-000000000001",
+      "occurred_minute": "2026-09-30T09:00:00Z",
+      "ui_version": "wireframe-v5",
+      "event_id": "10000000-0000-4000-8000-000000000002",
+      "session_sequence": 1,
+      "event_name": "category_select",
+      "screen": "course",
+      "properties": {
+        "group": "course_tab",
+        "previous": null,
+        "selected": "assignments",
+        "selection_source": "context_link",
+        "interaction": "user_explicit"
+      }
+    },
+    {
+      "schema_version": "1",
+      "analytics_id": "20000000-0000-4000-8000-000000000001",
+      "session_id": "30000000-0000-4000-8000-000000000001",
+      "occurred_minute": "2026-09-30T09:00:00Z",
+      "ui_version": "wireframe-v5",
+      "event_id": "10000000-0000-4000-8000-000000000003",
+      "session_sequence": 2,
+      "event_name": "button_click",
+      "screen": "course",
+      "properties": {
+        "action": "run_now",
+        "surface": "course_toolbar"
+      }
+    },
+    {
+      "schema_version": "1",
+      "analytics_id": "20000000-0000-4000-8000-000000000001",
+      "session_id": "30000000-0000-4000-8000-000000000001",
+      "occurred_minute": "2026-09-30T09:00:00Z",
+      "ui_version": "wireframe-v5",
+      "event_id": "10000000-0000-4000-8000-000000000004",
+      "session_sequence": 3,
+      "event_name": "interaction_duration",
+      "screen": "course",
+      "properties": {
+        "operation": "navigate_course",
+        "duration_ms": 1200,
+        "outcome": "ui_shown"
+      }
+    },
+    {
+      "schema_version": "1",
+      "analytics_id": "20000000-0000-4000-8000-000000000001",
+      "session_id": "30000000-0000-4000-8000-000000000001",
+      "occurred_minute": "2026-09-30T09:00:00Z",
+      "ui_version": "wireframe-v5",
+      "event_id": "10000000-0000-4000-8000-000000000005",
+      "session_sequence": 4,
+      "event_name": "normalized_error",
+      "screen": "attendance",
+      "properties": {
+        "code": "school_fetch_failed",
+        "operation": "load_attendance",
+        "retryable": true
+      }
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+# Build scripts/Dockerfile.controlled-playback-qa first; this fixture image is QA-only.
+ARG CONTROLLED_QA_IMAGE=alms-controlled-playback-qa:local
+FROM node:24-bookworm-slim AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+COPY vendor ./vendor
+RUN npm ci
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build && npm prune --omit=dev
+FROM ${CONTROLLED_QA_IMAGE}
+WORKDIR /app
+COPY --from=build --chown=node:node /app/dist ./dist
+COPY --from=build --chown=node:node /app/node_modules ./node_modules
+COPY --chown=node:node package.json ./
+COPY --chown=node:node migrations ./migrations
+COPY --chown=node:node scripts/worker-playback-integration-qa.mjs ./scripts/
+USER node
+CMD ["node", "scripts/worker-playback-integration-qa.mjs"]

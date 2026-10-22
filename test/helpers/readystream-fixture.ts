@@ -1,0 +1,7 @@
+// Synthetic single-story UPF only; no captured school content.
+export function readystreamXml(content = 'synthetic-video', duration = 600, filename = 'synthetic_video(01)-part_1.mp4') {
+  const root = `https://commons.ssu.ac.kr/contents31/ssu1000001/${content}/contents/web_files`;
+  const template = `https://ssu-toast.commonscdn.com/contents31/ssu1000001/${content}/contents/media_files/[MEDIA_FILE]`;
+  const pseudo = `https://commons.ssu.ac.kr/contents31_pseudo/ssu1000001/${content}/contents/media_files/[MEDIA_FILE]`;
+  return `<content version="1.0"><content_playing_info version="1.0"><content_id>${content}</content_id><content_type>upf</content_type><content_uri>${root}</content_uri><content_duration>${duration}</content_duration><content_thumbnail_uri>https://unused.invalid/thumbnail.png</content_thumbnail_uri><story_list><story id="story-1"><story_type>video1</story_type><story_duration>${duration}</story_duration><main_media_list default_media_id="video-1"><main_media media_id="video-1">${filename}</main_media></main_media_list></story></story_list></content_playing_info><content_metadata version="1.0"><title>Synthetic stream</title></content_metadata><service_root version="1.0"><web>${root}</web><media type="default"><media_uri method="progressive" target="all">${template}</media_uri><media_uri method="pseudo" target="flash-fallback">${pseudo}</media_uri><media_uri method="progressive" target="mobile">${template}</media_uri></media></service_root></content>`;
+}

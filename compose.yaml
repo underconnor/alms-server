@@ -1,0 +1,92 @@
+name: alms
+x-app: &app
+  build: .
+  image: alms-backend:${APP_VERSION:-local}
+  init: true
+  restart: unless-stopped
+  environment: &environment
+    NODE_ENV: production
+    DATABASE_URL: postgres://alms:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/alms
+    HOST: 0.0.0.0
+    PORT: 4300
+    COOKIE_SECURE: 'true'
+    SSU_AUTH_ENABLED: ${SSU_AUTH_ENABLED:-false}
+    SSU_READ_ENABLED: ${SSU_READ_ENABLED:-false}
+    SSU_PLAYBACK_ENABLED: ${SSU_PLAYBACK_ENABLED:-false}
+    SSU_SAINT_READ_ENABLED: ${SSU_SAINT_READ_ENABLED:-false}
+    ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-https://lms.flyjung.kr}
+    APP_VERSION: ${APP_VERSION:-0.1.0}
+    GIT_COMMIT: ${GIT_COMMIT:-unknown}
+    API_PUBLIC_ORIGIN: ${API_PUBLIC_ORIGIN:-https://api-lms.flyjung.kr}
+    FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-https://lms.flyjung.kr}
+    FRONTEND_CLIENTS_JSON: ${FRONTEND_CLIENTS_JSON:-}
+    SESSION_ENCRYPTION_KEY: ${SESSION_ENCRYPTION_KEY:-}
+    POSTHOG_PROJECT_KEY: ${POSTHOG_PROJECT_KEY:-}
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+  read_only: true
+  tmpfs: [/tmp]
+  networks: [alms]
+services:
+  postgres:
+    image: postgres:17-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: alms
+      POSTGRES_DB: alms
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes: [postgres-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U alms -d alms']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [alms]
+  migrate:
+    <<: *app
+    restart: 'no'
+    command: [node,dist/migrate.js]
+    depends_on:
+      postgres: {condition: service_healthy}
+  api:
+    <<: *app
+    environment:
+      <<: *environment
+      MCP_ENABLED: ${MCP_ENABLED:-false}
+      MCP_SIGNING_JWKS_JSON: ${MCP_SIGNING_JWKS_JSON:-}
+      MCP_COOKIE_KEYS_JSON: ${MCP_COOKIE_KEYS_JSON:-}
+    build: { context: ., dockerfile: Dockerfile.playback, target: syllabus-api }
+    image: alms-backend-api:${APP_VERSION:-local}
+    cpus: 2
+    mem_limit: 2g
+    pids_limit: 256
+    shm_size: 256m
+    tmpfs: ['/tmp:rw,nosuid,nodev,size=256m']
+    security_opt: [no-new-privileges:true, 'seccomp=./scripts/playback-seccomp.json']
+    ports: ['127.0.0.1:4300:4300']
+    command: [node,dist/server.js]
+    healthcheck:
+      test: [CMD,node,-e,"fetch('http://127.0.0.1:4300/readyz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+  worker:
+    <<: *app
+    build: { context: ., dockerfile: Dockerfile.playback, target: playback }
+    image: alms-backend-worker:${APP_VERSION:-local}
+    cpus: 2
+    mem_limit: 2g
+    pids_limit: 256
+    shm_size: 256m
+    tmpfs: ['/tmp:rw,nosuid,nodev,size=256m']
+    security_opt: [no-new-privileges:true, 'seccomp=./scripts/playback-seccomp.json']
+    command: [node,dist/worker-main.js]
+    stop_grace_period: 40s
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+volumes:
+  postgres-data:
+networks:
+  alms:

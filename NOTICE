@@ -1,0 +1,23 @@
+ALMS Server
+
+Original ALMS Server code is licensed under the MIT License in LICENSE.
+Third-party components retain their own licenses and notices.
+
+1. Playwright seccomp profile
+   scripts/playback-seccomp.json is a modified version of
+   microsoft/playwright utils/docker/seccomp_profile.json at version 1.63.0,
+   commit 1b025d7e20a026371cd5f98ba0cdce48892737c8.
+   Copyright Microsoft Corporation. Licensed under Apache License 2.0.
+   ALMS added one SCMP_ACT_ALLOW group for the chroot syscall to support the
+   Chromium sandbox after entering its user namespace. Other upstream fields
+   and syscall groups are preserved.
+   See scripts/playback-seccomp.NOTICE.md,
+   LICENSES/Playwright-Apache-2.0.txt and LICENSES/Playwright-NOTICE.txt.
+
+2. ALMS SSU SDK
+   vendor/alms-ssu-api-0.3.39.tgz contains @alms/ssu-api 0.3.39 under MIT.
+   Its original package/LICENSE is preserved inside the unmodified archive
+   and copied to LICENSES/SSU-SDK-MIT.txt for convenient inspection.
+
+Dependencies installed from package-lock.json retain their respective
+licenses. The lockfile and installed package license files identify them.

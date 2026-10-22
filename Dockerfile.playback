@@ -1,0 +1,37 @@
+FROM node:24-bookworm-slim AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+COPY vendor ./vendor
+RUN npm ci
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build && npm prune --omit=dev
+
+FROM node:24-bookworm-slim AS playback
+ENV NODE_ENV=production PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
+WORKDIR /app
+COPY --from=build --chown=node:node /app/node_modules ./node_modules
+COPY --from=build --chown=node:node /app/dist ./dist
+COPY --chown=node:node package.json ./
+COPY --chown=node:node migrations ./migrations
+RUN node node_modules/playwright/cli.js install --with-deps chromium && rm -rf /var/lib/apt/lists/*
+USER node
+CMD ["node","dist/worker-main.js"]
+
+FROM playback AS syllabus-api
+CMD ["node","dist/server.js"]
+
+# The QA image contains only generated media and synthetic transport. It never receives production credentials.
+FROM playback AS playback-qa
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/* \
+    && mkdir /fixtures \
+    && ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc=size=160x90:rate=10 -t 2 -an -c:v libvpx-vp9 -pix_fmt yuv420p /fixtures/sample.webm
+COPY --chown=node:node scripts/playback-runtime-qa.mjs ./scripts/playback-runtime-qa.mjs
+ENV PLAYBACK_QA_FIXTURE=/fixtures/sample.webm
+USER node
+CMD ["node","scripts/playback-runtime-qa.mjs"]
+
+FROM syllabus-api AS syllabus-qa
+COPY --chown=node:node scripts/syllabus-runtime-qa.mjs scripts/syllabus-runtime-fixture.mjs ./scripts/
+CMD ["node","scripts/syllabus-runtime-qa.mjs"]

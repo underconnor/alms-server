@@ -1,0 +1,20 @@
+node_modules
+dist
+.git
+.env
+.env.*
+test
+coverage
+*.log
+# Private rollout state must never enter the Docker build context.
+.previous.env
+.snapshot.env
+.migration.env
+.previous-runtime
+.database-before.dump
+.rollout-*.json
+.admission-disabled.json
+rollout-result.json
+source.tar.gz
+source-manifest.json
+rollout.py

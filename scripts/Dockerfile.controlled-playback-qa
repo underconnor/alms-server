@@ -1,0 +1,27 @@
+# Isolated synthetic QA only. No production environment, DB or school credentials are accepted.
+FROM node:24-bookworm-slim AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+COPY vendor ./vendor
+RUN npm ci
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build && npm prune --omit=dev
+
+FROM node:24-bookworm-slim
+ENV NODE_ENV=production PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
+WORKDIR /app
+COPY --from=build --chown=node:node /app/node_modules ./node_modules
+COPY --chown=node:node package.json ./
+RUN node node_modules/playwright/cli.js install --with-deps chromium \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && mkdir /fixtures \
+    && ffmpeg -hide_banner -loglevel error -f lavfi -i testsrc2=size=640x360:rate=30 \
+       -vf noise=alls=100:allf=t+u -t 8 -an -c:v libx264 -preset ultrafast -crf 0 \
+       -pix_fmt yuv420p -movflags +faststart /fixtures/large.mp4 \
+    && test $(stat -c %s /fixtures/large.mp4) -gt 33554432 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build --chown=node:node /app/dist ./dist
+COPY --chown=node:node scripts/controlled-playback-runtime-qa.mjs ./scripts/
+USER node
+CMD ["node", "scripts/controlled-playback-runtime-qa.mjs"]
