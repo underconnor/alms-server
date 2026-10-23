@@ -10,7 +10,7 @@ ALMS 웹 세션, 학교 세션, MCP 승인은 서로 다른 수명을 가진다.
 
 웹 클라이언트는 허용된 Origin과 복귀 주소를 등록하고 [HTTP 인증 계약](http-contract.md)을 따른다. 실제 학교 SSO는 HTTPS 도메인과 callback 허용 조건을 갖춘 환경에서 검증한다. 실패한 callback을 자동 재전송하거나 다른 신원·세대로 이어 붙이지 않는다.
 
-MCP 연결은 [MCP 계약](mcp-contract.md)의 단일 native client 범위에서 검증한다. 현재 실제 Codex 운영 OAuth·도구 호출 검증은 완료되지 않았다. 새 클라이언트나 무인 갱신을 추가할 때는 세션 폐기, 계정 전환, replay, scope·resource·PKCE 검사를 먼저 정의한다.
+MCP 연결은 [MCP 계약](mcp-contract.md)의 단일 native client 범위에서 검증한다. 확인한 Codex 운영 OAuth·조회 도구 표본과 남은 검증 항목은 [실제 검증 범위](mcp-contract.md#실제-검증-범위)를 따른다. 새 클라이언트나 무인 갱신을 추가할 때는 세션 폐기, 계정 전환, replay, scope·resource·PKCE 검사를 먼저 정의한다.
 
 ## 검사 위치
 
