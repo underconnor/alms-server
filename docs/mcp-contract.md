@@ -1,6 +1,31 @@
 # ALMS MCP 계약
 
-이 문서는 조회 전용 Remote MCP의 구현 계약이다. REST API는 [HTTP 계약](http-contract.md)을 따른다. 실제 Codex와의 운영 OAuth·도구 호출 상호운용 검증은 아직 완료되지 않았다. 합성 테스트와 아래 연결 예시는 실제 학교 조회 성공이나 범용 클라이언트 호환을 보장하지 않는다.
+이 문서는 조회 전용 Remote MCP의 구현 계약이다. REST API는 [HTTP 계약](http-contract.md)을 따른다.
+
+## 실제 검증 범위
+
+2026-10-23 Codex CLI 0.141.0으로 운영 OAuth 연결과 아래 조회 도구 각각의 실제 호출 한 표본을 확인했다.
+
+| 도구 | 확인 결과 |
+| --- | --- |
+| `alms_get_capabilities` | 응답 성공 |
+| `alms_list_terms` | 응답 성공 |
+| `alms_list_courses` | 응답 성공 |
+| `alms_get_course` | 응답 성공, 부분 소스 표시 유지 |
+| `alms_list_assignments` | 응답 성공 |
+| `alms_get_calendar` | 응답 성공 |
+| `alms_get_attendance` | 응답 성공 |
+
+여기서 성공은 한계·부분 소스 표시를 포함한 도구 응답의 성공을 뜻한다. 강좌 전체 데이터의 완전성이나 모든 LMS 기능을 확인한 결과로 확대하지 않는다. 이번 표본은 OAuth·도구 호출 수준의 검증이며 모델 대화의 도구 선택은 포함하지 않는다.
+
+다음 범위는 아직 미검증이다.
+
+- 나머지 5개 도구: `alms_get_activity`, `alms_get_assignment`, `alms_list_tasks`, `alms_get_timetable`, `alms_get_learning_status`
+- 다른 MCP 클라이언트·계정·네트워크
+- 운영 환경에서 MCP refresh 토큰의 회전과 토큰 폐기
+- 별도 차시 출결 확인
+
+합성 전송·PostgreSQL 회귀 검사와 위 실제 표본을 구분한다. 아래 연결 예시만으로 실제 조회 성공이나 범용 클라이언트 호환을 판단하지 않는다.
 
 ## 범위와 인증 경계
 
