@@ -22,7 +22,7 @@
     "@alms/ssu-api": "file:vendor/alms-ssu-api-0.3.39.tgz",
     "@fastify/cookie": "11.1.2",
     "@fastify/cors": "11.3.0",
-    "@fastify/formbody": "9.0.0",
+    "@fastify/formbody": "9.0.1",
     "@fastify/rate-limit": "11.2.0",
     "@modelcontextprotocol/node": "2.1.1",
     "@modelcontextprotocol/server": "2.3.1",
