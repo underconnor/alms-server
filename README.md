@@ -101,6 +101,8 @@ npm run contract:generate
 
 기여 절차는 [CONTRIBUTING](CONTRIBUTING.md), 보안 보고는 [SECURITY](SECURITY.md), 자동화 작업 지침은 [AGENTS](AGENTS.md)를 참고합니다.
 
+[범용성·보안 검토](docs/security-review-2026-10-24.md)와 [위협 모델](docs/alms-server-threat-model.md)에 현재 보호, 확인된 제약, 후속 검증을 정리했습니다. MCP 클라이언트 추가·200개 초과 목록 조회·초대 사용자 정책은 후속 작업이며 현재 지원으로 간주하지 않습니다.
+
 ## 라이선스
 
 ALMS Server는 [MIT 라이선스](LICENSE)를 적용합니다. 비공개 프로젝트와 상용 서비스에서도 사용할 수 있으며 배포하는 사본에는 라이선스의 저작권 표시와 허가 문구를 유지해야 합니다. 외부 코드의 고지는 [NOTICE](NOTICE)와 [라이선스 파일](LICENSES/)을 함께 확인합니다. 이 라이선스는 학교 데이터·강의자료에 대한 권리를 부여하지 않습니다.

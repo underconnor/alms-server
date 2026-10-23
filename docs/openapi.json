@@ -8,11 +8,8 @@
   },
   "servers": [
     {
-      "url": "https://api-lms.flyjung.kr"
-    },
-    {
-      "url": "http://127.0.0.1:4300",
-      "description": "Local development"
+      "url": "/",
+      "description": "The origin serving this OpenAPI document. Set your API base URL when generating a client from a local file."
     }
   ],
   "paths": {

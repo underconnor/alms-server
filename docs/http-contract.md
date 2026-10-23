@@ -4,6 +4,8 @@
 
 `GET /.well-known/alms-api`에서 HTTP 명세·기능 지원 조회·선택적 MCP의 경로와 실제 활성화 여부를 발견할 수 있다. 웹 프론트는 아래의 인증·전송 계약을 구현하는 HTTP 클라이언트를 사용한다. AI 클라이언트의 조회 전용 원격 연결은 [MCP 계약](mcp-contract.md)을 따른다. MCP의 별도 OAuth 권한은 웹 세션 토큰과 교환해 사용하는 범용 REST 토큰이 아니며 기존 Origin·CSRF·클라이언트 바인딩을 대체하지 않는다. MCP가 활성화된 배포의 `/oauth/*`, `/mcp`, OAuth discovery는 해당 프로토콜 계약으로 관리하고, OpenAPI 경로 대조는 기본 HTTP 서비스의 등록 경로를 검증한다.
 
+OpenAPI의 `servers`는 상대 `/`이며 명세를 제공한 API Origin을 따른다. 다른 도메인에 배포해도 원 운영 도메인으로 요청하지 않는다. 내려받은 JSON 파일로 클라이언트를 생성할 때는 생성기의 API base URL을 본인의 배포 주소로 지정한다.
+
 ## 주요 동작
 
 과제 미확정 작업은 영수증이 없어도 `POST .../submissions/:operationId/reconcile`로 현재 본인 학교 제출을 새로 읽는다. `Operation.recovery.schoolObservation`은 `attribution:'unattributed'`인 현재 학교 상태이며 원래 ALMS 제출 성공과 구분한다. `POST .../:operationId/release {observedAt}`는 fresh 관측·세대/세션/claim CAS와 종료 근거를 검증해 차단만 명시적으로 정리한다. 원래 미확정 상태/오류/시각/영수증/idempotency는 유지하며 자동 재제출하지 않는다. [최신 과제 재확인·정리 계약](assignment-submission.md#영수증-없는-재확인과-명시적-작업-정리)을 따른다.

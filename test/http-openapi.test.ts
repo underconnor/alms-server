@@ -66,6 +66,25 @@ test('generated static contract is byte-identical and public route provides the 
   } finally { await app.close(); }
 });
 
+test('served OpenAPI server stays on the discovered self-hosted API origin', async () => {
+  for (const apiOrigin of ['https://api.selfhost.example', 'http://localhost:4311']) {
+    const frontendOrigin = apiOrigin.startsWith('https:') ? 'https://app.selfhost.example' : 'http://localhost:5173';
+    const app = await buildApp(loadConfig({ DATABASE_URL: 'postgres://unused', LOG_LEVEL: 'silent',
+      API_PUBLIC_ORIGIN: apiOrigin, FRONTEND_ORIGIN: frontendOrigin, ALLOWED_ORIGINS: frontendOrigin }), {} as Store);
+    try {
+      const discovery = (await app.inject('/.well-known/alms-api')).json();
+      const response = await app.inject('/openapi.json');
+      assert.equal(response.statusCode, 200);
+      const document = response.json();
+      assert.deepEqual(document, httpOpenApi);
+      assert.equal(discovery.http.openapi, apiOrigin + '/openapi.json');
+      assert.equal(document.servers.length, 1);
+      const base = new URL(document.servers[0].url, discovery.http.openapi);
+      assert.equal(new URL('v1/courses', base).href, apiOrigin + '/v1/courses');
+    } finally { await app.close(); }
+  }
+});
+
 test('contract declares protection, exact compatibility Accept values and request bodies', () => {
   const ids: string[] = [];
   for (const [path, methods] of Object.entries(httpOpenApi.paths)) for (const [method, operation] of Object.entries(methods)) {
