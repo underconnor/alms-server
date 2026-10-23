@@ -20,6 +20,7 @@ test('the full app preserves same-origin only for verified MCP consent HTML, and
   // fixture covers app hooks and HTTP headers, not database or consent commits.
   const rows = new Map<string, { id_hash: string; uid_hash: string | null; payload_enc: string }>();
   let consentChallenges = 0;
+  let challengeConsumed = false;
   const pool = { query: async (sql: string, values: unknown[] = []) => {
     if (sql.includes('AS session_binding')) return { rows: [{ migration: true, authorizations: true, challenges: true, objects: true, session_binding: true, challenge_binding: true }], rowCount: 1 };
     if (sql.startsWith('INSERT INTO mcp_oauth_objects')) {
@@ -32,6 +33,9 @@ test('the full app preserves same-origin only for verified MCP consent HTML, and
       return { rows: row ? [row] : [], rowCount: row ? 1 : 0 };
     }
     if (sql.startsWith('INSERT INTO mcp_consent_challenges')) { consentChallenges++; return { rows: [], rowCount: 1 }; }
+    if (sql.startsWith('UPDATE mcp_consent_challenges challenge')) {
+      const rowCount = challengeConsumed ? 0 : 1; challengeConsumed = true; return { rows: [], rowCount };
+    }
     throw new Error('Unexpected synthetic query');
   } } as unknown as Pool;
   const key = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({ format: 'jwk' });
@@ -65,6 +69,15 @@ test('the full app preserves same-origin only for verified MCP consent HTML, and
         payload: new URLSearchParams({ csrf: session.csrfToken, nonce: 'a'.repeat(43), decision: 'approve' }).toString() });
       assert.equal(denied.statusCode, 403); assert.equal(denied.json().error.code, 'CSRF_INVALID'); assert.equal(denied.headers['referrer-policy'], 'no-referrer');
     }
+    const nonce = /name="nonce" value="([^"]+)"/.exec(page.body)![1]!;
+    const denied = await app.inject({ method: 'POST', url: interaction.pathname, headers: { ...headers(), origin: apiOrigin, 'content-type': 'application/x-www-form-urlencoded' },
+      payload: new URLSearchParams({ csrf: session.csrfToken, nonce, decision: 'deny' }).toString() });
+    const resume = apiOrigin + '/oauth/auth/' + interaction.pathname.split('/').at(-1);
+    assert.equal(denied.statusCode, 200); assert.equal(denied.headers.location, undefined); assert.equal(challengeConsumed, true);
+    assert.equal(denied.headers['referrer-policy'], 'no-referrer'); assert.equal(denied.headers['cache-control'], 'no-store');
+    assert.equal(denied.headers['x-frame-options'], 'DENY'); assert.match(String(denied.headers['content-security-policy']), /form-action 'self'; frame-ancestors 'none'/);
+    assert.ok(denied.body.includes('<meta http-equiv="refresh" content="0;url=' + resume + '">'));
+    assert.ok(denied.body.includes('href="' + resume + '"')); assert.doesNotMatch(denied.body, /<form|<script|synthetic-csrf/);
     sessionAvailable = false;
     const login = await app.inject({ url: interaction.pathname, headers: headers() });
     assert.equal(login.statusCode, 200); assert.match(login.body, /ALMS 로그인이 필요해요/); assert.equal(login.headers['referrer-policy'], 'no-referrer');

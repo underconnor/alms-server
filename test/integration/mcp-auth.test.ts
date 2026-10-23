@@ -74,11 +74,20 @@ describe('real PostgreSQL: MCP consent, OAuth code/refresh, revocation and sessi
       assert.equal(page.headers['x-frame-options'], 'DENY'); assert.match(String(page.headers['content-security-policy']), /form-action 'self'; frame-ancestors 'none'/);
       return { interactionUrl, csrf, nonce, verifier };
     };
+    const handoffTarget = (response: Awaited<ReturnType<typeof request>>, interactionUrl: string) => {
+      assert.equal(response.statusCode, 200, response.body); assert.equal(response.headers.location, undefined);
+      assert.equal(response.headers['referrer-policy'], 'no-referrer'); assert.equal(response.headers['cache-control'], 'no-store');
+      assert.match(String(response.headers['content-security-policy']), /form-action 'self'/);
+      assert.doesNotMatch(response.body, /<script|<form/);
+      const expected = apiOrigin + '/oauth/auth/' + new URL(interactionUrl).pathname.split('/').at(-1);
+      const target = /<meta http-equiv="refresh" content="0;url=([^"]+)">/.exec(response.body)?.[1];
+      assert.equal(target, expected); assert.ok(response.body.includes('href="' + expected + '"'));
+      return expected;
+    };
     const approve = async () => {
       const pending = await begin();
       const consent = await request(pending.interactionUrl, { body: { csrf: pending.csrf, nonce: pending.nonce, decision: 'approve' } });
-      assert.equal(consent.statusCode, 303, consent.body);
-      const finished = await request(consent.headers.location!); assert.equal(finished.statusCode, 303, finished.body);
+      const finished = await request(handoffTarget(consent, pending.interactionUrl)); assert.equal(finished.statusCode, 303, finished.body);
       const returned = new URL(finished.headers.location!); assert.equal(returned.origin + returned.pathname, callback);
       assert.equal(returned.searchParams.get('state'), 'synthetic-state'); const code = returned.searchParams.get('code'); assert.ok(code, returned.search);
       const exchanged = await request('/oauth/token', { useCookies: false, body: { grant_type: 'authorization_code', client_id: clientId,
@@ -86,7 +95,7 @@ describe('real PostgreSQL: MCP consent, OAuth code/refresh, revocation and sessi
       assert.equal(exchanged.statusCode, 200, exchanged.body);
       return { pending, code, tokens: exchanged.json() as { access_token: string; refresh_token: string; expires_in: number; scope: string; token_type: string } };
     };
-    return { app, service, own, request, start, begin, approve, setBrowserToken: (token: string) => jar.set('alms_session_dev', token), close: async () => { await app.close(); await service.close(); } };
+    return { app, service, own, request, start, begin, approve, handoffTarget, setBrowserToken: (token: string) => jar.set('alms_session_dev', token), close: async () => { await app.close(); await service.close(); } };
   }
 
   it('native variable loopback port completes code+S256 and authenticates only the verified owner, with bounded lifetime', async () => {
@@ -138,9 +147,25 @@ describe('real PostgreSQL: MCP consent, OAuth code/refresh, revocation and sessi
       assert.ok((await f.request(pending.interactionUrl, { body: { ...input, nonce: 'b'.repeat(43) } })).statusCode >= 400);
       assert.ok((await f.request(pending.interactionUrl, { body: { ...input, userId: randomUUID() } })).statusCode >= 400);
       assert.equal((await pool.query('SELECT id FROM mcp_authorizations WHERE user_id=$1', [f.own.user.id])).rowCount, 0);
-      const accepted = await f.request(pending.interactionUrl, { body: input }); assert.equal(accepted.statusCode, 303, accepted.body);
+      const accepted = await f.request(pending.interactionUrl, { body: input }); f.handoffTarget(accepted, pending.interactionUrl);
       assert.ok((await f.request(pending.interactionUrl, { body: input })).statusCode >= 400);
       assert.equal((await pool.query('SELECT id FROM mcp_authorizations WHERE user_id=$1', [f.own.user.id])).rowCount, 1);
+    } finally { await f.close(); }
+  });
+
+  it('deny uses the same private document handoff, reaches only its exact resume URL and issues no authorization', async () => {
+    const f = await fixture(3600, true);
+    try {
+      const pending = await f.begin();
+      const denied = await f.request(pending.interactionUrl, { body: { csrf: pending.csrf, nonce: pending.nonce, decision: 'deny' } });
+      const resumed = await f.request(f.handoffTarget(denied, pending.interactionUrl));
+      assert.equal(resumed.statusCode, 303, resumed.body);
+      const returned = new URL(resumed.headers.location!); assert.equal(returned.origin + returned.pathname, redirectUri);
+      assert.equal(returned.searchParams.get('error'), 'access_denied'); assert.equal(returned.searchParams.get('code'), null);
+      assert.equal(returned.searchParams.get('state'), 'synthetic-state');
+      assert.equal((await pool.query('SELECT id FROM mcp_authorizations WHERE user_id=$1', [f.own.user.id])).rowCount, 0);
+      const replay = await f.request(pending.interactionUrl, { body: { csrf: pending.csrf, nonce: pending.nonce, decision: 'deny' } });
+      assert.ok(replay.statusCode >= 400);
     } finally { await f.close(); }
   });
 

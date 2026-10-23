@@ -16,7 +16,14 @@ export function accountChangedHtml() {
     <p>이 브라우저의 기존 MCP 연결과 현재 ALMS 로그인 계정이 다릅니다. 계정을 섞지 않도록 이번 승인을 중단했습니다.</p>
     <p>현재 창을 닫고, 연결하려는 계정으로 로그인한 별도 브라우저 프로필이나 비공개 창에서 Codex 연결을 다시 시작해 주세요.</p>`);
 }
-function page(title: string, body: string) {
+export function handoffHtml(resumeUrl: string) {
+  const target = escape(resumeUrl);
+  return page('Codex 연결 계속', `<p class="eyebrow">ALMS · MCP</p><h1>Codex 연결을 계속하고 있어요</h1>
+    <p>잠시 후 연결 결과 화면으로 이동합니다.</p><p><a href="${target}" rel="noreferrer">계속하기</a></p>`,
+  `<meta http-equiv="refresh" content="0;url=${target}">`);
+}
+function page(title: string, body: string, head = '') {
   return `<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title>
+    ${head}
     <style>html{font-family:Pretendard,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#191f28;background:#f7f8fa}body{margin:0;word-break:keep-all;overflow-wrap:anywhere}main{max-width:560px;margin:8vh auto;padding:32px;background:#fff;border:1px solid #e5e8eb;border-radius:16px}h1{font-size:26px;line-height:1.4;margin:12px 0 20px}p,li{line-height:1.75}ul{padding-left:22px}.eyebrow,.muted{color:#6b7684}.eyebrow{font-size:14px}.muted{font-size:14px}.actions{display:flex;gap:12px;margin-top:28px}button,a{font:inherit}button{min-height:44px;border:0;border-radius:10px;background:#1b64da;color:#fff;padding:12px 20px;cursor:pointer}.secondary{background:#f2f4f6;color:#191f28}a{color:#1b64da}button:focus-visible,a:focus-visible{outline:3px solid #2272eb;outline-offset:3px}@media(max-width:640px){main{margin:24px 16px;padding:24px}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto}}</style></head><body><main>${body}</main></body></html>`;
 }

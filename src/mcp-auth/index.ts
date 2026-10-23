@@ -10,7 +10,8 @@ import type { McpPrincipal } from '../mcp-types.js';
 import { AppError } from '../errors.js';
 import { mcpNativeRedirectUris } from '../mcp-config.js';
 import { McpAuthorizationRepository, mcpDenied, type Authorization } from './repository.js';
-import { accountChangedHtml, consentHtml, signInHtml } from './html.js';
+import { accountChangedHtml, consentHtml, handoffHtml, signInHtml } from './html.js';
+import { verifiedMcpResumeUrl } from './handoff.js';
 
 export interface McpAuthorizationOptions {
   apiOrigin: string; frontendOrigin: string; issuer: string; resource: string; store: Pick<Store, 'getSession'>; pool: Pool;
@@ -142,7 +143,15 @@ export function createMcpAuthorization(options: McpAuthorizationOptions) {
     if (detail.uid !== uid || !['login', 'consent'].includes(detail.prompt.name) || detail.params.client_id !== options.client.id
       || detail.params.resource !== options.resource || typeof detail.params.scope !== 'string'
       || detail.params.scope !== 'alms:read') throw mcpDenied();
+    verifiedMcpResumeUrl(detail.returnTo, options.apiOrigin, provider.urlFor('resume', { uid: detail.uid }));
     return detail;
+  };
+  const finishInteraction = async (request: FastifyRequest, reply: FastifyReply, uid: string,
+    result: Parameters<Provider['interactionResult']>[2]) => {
+    const returnTo = await provider.interactionResult(request.raw, reply.raw, result, { mergeWithLastSubmission: false });
+    const target = verifiedMcpResumeUrl(returnTo, options.apiOrigin, provider.urlFor('resume', { uid }));
+    // A new document starts GET navigation, outside the previous form's redirect chain.
+    return privateHtml(reply).code(200).send(handoffHtml(target));
   };
   let timer: ReturnType<typeof setInterval> | undefined;
   return {
@@ -175,7 +184,7 @@ export function createMcpAuthorization(options: McpAuthorizationOptions) {
         if (detail.session?.accountId && detail.session.accountId !== session.user.id) throw new AppError(403, 'MCP_AUTH_ACCOUNT_CHANGED', 'ALMS 계정이 변경되어 승인을 중단했습니다.');
         if (input.decision === 'deny') {
           await repo.deny(detail.uid, input.nonce, session);
-          reply.hijack(); await provider.interactionFinished(request.raw, reply.raw, { error: 'access_denied' }, { mergeWithLastSubmission: false }); return;
+          return finishInteraction(request, reply, detail.uid, { error: 'access_denied' });
         }
         const grant = new provider.Grant({ accountId: session.user.id, clientId: options.client.id });
         grant.exp = Math.floor(Date.parse(session.expiresAt) / 1000);
@@ -183,8 +192,7 @@ export function createMcpAuthorization(options: McpAuthorizationOptions) {
         const grantId = await grant.save();
         try { await repo.authorize(detail.uid, input.nonce, session, grantId, options.client.id, options.resource); }
         catch (error) { await grant.destroy(); throw error; }
-        reply.hijack();
-        await provider.interactionFinished(request.raw, reply.raw, { login: { accountId: session.user.id }, consent: { grantId } }, { mergeWithLastSubmission: false });
+        return finishInteraction(request, reply, detail.uid, { login: { accountId: session.user.id }, consent: { grantId } });
       });
       const route = async (request: FastifyRequest, reply: FastifyReply, discovery = false) => {
         const requestedHost = request.headers.host;

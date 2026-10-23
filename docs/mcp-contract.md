@@ -39,6 +39,8 @@ Issuer는 정확한 `API_ORIGIN/oauth`, resource와 access token audience는 정
 4. 승인 POST는 정확한 API Origin, 원래 ALMS 세션의 CSRF, interaction UID와 단회 nonce를 검증한다. 서버가 세션에서 owner를 결정한다.
 5. 클라이언트가 PKCE verifier로 code를 교환하고 각 `/mcp` 요청에 `Authorization: Bearer …`를 붙인다.
 
+승인·취소 POST는 Provider에 결과를 저장한 뒤 **200 private HTML**로 응답한다. 새 문서의 즉시 meta refresh가 동일 Origin의 정확한 interaction resume URL을 GET으로 열며, 같은 URL의 ‘계속하기’ 링크도 제공한다. `form-action 'self'`와 기존 Origin·CSRF·nonce·세션 검증은 유지하고, 폼 POST의 303 연쇄로 loopback callback까지 이동하지 않는다. resume에서 등록된 native callback으로 돌려보낸 뒤, 승인된 경우 클라이언트가 code를 교환한다.
+
 Interaction은 최대 **15분**, 화면의 단회 동의 nonce는 최대 **10분**이며 nonce는 승인할 ALMS 세션보다 오래 유효하지 않다. Code는 최대 **60초**, access token은 최대 **300초**, refresh token은 발급마다 최대 **24시간**이며 모두 원래 승인 세션의 남은 유효기간으로 제한된다. 명시적으로 조회·갱신을 승인한 등록 클라이언트에만 refresh token을 발급한다. 갱신 요청마다 원래 승인·소유자·ALMS 세션을 다시 확인하고 토큰을 회전하며, ALMS 세션 밖의 오프라인 접근은 허용하지 않는다. 이전 refresh token을 다시 사용하면 관련 grant를 폐기한다.
 
 기존 OIDC 쿠키가 있어도 현재 유효한 기본 ALMS 로그인이 필요하다. 이전 OIDC 계정과 현재 ALMS 계정이 다르면 동의 화면과 승인 POST에서 중단한다. 다른 계정의 기존 grant를 재사용하거나 현재 계정의 승인으로 바꾸지 않는다. 같은 계정으로 새 ALMS 세션을 만든 경우에도 새 동의가 필요하며, 이전 승인·refresh의 만료를 연장하지 않는다.
