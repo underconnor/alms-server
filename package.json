@@ -23,7 +23,7 @@
     "@fastify/cookie": "11.1.2",
     "@fastify/cors": "11.3.0",
     "@fastify/formbody": "9.0.0",
-    "@fastify/rate-limit": "11.2.0",
+    "@fastify/rate-limit": "11.2.1",
     "@modelcontextprotocol/node": "2.1.1",
     "@modelcontextprotocol/server": "2.3.1",
     "ajv": "8.20.0",
