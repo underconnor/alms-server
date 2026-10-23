@@ -406,7 +406,8 @@ for (const operations of Object.values(paths)) if (operations.get && !operations
 export const httpOpenApi = {
   openapi: '3.1.0', jsonSchemaDialect: 'https://json-schema.org/draft/2020-12/schema',
   info: { title: 'ALMS frontend HTTP API', version: '1.0.0', description: '숭실대학교 전용 ALMS Backend API. Current source contract; release and production QA evidence are separate. School adapter SDK @alms/ssu-api is not the frontend HTTP client.' },
-  servers: [{ url: 'https://api-lms.flyjung.kr' }, { url: 'http://127.0.0.1:4300', description: 'Local development' }],
+  // Resolve against the served document so self-hosted clients stay on their own API.
+  servers: [{ url: '/', description: 'The origin serving this OpenAPI document. Set your API base URL when generating a client from a local file.' }],
   paths, components: { schemas: httpSchemas, securitySchemes: {
     cookieSession: { type: 'apiKey', in: 'cookie', name: '__Host-alms_session', description: 'Default HttpOnly Secure SameSite=Lax cookie. Registered nondefault cookie clients use __Host-alms_session_{clientId}; development HTTP uses alms_session_dev[_clientId]. Select with client header or unique registered Origin. Different-site frontends use PKCE bearer.' },
     bearerSession: { type: 'http', scheme: 'bearer', description: 'Client-bound opaque token from /v1/auth/token; exact registered Origin and client header required.' },

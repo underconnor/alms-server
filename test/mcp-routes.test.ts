@@ -281,6 +281,24 @@ test('the Fastify parser enforces the MCP body bound before token verification',
   assert.equal(f.authTokens.length, 0); assert.equal(f.calls.length, 0);
 });
 
+for (const version of [legacy, modern]) {
+  test(`MCP ${version} bounds input elements below the byte limit before schema validation`, async t => {
+    const f = await fixture(); t.after(() => f.app.close());
+    const payload = rpc('tools/call', {
+      name: 'alms_read_fixture', arguments: { itemId: '42', padding: Array(1000).fill(0) },
+    }, version);
+    assert.ok(Buffer.byteLength(JSON.stringify(payload)) < 32768);
+    const response = await f.send('/mcp', payload, {
+      headers: headers('tools/call', version, 'owner-a-token', 'alms_read_fixture'),
+    });
+    assert.equal(response.status, 200);
+    const result = await readRpc(response);
+    assert.ok(result.error || result.result?.isError);
+    assert.match(JSON.stringify(result), /maximum of 256 elements/);
+    assert.equal(f.calls.length, 0);
+  });
+}
+
 test('real client disconnect aborts the signal delivered to the in-flight read provider', async t => {
   const f = await fixture(); t.after(() => f.app.close());
   const controller = new AbortController();
