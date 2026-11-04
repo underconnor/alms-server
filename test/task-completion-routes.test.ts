@@ -35,7 +35,7 @@ test('TODO uses one authenticated owner batch for verified module links and pres
   const f = await fixture();
   try {
     assert.equal((await f.app.inject('/v1/tasks')).statusCode, 401); assert.deepEqual(f.calls, []);
-    for (const query of ['userId=owner-b', 'courseId=20', 'refresh=1'])
+    for (const query of ['userId=owner-b', 'courseId=20', 'refresh=invalid'])
       assert.equal((await f.app.inject({url: '/v1/tasks?' + query, headers: {cookie}})).statusCode, 400);
     assert.deepEqual(f.calls, []);
     const response = await f.app.inject({url: '/v1/tasks', headers: {cookie}});

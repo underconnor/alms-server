@@ -103,4 +103,64 @@ describe('encrypted school JSON cache in real PostgreSQL', { skip: !databaseUrl 
     } finally { await locker.query('ROLLBACK'); locker.release(); }
   });
 
+  it('related source invalidation is generation-bound, preserves its fresh target and leaves bytes and other courses untouched', async () => {
+    const a = await user(), b = await user(), oldGeneration = randomUUID();
+    const resources = ['tasks', 'calendar:v3:2026-11-01:2026-11-30:all', 'calendar:v3:2026-10-01:2026-10-31:10',
+      'calendar:v3:2026-11-01:2026-11-30:11', 'calendar:v3:unknown-shape', 'course:10', 'calendar-modules:10', 'assignments:10', 'assignment:10:90',
+      'course:11', 'calendar-modules:11', 'assignments:11', 'assignment:11:91', 'activity:10:90', 'assignment-file:10:90:7',
+      'syllabus:10', 'video:10:90', 'catalog', 'catalog:all', 'attendance:10', 'calendar:v30:kept'];
+    for (const resource of resources) await cache.put({ ...a.scope, resource }, { resource }, 60_000);
+    await cache.put({ ...b.scope, resource: 'course:10' }, { other: true }, 60_000);
+    await pool.query(`INSERT INTO school_read_cache(user_id,provider,generation,resource_key,encrypted_payload,payload_bytes,stored_bytes,expires_at)
+      SELECT user_id,provider,$2,resource_key,encrypted_payload,payload_bytes,stored_bytes,expires_at
+      FROM school_read_cache WHERE user_id=$1 AND resource_key='course:10'`, [a.scope.owner, oldGeneration]);
+    await pool.query(`INSERT INTO school_read_cache(user_id,provider,generation,resource_key,encrypted_payload,payload_bytes,stored_bytes,expires_at)
+      SELECT user_id,'other-provider',generation,resource_key,encrypted_payload,payload_bytes,stored_bytes,expires_at
+      FROM school_read_cache WHERE user_id=$1 AND generation=$2 AND resource_key='course:10'`, [a.scope.owner, a.scope.generation]);
+    await cache.deleteRelated(a.scope.owner, 'ssu', a.scope.generation, ['10', '10'], 'assignments:10');
+    const removed = new Set(['tasks', 'calendar:v3:2026-11-01:2026-11-30:all', 'calendar:v3:2026-10-01:2026-10-31:10', 'course:10', 'calendar-modules:10', 'assignment:10:90']);
+    const current = (await pool.query('SELECT resource_key FROM school_read_cache WHERE user_id=$1 AND provider=$2 AND generation=$3 ORDER BY resource_key',
+      [a.scope.owner, 'ssu', a.scope.generation])).rows.map(row => row.resource_key);
+    assert.deepEqual(current, resources.filter(resource => !removed.has(resource)).sort());
+    assert.deepEqual((await cache.get({ ...a.scope, resource: 'assignments:10' }))?.value, { resource: 'assignments:10' });
+    assert.deepEqual((await cache.get({ ...b.scope, resource: 'course:10' }))?.value, { other: true });
+    assert.equal((await pool.query('SELECT 1 FROM school_read_cache WHERE user_id=$1 AND generation=$2 AND resource_key=$3',
+      [a.scope.owner, oldGeneration, 'course:10'])).rowCount, 1);
+    assert.equal((await pool.query('SELECT 1 FROM school_read_cache WHERE user_id=$1 AND provider=$2 AND generation=$3',
+      [a.scope.owner, 'other-provider', a.scope.generation])).rowCount, 1);
+  });
+  it('a refresh with no changed-course IDs clears only aggregate calendar snapshots and keeps per-course snapshots', async () => {
+    const a = await user();
+    const all = 'calendar:v3:2026-11-01:2026-11-30:all', selected = 'calendar:v3:2026-11-01:2026-11-30:11';
+    for (const resource of ['tasks', all, selected, 'course:11']) await cache.put({ ...a.scope, resource }, { resource }, 60_000);
+    await cache.deleteRelated(a.scope.owner, 'ssu', a.scope.generation, [], 'tasks');
+    const current = (await pool.query('SELECT resource_key FROM school_read_cache WHERE user_id=$1 ORDER BY resource_key', [a.scope.owner])).rows.map(row => row.resource_key);
+    assert.deepEqual(current, [selected, 'course:11', 'tasks'].sort());
+  });
+  it('generation-bound failure cleanup cannot delete a newer login snapshot', async () => {
+    const a = await user(), oldGeneration = randomUUID();
+    await cache.put({ ...a.scope, resource: 'course:10' }, { current: true }, 60_000);
+    await pool.query(`INSERT INTO school_read_cache(user_id,provider,generation,resource_key,encrypted_payload,payload_bytes,stored_bytes,expires_at)
+      SELECT user_id,provider,$2,resource_key,encrypted_payload,payload_bytes,stored_bytes,expires_at
+      FROM school_read_cache WHERE user_id=$1 AND resource_key='course:10'`, [a.scope.owner, oldGeneration]);
+    await cache.delete(a.scope.owner, 'ssu', undefined, oldGeneration);
+    assert.equal((await pool.query('SELECT 1 FROM school_read_cache WHERE user_id=$1 AND generation=$2', [a.scope.owner, oldGeneration])).rowCount, 0);
+    assert.deepEqual((await cache.get({ ...a.scope, resource: 'course:10' }))?.value, { current: true });
+    await cache.delete(a.scope.owner, 'ssu', 'course:10', oldGeneration);
+    assert.deepEqual((await cache.get({ ...a.scope, resource: 'course:10' }))?.value, { current: true });
+    await cache.delete(a.scope.owner, 'ssu', 'course:10', a.scope.generation);
+    assert.equal(await cache.get({ ...a.scope, resource: 'course:10' }), null);
+  });
+  it('failure cleanup binds the exact current school jar even when the generation is unchanged', async () => {
+    const a = await user(), newer = `synthetic-current-jar-${randomUUID()}`;
+    await cache.put({ ...a.scope, resource: 'course:10' }, { original: true }, 60_000);
+    await pool.query('UPDATE school_sessions SET encrypted_state=$3 WHERE user_id=$1 AND provider=$2', [a.scope.owner, 'ssu', newer]);
+    const current = { ...a.scope, resource: 'course:10', encryptedSession: newer };
+    assert.equal(await cache.put(current, { fresh: true }, 60_000), true);
+    await cache.delete(a.scope.owner, 'ssu', 'course:10', a.scope.generation, a.scope.encryptedSession);
+    assert.deepEqual((await cache.get(current))?.value, { fresh: true });
+    await cache.delete(a.scope.owner, 'ssu', 'course:10', a.scope.generation, newer);
+    assert.equal(await cache.get(current), null);
+  });
+
 });

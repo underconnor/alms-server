@@ -24,8 +24,8 @@
     "@fastify/cors": "11.3.0",
     "@fastify/formbody": "9.0.0",
     "@fastify/rate-limit": "11.2.0",
-    "@modelcontextprotocol/node": "2.1.1",
-    "@modelcontextprotocol/server": "2.3.1",
+    "@modelcontextprotocol/node": "2.1.2",
+    "@modelcontextprotocol/server": "2.4.0",
     "ajv": "8.20.0",
     "ajv-formats": "3.0.1",
     "cheerio": "1.2.0",
@@ -36,7 +36,7 @@
     "pg-boss": "12.35.0",
     "playwright": "1.63.0",
     "tldts": "7.4.18",
-    "zod": "4.6.5"
+    "zod": "4.6.6"
   },
   "devDependencies": {
     "@types/node": "26.6.3",

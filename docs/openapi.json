@@ -669,13 +669,54 @@
                         },
                         "schoolSdkPackage": {
                           "const": "@alms/ssu-api"
+                        },
+                        "freshness": {
+                          "type": "object",
+                          "properties": {
+                            "queryParameter": {
+                              "const": "refresh"
+                            },
+                            "modes": {
+                              "type": "array",
+                              "items": {
+                                "type": "string",
+                                "enum": [
+                                  "1",
+                                  "resource"
+                                ]
+                              },
+                              "minItems": 2,
+                              "maxItems": 2
+                            },
+                            "resources": {
+                              "type": "array",
+                              "items": {
+                                "type": "string",
+                                "enum": [
+                                  "course",
+                                  "assignments",
+                                  "tasks",
+                                  "calendar"
+                                ]
+                              },
+                              "minItems": 4,
+                              "maxItems": 4
+                            }
+                          },
+                          "required": [
+                            "queryParameter",
+                            "modes",
+                            "resources"
+                          ],
+                          "additionalProperties": true
                         }
                       },
                       "required": [
                         "openapi",
                         "featureSupport",
                         "clientPackage",
-                        "schoolSdkPackage"
+                        "schoolSdkPackage",
+                        "freshness"
                       ],
                       "additionalProperties": true
                     },
@@ -4737,6 +4778,19 @@
               "format": "uri"
             },
             "description": "Exact registered origin; required on writes and on every bearer request."
+          },
+          {
+            "name": "refresh",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "1",
+                "resource"
+              ]
+            },
+            "description": "Explicit source revalidation. 1 preserves full catalog refresh; resource revalidates this resource while retaining only verified display context. Identity, enrollment and session checks remain required. No duplicate query parameter."
           }
         ],
         "responses": {
@@ -4919,6 +4973,19 @@
               "format": "uri"
             },
             "description": "Exact registered origin; required on writes and on every bearer request."
+          },
+          {
+            "name": "refresh",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "1",
+                "resource"
+              ]
+            },
+            "description": "Explicit source revalidation. 1 preserves full catalog refresh; resource revalidates this resource while retaining only verified display context. Identity, enrollment and session checks remain required. No duplicate query parameter."
           }
         ],
         "responses": {
@@ -5742,9 +5809,13 @@
             "in": "query",
             "required": false,
             "schema": {
-              "const": "1"
+              "type": "string",
+              "enum": [
+                "1",
+                "resource"
+              ]
             },
-            "description": "Explicit refresh only. No duplicate query parameter."
+            "description": "Explicit source revalidation. 1 preserves full catalog refresh; resource revalidates this resource while retaining only verified display context. Identity, enrollment and session checks remain required. No duplicate query parameter."
           }
         ],
         "responses": {
@@ -5934,9 +6005,13 @@
             "in": "query",
             "required": false,
             "schema": {
-              "const": "1"
+              "type": "string",
+              "enum": [
+                "1",
+                "resource"
+              ]
             },
-            "description": "Explicit refresh only. No duplicate query parameter."
+            "description": "Explicit source revalidation. 1 preserves full catalog refresh; resource revalidates this resource while retaining only verified display context. Identity, enrollment and session checks remain required. No duplicate query parameter."
           }
         ],
         "responses": {
@@ -6051,9 +6126,13 @@
             "in": "query",
             "required": false,
             "schema": {
-              "const": "1"
+              "type": "string",
+              "enum": [
+                "1",
+                "resource"
+              ]
             },
-            "description": "Explicit refresh only. No duplicate query parameter."
+            "description": "Explicit source revalidation. 1 preserves full catalog refresh; resource revalidates this resource while retaining only verified display context. Identity, enrollment and session checks remain required. No duplicate query parameter."
           }
         ],
         "responses": {
@@ -6250,9 +6329,13 @@
             "in": "query",
             "required": false,
             "schema": {
-              "const": "1"
+              "type": "string",
+              "enum": [
+                "1",
+                "resource"
+              ]
             },
-            "description": "Explicit refresh only. No duplicate query parameter."
+            "description": "Explicit source revalidation. 1 preserves full catalog refresh; resource revalidates this resource while retaining only verified display context. Identity, enrollment and session checks remain required. No duplicate query parameter."
           }
         ],
         "responses": {
@@ -14452,6 +14535,19 @@
               "format": "uri"
             },
             "description": "Exact registered origin; required on writes and on every bearer request."
+          },
+          {
+            "name": "refresh",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "1",
+                "resource"
+              ]
+            },
+            "description": "Explicit source revalidation. 1 preserves full catalog refresh; resource revalidates this resource while retaining only verified display context. Identity, enrollment and session checks remain required. No duplicate query parameter."
           }
         ],
         "responses": {
@@ -14624,6 +14720,19 @@
               "format": "uri"
             },
             "description": "Exact registered origin; required on writes and on every bearer request."
+          },
+          {
+            "name": "refresh",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "1",
+                "resource"
+              ]
+            },
+            "description": "Explicit source revalidation. 1 preserves full catalog refresh; resource revalidates this resource while retaining only verified display context. Identity, enrollment and session checks remain required. No duplicate query parameter."
           }
         ],
         "responses": {
@@ -14747,9 +14856,13 @@
             "in": "query",
             "required": false,
             "schema": {
-              "const": "1"
+              "type": "string",
+              "enum": [
+                "1",
+                "resource"
+              ]
             },
-            "description": "Explicit refresh only. No duplicate query parameter."
+            "description": "Explicit source revalidation. 1 preserves full catalog refresh; resource revalidates this resource while retaining only verified display context. Identity, enrollment and session checks remain required. No duplicate query parameter."
           }
         ],
         "responses": {
@@ -14956,9 +15069,13 @@
             "in": "query",
             "required": false,
             "schema": {
-              "const": "1"
+              "type": "string",
+              "enum": [
+                "1",
+                "resource"
+              ]
             },
-            "description": "Explicit refresh only. No duplicate query parameter."
+            "description": "Explicit source revalidation. 1 preserves full catalog refresh; resource revalidates this resource while retaining only verified display context. Identity, enrollment and session checks remain required. No duplicate query parameter."
           }
         ],
         "responses": {

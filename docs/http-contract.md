@@ -6,6 +6,8 @@
 
 OpenAPI의 `servers`는 상대 `/`이며 명세를 제공한 API Origin을 따른다. 다른 도메인에 배포해도 원 운영 도메인으로 요청하지 않는다. 내려받은 JSON 파일로 클라이언트를 생성할 때는 생성기의 API base URL을 본인의 배포 주소로 지정한다.
 
+강좌·주차·과제 목록/상세·학교 TODO·캘린더는 명시적 `refresh=1|resource`를 지원한다. 배포의 `http.freshness` 광고와 [학교 원본 재검증 계약](source-refresh-contract.md)을 확인한다. 기본 GET의 cache 재사용, 기존 `refresh=1`의 전체 확인과 별도 파일·이력 재조회는 유지한다. 최신 확인을 위한 읽기는 제출·학습 기록 쓰기를 수행하지 않는다.
+
 ## 주요 동작
 
 과제 미확정 작업은 영수증이 없어도 `POST .../submissions/:operationId/reconcile`로 현재 본인 학교 제출을 새로 읽는다. `Operation.recovery.schoolObservation`은 `attribution:'unattributed'`인 현재 학교 상태이며 원래 ALMS 제출 성공과 구분한다. `POST .../:operationId/release {observedAt}`는 fresh 관측·세대/세션/claim CAS와 종료 근거를 검증해 차단만 명시적으로 정리한다. 원래 미확정 상태/오류/시각/영수증/idempotency는 유지하며 자동 재제출하지 않는다. [최신 과제 재확인·정리 계약](assignment-submission.md#영수증-없는-재확인과-명시적-작업-정리)을 따른다.

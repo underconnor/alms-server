@@ -15,6 +15,7 @@ import { z } from 'zod';
 import type { SchoolResult } from './domain.js';
 import { boundedWorkerOperation } from './worker-bounds.js';
 import { withSchoolSessionLock } from './school-session-lock.js';
+import { createSourceReadFlights } from './source-read-flight.js';
 import { decryptSchoolSession, encryptSchoolSession } from './crypto.js';
 import { AppError, notFound } from './errors.js';
 import type { AuthenticatedSchoolSessionSnapshot } from './store.js';
@@ -22,7 +23,7 @@ import { createMaterialByteCache, isMaterialViewer, type MaterialLoader } from '
 import { schoolCacheTtl, type SchoolReadCache } from './school-read-cache.js';
 import { createVideoStreamer, type VideoRequest } from './video-stream.js';
 import { publicCourse, publicTaskCatalog, normalizeSchoolReadError, type TasksRead, type CalendarRead, type LearningxReader, type Catalog, type CourseTerm, type AttendanceRead, type CourseRead, type ActivityRead, type MaterialViewRead, type Course } from './school-read.js';
-import type { MaterialViewObservation, SyllabusReadOptions, AssignmentReadOptions, TasksReadOptions } from './provider.js';
+import type { MaterialViewObservation, SyllabusReadOptions, AssignmentReadOptions, TasksReadOptions, SourceReadOptions } from './provider.js';
 import { materialViewFailureDiagnostic, rememberMaterialViewFailure, type MaterialViewFailureDiagnostic,
   type MaterialViewFailureStage } from './material-view-diagnostics.js';
 
@@ -83,6 +84,7 @@ export function createLearningxReader(store: SessionStore, key: Buffer, connect:
   type OwnerCache = { generation: string; values: Map<string, Cached> };
   const cache = new Map<string, OwnerCache>();
   const pending = new Map<string, Map<string, Promise<unknown>>>();
+  const shareSourceRead = createSourceReadFlights();
   type Warmup = { generation: string; courseId: string; items: string[] };
   const warmups = new Map<string, Warmup>();
   const warming = new Set<string>();
@@ -157,7 +159,53 @@ export function createLearningxReader(store: SessionStore, key: Buffer, connect:
         && (value as CourseRead).commonsMappingVersion === 3
         && ((value as CourseRead).usePureCanvas === null || typeof (value as CourseRead).usePureCanvas === 'boolean')));
   };
-  function execute<T>(owner: string, resource: string, run: (client: LearningxClient, catalog: Catalog, generation: string, validate: () => Promise<void>, connection: Connection) => Promise<T>, expectedGeneration?: string, transient = false, fresh = false, signal?: AbortSignal, validateCached?: (value: T, catalog: Catalog) => boolean, abortKind: ReadAbortKind = validateCached ? 'calendar' : 'syllabus', selection?: CatalogSelection, assignmentTrace?: AssignmentReadTrace): Promise<T> {
+  async function sourceRead<T, O extends SourceReadOptions & TasksReadOptions>(owner: string, resource: string, options: O,
+    run: (options: O, generation?: string) => Promise<T>): Promise<T> {
+    if (!options.refresh) return run(options);
+    options.signal?.throwIfAborted(); await options.validate?.();
+    const encrypted = await store.getEncryptedSchoolSession(owner, 'ssu');
+    if (!encrypted) throw new AppError(401, 'SCHOOL_AUTH_REQUIRED', '학교 로그인이 필요합니다.');
+    let generation: string | undefined;
+    try { generation = storedSession.parse(decryptSchoolSession(encrypted, key, owner, 'ssu')).generation; }
+    catch { throw new AppError(401, 'SCHOOL_AUTH_REQUIRED', '학교 인증을 다시 확인해 주세요.'); }
+    // Legacy sessions are allowed through the normal fresh read, without sharing a generation.
+    if (!generation) return run(options);
+    // Explicit metadata work takes priority over speculative items that have not started.
+    warmups.delete(owner);
+    const expected = generation;
+    const value = await shareSourceRead({ owner, generation, resource,
+      policy: `${options.refreshScope ?? 'all'}:${options.personalCompletionCourses ? 'mapped' : 'plain'}` }, {
+      ...options, validate: async () => { await options.validate?.(); await planningGeneration(owner, expected); },
+    }, shared => run({ ...options, ...shared } as O, expected));
+    await options.validate?.(); await planningGeneration(owner, expected); options.signal?.throwIfAborted();
+    return value;
+  }
+
+  async function invalidateSourceRelations(owner: string, generation: string, resource: string, value: unknown, signal?: AbortSignal) {
+    const exact = /^(?:course|assignments|assignment):(\d{1,16})(?::|$)/.exec(resource);
+    if (!exact && resource !== 'tasks' && !resource.startsWith('calendar:v3:')) return;
+    const record = value as { groups?: { courseId: string }[]; data?: { items?: { courseId: string }[] } };
+    const previous = cache.get(owner)?.generation === generation ? cache.get(owner)?.values.get(resource)?.value as typeof record | undefined : undefined;
+    const calendarCourse = resource.startsWith('calendar:v3:') ? resource.split(':')[4] : undefined;
+    const ids = [...new Set(exact ? [exact[1]!] : resource === 'tasks'
+      ? [...(record.groups ?? []), ...(previous?.groups ?? [])].map(item => item.courseId)
+      : [...(record.data?.items ?? []), ...(previous?.data?.items ?? []),
+        ...calendarCourse && calendarCourse !== 'all' ? [{ courseId: calendarCourse }] : []].map(item => item.courseId))];
+    if (ids.length > 100 || ids.some(id => !/^\d{1,16}$/.test(id))) throw new SchoolError('unexpected_response');
+    const related = (name: string) => name !== resource && (name === 'tasks'
+      || name.startsWith('calendar:v3:') && (name.endsWith(':all') || ids.includes(name.split(':')[4] ?? ''))
+      || ids.some(id => [`course:${id}`, `calendar-modules:${id}`, `assignments:${id}`].includes(name) || name.startsWith(`assignment:${id}:`)));
+    const entry = cache.get(owner);
+    const resources = new Set<string>(['tasks', ...ids.flatMap(id => [`course:${id}`, `calendar-modules:${id}`, `assignments:${id}`])]);
+    if (entry?.generation === generation) for (const name of entry.values.keys()) if (related(name)) { resources.add(name); entry.values.delete(name); }
+    resources.delete(resource);
+    if (durable?.deleteRelated) await durable.deleteRelated(owner, 'ssu', generation, ids, resource, signal);
+    else if (durable) for (const name of resources) await durable.delete(owner, 'ssu', name);
+  }
+
+  function execute<T>(owner: string, resource: string, run: (client: LearningxClient, catalog: Catalog, generation: string, validate: () => Promise<void>, connection: Connection) => Promise<T>, expectedGeneration?: string, transient = false, fresh = false, signal?: AbortSignal, validateCached?: (value: T, catalog: Catalog) => boolean, abortKind: ReadAbortKind = validateCached ? 'calendar' : 'syllabus', selection?: CatalogSelection, assignmentTrace?: AssignmentReadTrace, refreshScope?: 'resource'): Promise<T> {
+    let attemptedGeneration: string | undefined;
+    let attemptedSchoolState: string | undefined;
     // Explicit course reads include previously enrolled terms; the dashboard/TODO default stays current.
     const selectedCatalog = selection ?? (/^(?:course|activity|video|assignments?|attendance|learning-status|syllabus-owner|syllabus-launch):/.test(resource) ? 'all' : 'default');
     let catalogResource = typeof selectedCatalog === 'object' ? `catalog:term:${selectedCatalog.termId}`
@@ -167,12 +215,14 @@ export function createLearningxReader(store: SessionStore, key: Buffer, connect:
     const result = abortableRead(withSchoolSessionLock(owner, async () => {
       signal?.throwIfAborted();
       const encrypted = await store.getEncryptedSchoolSession(owner, 'ssu');
+      attemptedSchoolState = encrypted ?? undefined;
       signal?.throwIfAborted();
       if (!encrypted) throw new AppError(401, 'SCHOOL_AUTH_REQUIRED', '학교 로그인이 필요합니다.');
       let session: z.infer<typeof storedSession>;
       try { session = storedSession.parse(decryptSchoolSession(encrypted, key, owner, 'ssu')); }
       catch { throw new AppError(401, 'SCHOOL_AUTH_REQUIRED', '저장된 학교 세션을 확인할 수 없습니다. 다시 로그인해 주세요.'); }
       const generation = session.generation ?? randomUUID();
+      attemptedGeneration = generation;
       const currentSession = async (expected: string) => {
         if (await store.getEncryptedSchoolSession(owner, 'ssu') !== expected)
           throw new AppError(409, 'SCHOOL_SESSION_CHANGED', '학교 세션이 갱신됐습니다. 다시 조회해 주세요.');
@@ -200,7 +250,7 @@ export function createLearningxReader(store: SessionStore, key: Buffer, connect:
       // Reuse only this owner's current-generation, unexpired catalog for display context;
       // a cold assignment must not duplicate the SDK's terms/courses GETs first.
       let assignmentCatalog: Cached | undefined;
-      if (!fresh && abortKind === 'assignment' && validateCached && selectedCatalog === 'all') {
+      if ((!fresh || refreshScope === 'resource') && abortKind === 'assignment' && validateCached && selectedCatalog === 'all') {
         const liveCatalog = (entry: Cached | undefined) => entry && entry.expiresAt > Date.now() && catalogCompatible(entry.value);
         const targetCourse = resource.split(':')[1];
         const exactTarget = (entry: Cached | undefined) => liveCatalog(entry)
@@ -270,12 +320,31 @@ export function createLearningxReader(store: SessionStore, key: Buffer, connect:
       let catalog: Catalog;
       if (cachedCatalog && cachedCatalog.expiresAt > Date.now()) catalog = cachedCatalog.value as Catalog;
       else {
+        // A resource refresh can verify enrollment in the exact known term instead of
+        // enumerating historical terms. A cached label never replaces fresh membership.
+        let targetTerm: string | undefined;
+        if (fresh && refreshScope === 'resource' && /^course:\d{1,16}$/.test(resource)) {
+          const target = resource.split(':')[1], terms = new Set<string>();
+          const observe = (entry: Cached | undefined) => {
+            if (!entry || entry.expiresAt <= Date.now() || !catalogCompatible(entry.value)) return;
+            const matches = entry.value.courses.filter(course => course.id === target);
+            const term = matches[0]?.termId;
+            if (matches.length === 1 && typeof term === 'string') terms.add(term);
+          };
+          for (const [name, entry] of valid?.values ?? []) if (name === 'catalog' || name.startsWith('catalog:')) observe(entry);
+          if (durable && session.generation) for (const name of ['catalog', 'catalog:all']) {
+            const entry = await durable.get<Catalog>(scope(name)).catch(() => null); observe(entry ?? undefined);
+          }
+          if (terms.size === 1) targetTerm = [...terms][0];
+        }
         const terms = await connection.client.terms();
         signal?.throwIfAborted();
         if (terms.length > 30 || new Set(terms.map(term => term.id)).size !== terms.length) throw new SchoolError('unexpected_response');
         const defaults = selectDefaultTerms(terms);
-        const selected = typeof selectedCatalog === 'object' ? terms.filter(term => term.id === selectedCatalog.termId)
+        const selected = targetTerm && terms.some(term => term.id === targetTerm) ? terms.filter(term => term.id === targetTerm)
+          : typeof selectedCatalog === 'object' ? terms.filter(term => term.id === selectedCatalog.termId)
           : selectedCatalog === 'terms' ? [] : selectedCatalog === 'all' ? terms : defaults;
+        if (targetTerm && selected.length === 1 && selected[0]!.id === targetTerm) catalogResource = `catalog:term:${targetTerm}`;
         if (typeof selectedCatalog === 'object' && !selected.length) throw notFound();
         const termIds = selected.map(term => term.id);
         const termNames = new Map(terms.map(term => [term.id, term.name]));
@@ -303,7 +372,9 @@ export function createLearningxReader(store: SessionStore, key: Buffer, connect:
       if (!await store.replaceEncryptedSchoolSession(owner, 'ssu', encrypted, updated)) {
         throw new AppError(409, 'SCHOOL_SESSION_CHANGED', '학교 세션이 갱신됐습니다. 다시 조회해 주세요.');
       }
+      attemptedSchoolState = updated;
       signal?.throwIfAborted();
+      if (fresh && !transient) await invalidateSourceRelations(owner, generation, resource, value, signal);
       // Publish neither data nor jar from a read that lost a race with a new login.
       // Opaque handles never enter this display cache or durable storage.
       const values: Array<[string, unknown]> = transient || reused ? [] : [[resource, value]];
@@ -321,10 +392,21 @@ export function createLearningxReader(store: SessionStore, key: Buffer, connect:
       // evict independently usable courses/timetable/catalog and restart the whole screen.
       const accountInvalid = error instanceof AppError && [401, 409].includes(error.statusCode)
         || error instanceof SchoolError && ['authentication_required', 'identity_mismatch'].includes(error.code);
-      if (accountInvalid) cache.delete(owner);
-      else if (!expectedGeneration) cache.get(owner)?.values.delete(resource);
-      if (durable) await durable.delete(owner, 'ssu', error instanceof AppError && [401, 409].includes(error.statusCode)
-        || error instanceof SchoolError && ['authentication_required', 'identity_mismatch'].includes(error.code) ? undefined : resource).catch(() => {});
+      // A late failure must not erase snapshots already published by a newer login.
+      // The failed response still rejects; every later cache hit checks current authority.
+      let newerGeneration = false;
+      if (attemptedGeneration) try {
+        const current = await store.getEncryptedSchoolSession(owner, 'ssu');
+        const generation = current ? storedSession.parse(decryptSchoolSession(current, key, owner, 'ssu')).generation : undefined;
+        newerGeneration = Boolean(generation && generation !== attemptedGeneration || current && attemptedSchoolState && current !== attemptedSchoolState);
+      } catch { newerGeneration = true; }
+      if (!newerGeneration) {
+        if (cache.get(owner)?.generation === attemptedGeneration) {
+          if (accountInvalid) cache.delete(owner);
+          else if (!expectedGeneration || fresh) cache.get(owner)?.values.delete(resource);
+        }
+        if (durable && attemptedGeneration) await durable.delete(owner, 'ssu', accountInvalid ? undefined : resource, attemptedGeneration, attemptedSchoolState).catch(() => {});
+      }
       const diagnostic = assignmentTrace && assignmentReadFailureDiagnostic(error, assignmentTrace.operation, assignmentTrace.stage, assignmentTrace.scope, false);
       try { return normalizeSchoolReadError(error); }
       catch (normalized) { if (diagnostic) rememberAssignmentReadFailure(normalized, diagnostic, assignmentTrace!.scope); throw normalized; }
@@ -354,7 +436,7 @@ export function createLearningxReader(store: SessionStore, key: Buffer, connect:
     return ownedCourse(catalog, courseId);
   };
   async function assignmentRead<T>(owner: string, course: string, resource: string, options: AssignmentReadOptions,
-    load: (client: LearningxClient, signal: AbortSignal) => Promise<unknown>, project: (value: unknown, owned: Course) => T): Promise<T> {
+    load: (client: LearningxClient, signal: AbortSignal) => Promise<unknown>, project: (value: unknown, owned: Course) => T, expectedGeneration?: string): Promise<T> {
     assignmentId.parse(course);
     const trace: AssignmentReadTrace = { operation: resource.startsWith('assignments:') ? 'list' : 'detail', stage: 'owned_catalog', scope: options.validate };
     const signal = AbortSignal.any([options.signal, AbortSignal.timeout(90_000)]);
@@ -366,11 +448,11 @@ export function createLearningxReader(store: SessionStore, key: Buffer, connect:
         await options.validate(); signal.throwIfAborted();
         trace.stage = 'school_read'; const raw = await load(client, signal);
         trace.stage = 'projection'; return { course: owned, data: project(raw, owned) };
-      }, undefined, false, Boolean(options.refresh), signal, (value, catalog) => {
+      }, expectedGeneration, false, Boolean(options.refresh), signal, (value, catalog) => {
         const owned = ownedAssignmentCourse(catalog, course);
         try { project(value.data, value.course); return assignmentCourseMatches(value.course, owned); }
         catch { return false; }
-      }, 'assignment', 'all', trace);
+      }, 'assignment', 'all', trace, options.refreshScope);
       trace.stage = 'final_session'; await options.validate(); signal.throwIfAborted();
       trace.stage = 'projection'; return project(value.data, value.course);
     })();
@@ -834,8 +916,9 @@ export function createLearningxReader(store: SessionStore, key: Buffer, connect:
     readTerms: owner => execute(owner, 'course-terms', async (_client, catalog) => ({
       items: catalog.terms ?? [], defaultTermId: catalog.defaultTermId ?? null,
     }), undefined, false, false, undefined, undefined, undefined, 'terms'),
-    readCourse: (owner, courseId) => execute(owner, `course:${courseId}`, async (client, catalog) => {
+    readCourse: (owner, courseId, options = {}) => sourceRead(owner, `course:${courseId}`, options, (read, generation) => execute(owner, `course:${courseId}`, async (client, catalog) => {
       const course = ownedCourse(catalog, courseId);
+      await read.validate?.(); read.signal?.throwIfAborted();
       const modules = await client.modules(courseId);
       let lessons: CourseRead['lessons'] = null;
       try { if (typeof client.lessons === 'function') lessons = await client.lessons(courseId); }
@@ -846,7 +929,8 @@ export function createLearningxReader(store: SessionStore, key: Buffer, connect:
       }
       return { course, modules, lessons, observedAt: new Date().toISOString(), assignmentMappingVersion: 1 as const,
         commonsMappingVersion: 3 as const, usePureCanvas: catalog.commonsModes?.[courseId] ?? null };
-    }).then(value => { warmMaterials(owner, value); return value; }),
+    }, generation, false, Boolean(read.refresh), read.signal, undefined, undefined, undefined, undefined, read.refreshScope)
+      .then(value => { if (!read.refresh) warmMaterials(owner, value); return value; })),
     readActivity: (owner, courseId, moduleItemId) => selectedActivity(owner, courseId, moduleItemId).then(value => { warmOpenedMaterial(owner, value); return value; }),
     ...(materialReporter ? { recordMaterialView } : {}),
     readMaterial: (owner, courseId, moduleItemId, options) => material(owner, courseId, moduleItemId, undefined, false, options?.refresh),
@@ -894,14 +978,16 @@ export function createLearningxReader(store: SessionStore, key: Buffer, connect:
         throw new AppError(503, 'SCHOOL_RESULT_UNAVAILABLE', '학교 결과 갱신을 확인하지 못했습니다. 다시 시도해 주세요.');
       }
     },
-    readAssignments: (owner, courseId, options) => assignmentRead(owner, courseId, `assignments:${courseId}`, options,
-      (client, signal) => client.assignments(courseId, signal),
-      (value, course) => publicAssignments(value, courseId, course)),
+    readAssignments: (owner, courseId, options) => sourceRead(owner, `assignments:${courseId}`, options,
+      (read, generation) => assignmentRead(owner, courseId, `assignments:${courseId}`, read,
+        (client, signal) => client.assignments(courseId, signal),
+        (value, course) => publicAssignments(value, courseId, course), generation)),
     readAssignment: (owner, courseId, id, options) => {
       assignmentId.parse(id);
-      return assignmentRead(owner, courseId, `assignment:${courseId}:${id}`, options,
-        (client, signal) => client.assignmentDetail(courseId, id, signal),
-        (value, course) => publicAssignmentDetail(value, courseId, id, course));
+      return sourceRead(owner, `assignment:${courseId}:${id}`, options,
+        (read, generation) => assignmentRead(owner, courseId, `assignment:${courseId}:${id}`, read,
+          (client, signal) => client.assignmentDetail(courseId, id, signal),
+          (value, course) => publicAssignmentDetail(value, courseId, id, course), generation));
     },
     readAssignmentHistory: async (owner, courseId, id, options) => {
       assignmentId.parse(courseId); assignmentId.parse(id);
@@ -979,31 +1065,45 @@ export function createLearningxReader(store: SessionStore, key: Buffer, connect:
     },
     readCalendar: async (owner, input, options) => {
       const query = calendarQuery.parse(input);
-      const signal = AbortSignal.any([options.signal, AbortSignal.timeout(90_000)]);
-      const operation = (async () => {
-        signal.throwIfAborted(); await options.validate(); signal.throwIfAborted();
-        const value = await execute<CalendarSnapshot>(owner, `calendar:v3:${query.start}:${query.end}:${query.courseId ?? 'all'}`,
+      const resource = `calendar:v3:${query.start}:${query.end}:${query.courseId ?? 'all'}`;
+      const value = await sourceRead(owner, resource, options, async (read, generation) => {
+        const signal = AbortSignal.any([read.signal, AbortSignal.timeout(90_000)]);
+        signal.throwIfAborted(); await read.validate(); signal.throwIfAborted();
+        const snapshot = await execute<CalendarSnapshot>(owner, resource,
           async (client, catalog, generation) => {
             if (query.courseId) ownedCourse(catalog, query.courseId);
-            await options.validate(); signal.throwIfAborted();
+            await read.validate(); signal.throwIfAborted();
             const result = await client.calendar(query, signal);
             return {data: publicCalendar(result, query, catalog), mappingGeneration: generation};
-          }, undefined, false, Boolean(options.refresh), signal, (value, catalog) => {
+          }, generation, false, Boolean(read.refresh), signal, (value, catalog) => {
             if (query.courseId) ownedCourse(catalog, query.courseId);
             return calendarMatchesCatalog(value.data, query, catalog);
-          });
-        await options.validate(); signal.throwIfAborted();
-        return calendarWithModules(owner, value, {...options, signal});
-      })();
-      return abortableRead(operation, signal, 'calendar');
+          }, 'calendar', undefined, undefined, read.refreshScope);
+        await read.validate(); signal.throwIfAborted();
+        // Source invalidation already removed the stale module proofs. Resource mode
+        // can use the just-verified current catalog when filling those exact misses.
+        return calendarWithModules(owner, snapshot, { ...read, signal, refresh: read.refreshScope === 'resource' ? false : read.refresh });
+      });
+      if (!options.refresh) return value;
+      const proof = calendarProofs.get(value);
+      if (!proof) throw new WarmupCancelled();
+      const result = { ...value }; calendarProofs.set(result, proof); return result;
     },
     validateCalendar,
-    readTasks: (owner, options) => execute<TasksRead>(owner, 'tasks', async (client, catalog, generation) => {
+    readTasks: async (owner, options = {}) => {
+      const value = await sourceRead(owner, 'tasks', options, (read, generation) => execute<TasksRead>(owner, 'tasks', async (client, catalog, generation) => {
+      await read.validate?.(); read.signal?.throwIfAborted();
       const groups = catalog.termIds.length ? await client.todos(catalog.termIds) : [];
       const ids = new Set(catalog.courses.map(course => course.id));
       if (groups.some(group => !ids.has(group.courseId))) throw new SchoolError('unexpected_response');
       return { catalog, groups, observedAt: new Date().toISOString(), taskMappingVersion: 4, mappingGeneration: generation };
-    }, undefined, false, false, options?.signal, undefined, 'tasks').then(value => tasksWithCachedModules(owner, value, options)),
+      }, generation, false, Boolean(read.refresh), read.signal, undefined, 'tasks', undefined, undefined, read.refreshScope)
+        .then(value => tasksWithCachedModules(owner, value, read)));
+      if (!options.refresh) return value;
+      const proof = taskProofs.get(value);
+      if (!proof) throw new WarmupCancelled();
+      const result = { ...value }; taskProofs.set(result, proof); return result;
+    },
     validateTasks,
     readAttendance: (owner, courseId) => execute(owner, courseId ? `attendance:${courseId}` : 'attendance', async (client, catalog) => {
       const courses = courseId ? [ownedCourse(catalog, courseId)] : catalog.courses;

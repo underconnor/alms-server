@@ -4,7 +4,7 @@ import type { SchoolResult } from './domain.js';
 import { publicCalendar, type CalendarQuery, type CalendarData } from './calendar.js';
 import { SchoolError, type SchoolActivityDetail, type SchoolCourse, type SchoolModule, type SchoolCourseTodos, type SchoolLessonWeek, type SchoolLessonAttendance } from '@alms/ssu-api';
 import { AppError } from './errors.js';
-import type { MaterialReadOptions, SyllabusReadOptions, CalendarReadOptions, TasksReadOptions, AssignmentReadOptions, MaterialViewObservation, SchoolProvider, CourseCatalogOptions, LearningStatusRefreshOptions } from './provider.js';
+import type { MaterialReadOptions, SyllabusReadOptions, CalendarReadOptions, TasksReadOptions, AssignmentReadOptions, MaterialViewObservation, SchoolProvider, CourseCatalogOptions, CourseReadOptions, LearningStatusRefreshOptions } from './provider.js';
 import { isMaterialViewer } from './material-cache.js';
 import type { VideoRequest, VideoResponse } from './video-stream.js';
 import { currentSchoolWeek } from './current-school-week.js';
@@ -36,7 +36,7 @@ export interface LearningxReader {
   // Only data leaves the owner-locked operation; the authenticated client and jar never do.
   catalog(userId: string, options?: CourseCatalogOptions): Promise<Catalog>;
   readTerms?(userId: string): Promise<{ items: CourseTerm[]; defaultTermId: string | null }>;
-  readCourse(userId: string, courseId: string): Promise<CourseRead>;
+  readCourse(userId: string, courseId: string, options?: CourseReadOptions): Promise<CourseRead>;
   readActivity?(userId: string, courseId: string, moduleItemId: string): Promise<ActivityRead>;
   recordMaterialView?(userId: string, courseId: string, moduleItemId: string, observation: MaterialViewObservation,
     validate: () => Promise<void>): Promise<MaterialViewRead>;
@@ -411,8 +411,8 @@ export function createLearningxReads(reader: LearningxReader, playbackSelectable
       await reader.validateTasks!(context.userId, proof.value, context.sessionTokenHash);
     }) } satisfies Pick<SchoolProvider, 'validateTasks'> : {}),
     attendance: (context, courseId) => read(async () => ({ items: publicAttendance(await reader.readAttendance(context.userId, courseId)) })),
-    course: (context, courseId) => read(async () => {
-      const value = await reader.readCourse(context.userId, courseId);
+    course: (context, courseId, options) => read(async () => {
+      const value = await reader.readCourse(context.userId, courseId, options);
       return publicCourseContent(value, Boolean(reader.readActivity), playbackSelectable);
     }),
   };

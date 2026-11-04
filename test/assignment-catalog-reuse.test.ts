@@ -112,6 +112,23 @@ test('explicit refresh obtains a fresh planning catalog and rejects revoked owne
   await assert.rejects(reader.readAssignment!('a', '10', '91', { ...options(), refresh: true }), { statusCode: 404 });
   assert.equal(f.count('backend_terms'), 3); assert.equal(f.count('sdk_self'), 1);
 });
+test('resource refresh avoids duplicate backend planning but retains fresh SDK identity and all-term enrollment', async () => {
+  const f = fixture(), reader = f.reader(); await reader.catalog('a');
+  await reader.readAssignments!('a', '10', { ...options(), refresh: true, refreshScope: 'resource' });
+  assert.equal(f.count('backend_terms'), 1); assert.equal(f.count('sdk_self'), 1);
+  assert.equal(f.count('sdk_terms'), 1); assert.equal(f.count('sdk_courses'), 1); assert.equal(f.count('sdk_list'), 1);
+  f.state.sdkCurrent = false;
+  await assert.rejects(reader.readAssignment!('a', '10', '90', { ...options(), refresh: true, refreshScope: 'resource' }), { statusCode: 502 });
+  assert.equal(f.count('backend_terms'), 1); assert.equal(f.count('sdk_self'), 2); assert.equal(f.count('sdk_detail'), 0);
+});
+test('equivalent resource refreshes share a source read while each caller keeps its ALMS validation', async () => {
+  const f = fixture(), reader = f.reader(); await reader.catalog('a'); const wait = gate();
+  f.state.load = () => wait.promise;
+  const a = reader.readAssignment!('a', '10', '90', { ...options(), refresh: true, refreshScope: 'resource' });
+  const b = reader.readAssignment!('a', '10', '90', { ...options(), refresh: true, refreshScope: 'resource' });
+  await flush(); assert.equal(f.count('sdk_self'), 1); wait.release(); assert.deepEqual(await a, await b);
+  assert.equal(f.count('sdk_self'), 1);
+});
 test('generation replacement and ALMS revocation during real SDK load withhold the result and do not replace a newer jar', async () => {
   for (const mode of ['generation', 'logout', 'alms']) {
     const f = fixture(), reader = f.reader(); await reader.catalog('a'); const wait = gate(); f.state.load = () => wait.promise;

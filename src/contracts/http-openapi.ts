@@ -215,6 +215,7 @@ const parameters = {
   client: { name: 'X-ALMS-Client-Id', in: 'header', required: false, schema: clientId, description: 'Required with bearer authentication. If provided with cookie, must equal the session-bound registered client.' },
   idempotency: { name: 'Idempotency-Key', in: 'header', required: true, schema: uuid, description: 'Reuse only for the identical accepted request. Uncertain writes must be read back, not retried with a new key.' },
   refresh: { name: 'refresh', in: 'query', required: false, schema: { const: '1' }, description: 'Explicit refresh only. No duplicate query parameter.' },
+  sourceRefresh: { name: 'refresh', in: 'query', required: false, schema: { type: 'string', enum: ['1', 'resource'] }, description: 'Explicit source revalidation. 1 preserves full catalog refresh; resource revalidates this resource while retaining only verified display context. Identity, enrollment and session checks remain required. No duplicate query parameter.' },
   download: { name: 'download', in: 'query', required: false, schema: { const: '1' } },
 };
 const paths: Record<string, Record<string, Operation>> = {};
@@ -259,7 +260,9 @@ add('get', '/version', 'Runtime version', object({ name: { const: 'alms-backend'
 add('get', '/.well-known/alms-api', 'Public HTTP and optional read-only MCP interface discovery', object({
   contractVersion: { const: '2026-10-22' },
   http: object({ openapi: { type: 'string', format: 'uri' }, featureSupport: { type: 'string', format: 'uri' },
-    clientPackage: { const: '@alms/http-client' }, schoolSdkPackage: { const: '@alms/ssu-api' } }),
+    clientPackage: { const: '@alms/http-client' }, schoolSdkPackage: { const: '@alms/ssu-api' },
+    freshness: object({ queryParameter: { const: 'refresh' }, modes: { type: 'array', items: enumeration('1', 'resource'), minItems: 2, maxItems: 2 },
+      resources: { type: 'array', items: enumeration('course', 'assignments', 'tasks', 'calendar'), minItems: 4, maxItems: 4 } }) }),
   mcp: object({ enabled: bool, endpoint: { type: 'string', format: 'uri' }, resourceMetadata: { type: 'string', format: 'uri' },
     readOnly: { const: true }, authorization: { const: 'oauth2_authorization_code_pkce_s256' }, clientId: { const: 'alms-codex' },
     scopes: { type: 'array', items: { const: 'alms:read' }, minItems: 1, maxItems: 1 } }),
@@ -303,12 +306,12 @@ add('post', '/v1/auth/logout', 'Revoke this ALMS session', null, { status: 204, 
 add('get', '/v1/dashboard', 'Dashboard data', ref('Dashboard'), { queries: [query('detail', { const: 'overview' })], errors: ['SCHOOL_PROVIDER_UNAVAILABLE'] });
 add('get', '/v1/course-terms', 'Owned school term selection', ref('CourseTerms'));
 add('get', '/v1/courses', 'Owned course catalog', ref('CourseList'), { queries: [query('termId', schoolId)] });
-add('get', course, 'Owned course and all week activities', ref('CourseContent'));
+add('get', course, 'Owned course and all week activities', ref('CourseContent'), { queries: [parameters.sourceRefresh] });
 add('get', course + '/completions', 'Owner personal completion overrides', object({ items: array(ref('PersonalCompletion')) }));
 add('patch', activity + '/completion', 'Set owner personal completion override', ref('PersonalCompletion'), { body: object({ completed: bool }, undefined, true), errors: ['COURSE_UNAVAILABLE'], description: 'Personal planning only; never school progress, attendance or submission.' });
 add('delete', activity + '/completion', 'Restore school completion default', null, { status: 204, description: 'No request body. Deletes only personal override.' });
-add('get', course + '/assignments', 'Complete owned assignment list', ref('Assignments'), { queries: [parameters.refresh], errors: ['ASSIGNMENTS_UNAVAILABLE'] });
-add('get', assignment, 'Owned assignment instructions, evaluation and own submission', ref('AssignmentDetail'), { queries: [parameters.refresh], pathSchemas: { id: schoolId, assignmentId: schoolId }, errors: ['ASSIGNMENTS_UNAVAILABLE'] });
+add('get', course + '/assignments', 'Complete owned assignment list', ref('Assignments'), { queries: [parameters.sourceRefresh], errors: ['ASSIGNMENTS_UNAVAILABLE'] });
+add('get', assignment, 'Owned assignment instructions, evaluation and own submission', ref('AssignmentDetail'), { queries: [parameters.sourceRefresh], pathSchemas: { id: schoolId, assignmentId: schoolId }, errors: ['ASSIGNMENTS_UNAVAILABLE'] });
 add('get', assignment + '/files/{fileId}', 'Owned instruction or current submission attachment', null, { binary: 'application/octet-stream', queries: [parameters.download, parameters.refresh],
   description: 'Actual validated MIME is returned; PDF/image/text/octet-stream supported. Original school file name is provided in Content-Disposition. No range support.', pathSchemas: { id: schoolId, assignmentId: schoolId, fileId: schoolId }, errors: ['ASSIGNMENT_FILE_UNAVAILABLE'] });
 add('get', assignment + '/submission-history', 'School-returned own submission history', ref('AssignmentHistory'), { queries: [parameters.refresh], pathSchemas: { id: schoolId, assignmentId: schoolId }, errors: ['ASSIGNMENTS_UNAVAILABLE'] });
@@ -366,8 +369,8 @@ add('get', course + '/syllabus', 'Owned syllabus metadata', ref('Syllabus'), { q
 add('get', course + '/syllabus/material', 'Owned syllabus PDF', null, { binary: 'application/pdf', queries: [parameters.refresh], errors: ['SYLLABUS_UNAVAILABLE'] });
 add('get', '/v1/timetable', 'Owned u-SAINT timetable', ref('Timetable'));
 add('get', '/v1/attendance', 'School lesson attendance', ref('Attendance'), { queries: [query('courseId', identifier)] });
-add('get', '/v1/tasks', 'School pending activities with exact module links', ref('Tasks'), { description: 'Feed is pending school activities, not proof of item submission. Personal override is separate and comes from this owner on each read.' });
-add('get', '/v1/calendar', 'Owned school calendar range', ref('Calendar'), { queries: [query('start', { type: 'string', format: 'date' }, true), query('end', { type: 'string', format: 'date' }, true), query('courseId', schoolId), parameters.refresh],
+add('get', '/v1/tasks', 'School pending activities with exact module links', ref('Tasks'), { queries: [parameters.sourceRefresh], description: 'Feed is pending school activities, not proof of item submission. Personal override is separate and comes from this owner on each read.' });
+add('get', '/v1/calendar', 'Owned school calendar range', ref('Calendar'), { queries: [query('start', { type: 'string', format: 'date' }, true), query('end', { type: 'string', format: 'date' }, true), query('courseId', schoolId), parameters.sourceRefresh],
   description: 'Seoul [start,end), 1–31 days; dates2000–2100. School userSubmitted and personalCompleted remain independent.', errors: ['CALENDAR_UNAVAILABLE'] });
 add('get', '/v1/todos', 'Owner personal TODO list (at most 500)', object({ items: array(ref('Todo'), 500), complete: bool, hasMore: bool, limit: { const: 500 } }), {
   description: 'Newest personal TODOs, ordered by createdAt then id descending. complete and hasMore are exact inverses for this owner at the query snapshot, based on one extra bounded row. They describe list truncation, not task completion. No cursor or total count is provided.',

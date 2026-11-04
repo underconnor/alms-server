@@ -13,6 +13,7 @@ test('public discovery distinguishes browser HTTP client from school SDK and dis
     assert.equal(result.statusCode, 200);
     assert.equal(result.headers['cache-control'], 'no-store');
     assert.deepEqual(result.json(), apiDiscovery(config));
+    assert.deepEqual(result.json().http.freshness, { queryParameter: 'refresh', modes: ['1', 'resource'], resources: ['course', 'assignments', 'tasks', 'calendar'] });
     assert.equal(result.json().mcp.enabled, false);
     assert.equal((await app.inject({ method: 'POST', url: '/mcp', payload: {} })).statusCode, 404);
     assert.equal(result.body.includes('encryption'), false);

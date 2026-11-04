@@ -135,7 +135,7 @@ client_id = "alms-codex"
 
 ## 전송·프로토콜
 
-- 설치 SDK는 `@modelcontextprotocol/server` 2.3.1과 `@modelcontextprotocol/node` 2.1.1이다. 하나의 도구 factory를 `createMcpHandler({ legacy: 'stateless' })` 방식으로 요청마다 생성한다.
+- 설치 SDK는 `@modelcontextprotocol/server` 2.4.0과 `@modelcontextprotocol/node` 2.1.2이다. 하나의 도구 factory를 `createMcpHandler({ legacy: 'stateless' })` 방식으로 요청마다 생성한다.
 - 2025 계열은 initialize/initialized 후 POST 요청을 받는 stateless fallback, 2026-07-28은 `server/discover`와 요청별 metadata를 사용하는 경로다. SDK가 두 형식의 wire 차이를 처리한다.
 - POST에는 JSON 본문과 `Accept: application/json, text/event-stream`이 필요하다. 2026 계열은 protocol version·method·도구 이름 등의 표준 header/metadata도 사용한다. SDK 클라이언트를 통해 구성하고 버전별 JSON을 혼용하지 않는다.
 - 응답은 JSON 또는 요청별 SSE다. GET·DELETE는 stateless 모드에서 405이며 프로토콜 세션 ID를 발급하지 않는다.
