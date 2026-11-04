@@ -10,12 +10,14 @@ import { jobClaim, type PlaybackAdmission, type PlaybackFinalProof, type WorkerC
 
 export interface SchoolContext { userId: string }
 export interface PlaybackContext extends SchoolContext { claim: WorkerClaim }
+export interface SourceReadOptions { refresh?: boolean; refreshScope?: 'resource' }
+export interface CourseReadOptions extends SourceReadOptions { signal?: AbortSignal; validate?: () => Promise<void> }
 export interface SyllabusReadOptions { refresh?: boolean; signal: AbortSignal; validate: () => Promise<void> }
-export interface AssignmentReadOptions { refresh?: boolean; signal: AbortSignal; validate: () => Promise<void> }
-export interface CalendarReadOptions { refresh?: boolean; signal: AbortSignal; validate: () => Promise<void>;
+export interface AssignmentReadOptions extends SourceReadOptions { signal: AbortSignal; validate: () => Promise<void> }
+export interface CalendarReadOptions extends SourceReadOptions { signal: AbortSignal; validate: () => Promise<void>;
   // Internal owner-scoped DB callback; only these calendar assignment courses may need cold module reads.
   personalCompletionCourses?: (courseIds: readonly string[]) => Promise<readonly string[]> }
-export interface TasksReadOptions { signal?: AbortSignal; validate?: () => Promise<void>;
+export interface TasksReadOptions extends SourceReadOptions { signal?: AbortSignal; validate?: () => Promise<void>;
   personalCompletionCourses?: (courseIds: readonly string[]) => Promise<readonly string[]> }
 export interface MaterialReadOptions { refresh?: boolean }
 export interface LearningStatusRefreshOptions { signal: AbortSignal; validate: () => Promise<void> }
@@ -50,7 +52,7 @@ export interface SchoolProvider {
   dashboard?(context: SchoolContext, options?: DashboardReadOptions): Promise<unknown>;
   courses?(context: SchoolContext, options?: CourseCatalogOptions): Promise<unknown>;
   courseTerms?(context: SchoolContext): Promise<unknown>;
-  course?(context: SchoolContext, courseId: string): Promise<unknown>;
+  course?(context: SchoolContext, courseId: string, options?: CourseReadOptions): Promise<unknown>;
   activity?(context: SchoolContext, courseId: string, moduleItemId: string): Promise<unknown>;
   // Called only after an explicit material view. Reads and cache warmups never invoke this.
   recordMaterialView?(context: SchoolContext, courseId: string, moduleItemId: string, observation: MaterialViewObservation, validate: () => Promise<void>): Promise<unknown>;

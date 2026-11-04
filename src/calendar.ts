@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { AppError } from './errors.js';
 import { SchoolError } from '@alms/ssu-api';
 import type { Catalog } from './school-read.js';
+import { sourceRefresh } from './source-read-query.js';
 
 const day = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(value => {
   const date = new Date(`${value}T00:00:00Z`);
@@ -13,7 +14,7 @@ export const calendarQuery = z.object({ start: day, end: day, courseId: courseId
   return days >= 1 && days <= 31;
 });
 export type CalendarQuery = z.infer<typeof calendarQuery>;
-export const calendarReadQuery = z.object({ start: day, end: day, courseId: courseId.optional(), refresh: z.literal('1').optional() }).strict();
+export const calendarReadQuery = z.object({ start: day, end: day, courseId: courseId.optional(), refresh: sourceRefresh.optional() }).strict();
 const instant = z.iso.datetime({ offset: true }).nullable();
 const item = z.object({
   id: z.string().min(1).max(200).regex(/^[A-Za-z0-9:_-]+$/), type: z.enum(['event', 'assignment']),

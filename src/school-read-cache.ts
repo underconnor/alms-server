@@ -7,8 +7,9 @@ export type SchoolCacheEntry<T = unknown> = { value: T; expiresAt: number };
 export interface SchoolReadCache {
   get<T>(scope: SchoolCacheScope): Promise<SchoolCacheEntry<T> | null>;
   put(scope: SchoolCacheScope, value: unknown, ttlMs: number): Promise<boolean>;
-  delete(owner: string, provider: string, resource?: string): Promise<void>;
+  delete(owner: string, provider: string, resource?: string, generation?: string, expectedEncryptedSession?: string): Promise<void>;
   deleteMany?(owner: string, provider: string, resources: readonly string[], signal?: AbortSignal): Promise<void>;
+  deleteRelated?(owner: string, provider: string, generation: string, courseIds: readonly string[], excludeResource: string, signal?: AbortSignal): Promise<void>;
 }
 export function schoolCacheTtl(resource: string): number {
   if (resource === 'catalog' || resource.startsWith('catalog:')) return 5 * 60_000;
@@ -94,7 +95,25 @@ export class PgSchoolReadCache implements SchoolReadCache {
       await query('DELETE FROM school_read_cache WHERE user_id=$1 AND provider=$2 AND resource_key=ANY($3::text[])', [owner, provider, unique]);
     }, { signal, timeoutMs: 5000 });
   }
-  async delete(owner: string, provider: string, resource?: string) {
-    await this.pool.query('DELETE FROM school_read_cache WHERE user_id=$1 AND provider=$2 AND ($3::text IS NULL OR resource_key=$3)', [owner, provider, resource ?? null]);
+  async deleteRelated(owner: string, provider: string, generation: string, courseIds: readonly string[], excludeResource: string, signal?: AbortSignal) {
+    const unique = [...new Set(courseIds)];
+    if (courseIds.length > 100 || unique.some(id => !/^[1-9]\d{0,15}$/.test(id))
+      || !generation || generation.length > 200 || !excludeResource || excludeResource.length > 512)
+      throw new Error('CACHE_RESOURCE_LIMIT');
+    const exact = unique.flatMap(id => [`course:${id}`, `calendar-modules:${id}`, `assignments:${id}`]);
+    const prefixes = unique.map(id => `assignment:${id}:`);
+    await workerTransaction(this.pool, async query => {
+      await query(`DELETE FROM school_read_cache WHERE user_id=$1 AND provider=$2 AND generation=$3 AND resource_key<>$4
+        AND (resource_key='tasks' OR (starts_with(resource_key,'calendar:v3:') AND split_part(resource_key,':',5)=ANY(array_append($7::text[],'all')))
+          OR resource_key=ANY($5::text[])
+          OR EXISTS(SELECT 1 FROM unnest($6::text[]) AS prefixes(value) WHERE starts_with(resource_key,prefixes.value)))`,
+      [owner, provider, generation, excludeResource, exact, prefixes, unique]);
+    }, { signal, timeoutMs: 5000 });
+  }
+  async delete(owner: string, provider: string, resource?: string, generation?: string, expectedEncryptedSession?: string) {
+    await this.pool.query(`DELETE FROM school_read_cache WHERE user_id=$1 AND provider=$2
+      AND ($3::text IS NULL OR resource_key=$3) AND ($4::uuid IS NULL OR generation=$4::uuid)
+      AND ($5::text IS NULL OR EXISTS(SELECT 1 FROM school_sessions s WHERE s.user_id=$1 AND s.provider=$2 AND s.encrypted_state=$5))`,
+      [owner, provider, resource ?? null, generation ?? null, expectedEncryptedSession ?? null]);
   }
 }

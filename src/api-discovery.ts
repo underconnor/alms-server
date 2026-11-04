@@ -5,7 +5,8 @@ export function apiDiscovery(config: Pick<Config, 'apiOrigin' | 'mcp'>) {
   return {
     contractVersion: '2026-10-22',
     http: { openapi: `${config.apiOrigin}/openapi.json`, featureSupport: `${config.apiOrigin}/v1/features`,
-      clientPackage: '@alms/http-client', schoolSdkPackage: '@alms/ssu-api' },
+      clientPackage: '@alms/http-client', schoolSdkPackage: '@alms/ssu-api',
+      freshness: { queryParameter: 'refresh', modes: ['1', 'resource'], resources: ['course', 'assignments', 'tasks', 'calendar'] } },
     mcp: { enabled: Boolean(config.mcp), endpoint: `${config.apiOrigin}/mcp`,
       resourceMetadata: `${config.apiOrigin}/.well-known/oauth-protected-resource/mcp`,
       readOnly: true, authorization: 'oauth2_authorization_code_pkce_s256', clientId: 'alms-codex', scopes: ['alms:read'] },

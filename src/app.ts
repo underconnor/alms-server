@@ -29,7 +29,7 @@ import { captureEvent } from './analytics.js';
 import { registerAuth, sessionCookieName } from './auth.js';
 import { validateVideoAccess } from './video-stream.js';
 import { calendarQuery, calendarReadQuery, awaitCalendarRead } from './calendar.js';
-import { assignmentId, assignmentReadQuery, awaitAssignmentRead } from './assignments.js';
+import { assignmentId, awaitAssignmentRead } from './assignments.js';
 import { assignmentFileDisposition, publicAssignmentFile } from './assignment-files.js';
 import { registerJobVerification } from './job-verification.js';
 import { registerActivityLearningStatus } from './activity-learning-status.js';
@@ -38,6 +38,7 @@ import { defaultFrontendClientId, getFrontendClient } from './frontend-clients.j
 import { providerFeatures } from './feature-support.js';
 import { httpOpenApi } from './contracts/http-openapi.js';
 import { apiDiscovery } from './api-discovery.js';
+import { sourceReadQuery, sourceReadOptions } from './source-read-query.js';
 import { playbackIsReady, type PlaybackReadinessReader } from './playback-worker-readiness.js';
 export { setSessionCookie } from './auth.js';
 
@@ -57,9 +58,9 @@ const safeEqual = (a: string,b: string) => {
   const left = Buffer.from(a); const right = Buffer.from(b);
   return left.length === right.length && timingSafeEqual(left,right);
 };
-function awaitTasksRead<T>(pending: Promise<T>, signal: AbortSignal): Promise<T> {
+function awaitTasksRead<T>(pending: Promise<T>, signal: AbortSignal, message = '할 일 조회가 중단됐습니다. 다시 시도해 주세요.'): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const abort = () => reject(new AppError(503, 'SCHOOL_PROVIDER_UNAVAILABLE', '할 일 조회가 중단됐습니다. 다시 시도해 주세요.'));
+    const abort = () => reject(new AppError(503, 'SCHOOL_PROVIDER_UNAVAILABLE', message));
     signal.addEventListener('abort', abort, {once: true}); if (signal.aborted) abort();
     void pending.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
   });
@@ -191,7 +192,7 @@ export async function buildApp(config: Config, store: Store, provider: SchoolPro
   });
   app.get('/v1/timetable',protectedRoute,async request => readSchool(provider,'timetable',owner(request)));
   app.get('/v1/tasks',protectedRoute,async (request, reply) => {
-    z.object({}).strict().parse(request.query);
+    const query = sourceReadQuery.parse(request.query);
     if (!provider.tasks) throw unavailable();
     const controller = new AbortController(), signal = AbortSignal.any([controller.signal, AbortSignal.timeout(90_000)]);
     const abort = () => controller.abort(); request.raw.once('aborted', abort); reply.raw.once('close', abort);
@@ -201,7 +202,7 @@ export async function buildApp(config: Config, store: Store, provider: SchoolPro
     };
     try {return await awaitTasksRead((async () => {
     signal.throwIfAborted();
-    const observedTasks = await provider.tasks!({userId: owner(request)}, {signal, validate,
+    const observedTasks = await provider.tasks!({userId: owner(request)}, {signal, validate, ...sourceReadOptions(query.refresh),
       personalCompletionCourses: async courseIds => {
         signal.throwIfAborted();
         const rows = await store.listCompletionsForCourses(owner(request), courseIds);
@@ -260,7 +261,7 @@ export async function buildApp(config: Config, store: Store, provider: SchoolPro
     try {
       return await awaitCalendarRead((async () => {
         signal.throwIfAborted(); await validate(); signal.throwIfAborted();
-        const result = await provider.calendar!({ userId: owner(request) }, query, { signal, validate, ...(refresh ? { refresh: true } : {}),
+        const result = await provider.calendar!({ userId: owner(request) }, query, { signal, validate, ...sourceReadOptions(refresh),
           personalCompletionCourses: async courseIds => {
             signal.throwIfAborted();
             const rows = await store.listCompletionsForCourses(owner(request), courseIds);
@@ -284,7 +285,7 @@ export async function buildApp(config: Config, store: Store, provider: SchoolPro
   });
   for (const detail of [false, true]) {
     app.get('/v1/courses/:id/assignments' + (detail ? '/:assignmentId' : ''), protectedRoute, async (request, reply) => {
-      const query = assignmentReadQuery.parse(request.query);
+      const query = sourceReadQuery.parse(request.query);
       const params = z.object({ id: assignmentId, assignmentId: detail ? assignmentId : z.undefined().optional() }).parse(request.params);
       if (detail ? !provider.assignment : !provider.assignments) throw unavailable('ASSIGNMENTS_UNAVAILABLE');
       const controller = new AbortController(), signal = AbortSignal.any([controller.signal, AbortSignal.timeout(90_000)]);
@@ -297,7 +298,7 @@ export async function buildApp(config: Config, store: Store, provider: SchoolPro
       try {
         return await awaitAssignmentRead((async () => {
           signal.throwIfAborted(); await validate(); signal.throwIfAborted();
-          const options = { signal, validate, ...(query.refresh ? { refresh: true } : {}) };
+          const options = { signal, validate, ...sourceReadOptions(query.refresh) };
           stage = 'school_read';
           const result = detail ? await provider.assignment!({ userId: owner(request) }, params.id, params.assignmentId!, options)
             : await provider.assignments!({ userId: owner(request) }, params.id, options);
@@ -339,9 +340,24 @@ export async function buildApp(config: Config, store: Store, provider: SchoolPro
     if (!provider.attendance) throw unavailable();
     return provider.attendance({ userId: owner(request) },query.courseId);
   });
-  app.get('/v1/courses/:id',protectedRoute,async request => {
+  app.get('/v1/courses/:id',protectedRoute,async (request, reply) => {
+    const query = sourceReadQuery.parse(request.query);
+    const courseId = identifier.parse((request.params as { id: string }).id);
     if (!provider.course) throw unavailable();
-    return provider.course({ userId: owner(request) },identifier.parse((request.params as { id: string }).id));
+    if (!query.refresh) return provider.course({ userId: owner(request) }, courseId);
+    const controller = new AbortController(), signal = AbortSignal.any([controller.signal, AbortSignal.timeout(90_000)]);
+    const abort = () => controller.abort(); request.raw.once('aborted', abort); reply.raw.once('close', abort);
+    const validate = async () => {
+      const session = await store.getSession(request.session!.tokenHash);
+      if (!session || session.user.id !== owner(request)) throw new AppError(401, 'AUTH_REQUIRED', '다시 로그인해 주세요.');
+    };
+    try {
+      return await awaitTasksRead((async () => {
+        signal.throwIfAborted(); await validate(); signal.throwIfAborted();
+        const result = await provider.course!({ userId: owner(request) }, courseId, { signal, validate, ...sourceReadOptions(query.refresh) });
+        await validate(); signal.throwIfAborted(); return result;
+      })(), signal, '강좌 조회가 중단됐습니다. 다시 시도해 주세요.');
+    } finally { request.raw.off('aborted', abort); reply.raw.off('close', abort); }
   });
   for (const material of [false, true]) {
     app.get('/v1/courses/:id/syllabus' + (material ? '/material' : ''), protectedRoute, async (request, reply) => {
