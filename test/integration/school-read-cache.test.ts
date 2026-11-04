@@ -120,7 +120,7 @@ describe('encrypted school JSON cache in real PostgreSQL', { skip: !databaseUrl 
     await cache.deleteRelated(a.scope.owner, 'ssu', a.scope.generation, ['10', '10'], 'assignments:10');
     const removed = new Set(['tasks', 'calendar:v3:2026-11-01:2026-11-30:all', 'calendar:v3:2026-10-01:2026-10-31:10', 'course:10', 'calendar-modules:10', 'assignment:10:90']);
     const current = (await pool.query('SELECT resource_key FROM school_read_cache WHERE user_id=$1 AND provider=$2 AND generation=$3 ORDER BY resource_key',
-      [a.scope.owner, 'ssu', a.scope.generation])).rows.map(row => row.resource_key);
+      [a.scope.owner, 'ssu', a.scope.generation])).rows.map(row => row.resource_key).sort();
     assert.deepEqual(current, resources.filter(resource => !removed.has(resource)).sort());
     assert.deepEqual((await cache.get({ ...a.scope, resource: 'assignments:10' }))?.value, { resource: 'assignments:10' });
     assert.deepEqual((await cache.get({ ...b.scope, resource: 'course:10' }))?.value, { other: true });

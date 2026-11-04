@@ -112,7 +112,7 @@ export class PgSchoolReadCache implements SchoolReadCache {
   }
   async delete(owner: string, provider: string, resource?: string, generation?: string, expectedEncryptedSession?: string) {
     await this.pool.query(`DELETE FROM school_read_cache WHERE user_id=$1 AND provider=$2
-      AND ($3::text IS NULL OR resource_key=$3) AND ($4::text IS NULL OR generation=$4)
+      AND ($3::text IS NULL OR resource_key=$3) AND ($4::uuid IS NULL OR generation=$4::uuid)
       AND ($5::text IS NULL OR EXISTS(SELECT 1 FROM school_sessions s WHERE s.user_id=$1 AND s.provider=$2 AND s.encrypted_state=$5))`,
       [owner, provider, resource ?? null, generation ?? null, expectedEncryptedSession ?? null]);
   }
