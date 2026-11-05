@@ -468,14 +468,19 @@ export function createLearningxReader(store: SessionStore, key: Buffer, connect:
       return { course, detail, observedAt: new Date().toISOString() };
     }, generation, false, fresh);
 
-  // Cold TODO loads modules only for its own persisted-override courses; never the whole catalog.
-  async function tasksWithCachedModules(owner: string, value: TasksRead, options: TasksReadOptions = {}): Promise<TasksRead> {
-    const signal = options.signal ?? AbortSignal.timeout(90_000);
-    const candidates = [...new Set(value.groups.filter(group => group.items.some(item =>
+  function taskModuleCourses(value: TasksRead): string[] {
+    return [...new Set(value.groups.filter(group => group.items.some(item =>
       item.componentType === 'assignment' && item.assignmentId
       || item.componentType === 'commons' && item.componentId && ['movie', 'mp4', 'pdf', 'file', 'readystream'].includes(item.commonsType ?? '')
         && value.catalog.commonsModes?.[group.courseId] === true)).map(group => group.courseId))];
-    const requested = options.personalCompletionCourses ? await options.personalCompletionCourses(candidates) : [];
+  }
+  // Cold TODO loads modules only for its own persisted overrides or exact courses
+  // already selected in this generation; source invalidation still discards the old proof.
+  async function tasksWithCachedModules(owner: string, value: TasksRead, options: TasksReadOptions = {}, selectedCourses: readonly string[] = []): Promise<TasksRead> {
+    const signal = options.signal ?? AbortSignal.timeout(90_000);
+    const candidates = taskModuleCourses(value);
+    const overrides = options.personalCompletionCourses ? await options.personalCompletionCourses(candidates) : [];
+    const requested = [...new Set([...overrides, ...selectedCourses])];
     const modules = await planningModules(owner, value.mappingGeneration, candidates, requested,
       {signal, validate: options.validate ?? (async () => {})}, 'tasks');
     signal.throwIfAborted();
@@ -525,6 +530,23 @@ export function createLearningxReader(store: SessionStore, key: Buffer, connect:
     if (!session.generation || session.generation !== expected) throw new WarmupCancelled();
     return session.generation;
   }
+  // Caller holds the owner lock. Cache presence selects bounded revalidation work;
+  // its module payload is never retained across explicit source invalidation.
+  async function cachedPlanningModule(owner: string, generation: string | undefined, courseId: string, signal: AbortSignal): Promise<CourseRead | undefined> {
+    await planningGeneration(owner, generation); signal.throwIfAborted();
+    const encrypted = await store.getEncryptedSchoolSession(owner, 'ssu');
+    if (!encrypted) throw new AppError(401, 'SCHOOL_AUTH_REQUIRED', '학교 로그인이 필요합니다.');
+    const entry = cache.get(owner)?.generation === generation ? cache.get(owner) : undefined;
+    for (const resource of [`course:${courseId}`, `calendar-modules:${courseId}`]) {
+      let cached = entry?.values.get(resource);
+      if ((!cached || cached.expiresAt <= Date.now() || !cachedCompatible(resource, cached.value)) && durable)
+        cached = await durable.get<CourseRead>({owner, provider: 'ssu', generation: generation!, resource, encryptedSession: encrypted}).catch(() => null) ?? undefined;
+      const value = cached?.value as CourseRead | undefined;
+      if (cached && cached.expiresAt > Date.now() && cachedCompatible(resource, value)
+        && value?.course.id === courseId && Array.isArray(value.modules)) return value;
+    }
+    return undefined;
+  }
   async function planningModules(owner: string, generation: string | undefined, candidates: readonly string[], requested: readonly string[],
     options: {signal: AbortSignal; validate: () => Promise<void>; refresh?: boolean}, kind: 'calendar' | 'tasks'): Promise<NonNullable<TasksRead['moduleProofs']>> {
     const coldCourses = new Set(requested);
@@ -534,21 +556,7 @@ export function createLearningxReader(store: SessionStore, key: Buffer, connect:
     const modules: NonNullable<TasksRead['moduleProofs']> = [];
     for (const courseId of candidates) {
       options.signal.throwIfAborted();
-      let proof = await withSchoolSessionLock(owner, async () => {
-        await planningGeneration(owner, generation); options.signal.throwIfAborted();
-        const encrypted = await store.getEncryptedSchoolSession(owner, 'ssu');
-        if (!encrypted) throw new AppError(401, 'SCHOOL_AUTH_REQUIRED', '학교 로그인이 필요합니다.');
-        const entry = cache.get(owner)?.generation === generation ? cache.get(owner) : undefined;
-        for (const resource of [`course:${courseId}`, `calendar-modules:${courseId}`]) {
-          let cached = entry?.values.get(resource);
-          if ((!cached || cached.expiresAt <= Date.now() || !cachedCompatible(resource, cached.value)) && durable)
-            cached = await durable.get<CourseRead>({owner, provider: 'ssu', generation: generation!, resource, encryptedSession: encrypted}).catch(() => null) ?? undefined;
-          const value = cached?.value as CourseRead | undefined;
-          if (cached && cached.expiresAt > Date.now() && cachedCompatible(resource, value)
-            && value?.course.id === courseId && Array.isArray(value.modules)) return value;
-        }
-        return undefined;
-      });
+      let proof = await withSchoolSessionLock(owner, () => cachedPlanningModule(owner, generation, courseId, options.signal));
       if ((!proof || options.refresh) && coldCourses.has(courseId)) {
         proof = await execute<CourseRead>(owner, `calendar-modules:${courseId}`, async (client, catalog) => {
           const course = ownedCourse(catalog, courseId);
@@ -1091,14 +1099,25 @@ export function createLearningxReader(store: SessionStore, key: Buffer, connect:
     },
     validateCalendar,
     readTasks: async (owner, options = {}) => {
-      const value = await sourceRead(owner, 'tasks', options, (read, generation) => execute<TasksRead>(owner, 'tasks', async (client, catalog, generation) => {
-      await read.validate?.(); read.signal?.throwIfAborted();
-      const groups = catalog.termIds.length ? await client.todos(catalog.termIds) : [];
-      const ids = new Set(catalog.courses.map(course => course.id));
-      if (groups.some(group => !ids.has(group.courseId))) throw new SchoolError('unexpected_response');
-      return { catalog, groups, observedAt: new Date().toISOString(), taskMappingVersion: 4, mappingGeneration: generation };
-      }, generation, false, Boolean(read.refresh), read.signal, undefined, 'tasks', undefined, undefined, read.refreshScope)
-        .then(value => tasksWithCachedModules(owner, value, read)));
+      const value = await sourceRead(owner, 'tasks', options, (read, generation) => {
+        const selectedCourses = new Set<string>();
+        return execute<TasksRead>(owner, 'tasks', async (client, catalog, generation) => {
+          await read.validate?.(); read.signal?.throwIfAborted();
+          const groups = catalog.termIds.length ? await client.todos(catalog.termIds) : [];
+          const ids = new Set(catalog.courses.map(course => course.id));
+          if (groups.some(group => !ids.has(group.courseId))) throw new SchoolError('unexpected_response');
+          const snapshot: TasksRead = { catalog, groups, observedAt: new Date().toISOString(), taskMappingVersion: 4, mappingGeneration: generation };
+          // execute holds the current owner lock. Remember only which exact course
+          // proofs existed before it invalidates related metadata, then re-read those
+          // modules below. No old payload, caller-supplied course scope or catalog fanout.
+          if (read.refresh) for (const course of taskModuleCourses(snapshot)) {
+            const proof = await cachedPlanningModule(owner, generation, course, read.signal ?? AbortSignal.timeout(90_000));
+            if (proof) selectedCourses.add(course);
+          }
+          return snapshot;
+        }, generation, false, Boolean(read.refresh), read.signal, undefined, 'tasks', undefined, undefined, read.refreshScope)
+          .then(value => tasksWithCachedModules(owner, value, read, [...selectedCourses]));
+      });
       if (!options.refresh) return value;
       const proof = taskProofs.get(value);
       if (!proof) throw new WarmupCancelled();
