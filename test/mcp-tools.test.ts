@@ -282,3 +282,108 @@ test('pre-cancelled requests do not reach the owner validator or provider', asyn
   const result = await tools.call('alms_list_courses', {}, principal({ validate: async () => { calls++; } }), { signal: controller.signal });
   assert.equal(payload(result).error.code, 'MCP_CANCELLED'); assert.equal(calls, 0);
 });
+
+const refreshingTools = [
+  ['alms_get_course', { courseId: '10' }],
+  ['alms_list_assignments', { courseId: '10' }],
+  ['alms_get_assignment', { courseId: '10', assignmentId: '90' }],
+  ['alms_list_tasks', {}],
+  ['alms_get_calendar', { start: '2026-10-01', end: '2026-10-02' }],
+] as const;
+
+test('only the five source-backed metadata tools advertise optional shared refresh modes', () => {
+  const supported = new Set(refreshingTools.map(([name]) => name));
+  for (const definition of createMcpReadTools({ provider: base(), store }).listToolDefinitions()) {
+    const fields = definition.inputSchema.properties as Record<string, { enum?: string[] }>;
+    if (!supported.has(definition.name as typeof refreshingTools[number][0])) {
+      assert.equal(fields.refresh, undefined); continue;
+    }
+    assert.deepEqual(fields.refresh?.enum, ['1', 'resource']);
+    assert.equal(((definition.inputSchema.required ?? []) as string[]).includes('refresh'), false);
+    assert.equal(definition.inputSchema.additionalProperties, false);
+  }
+});
+
+test('metadata source modes reach only authenticated provider options and preserve exact planning proofs', async () => {
+  for (const refresh of [undefined, 'resource', '1'] as const) for (const [name, args] of refreshingTools) {
+    let captured: Record<string, unknown> | undefined, owner: string | undefined, checks = 0, proofs = 0;
+    const taskData = tasks(), calendarData = calendar();
+    const capture = (context: { userId: string }, options: unknown) => { owner = context.userId; captured = options as Record<string, unknown>; };
+    const provider: McpReadProvider = { ...base(),
+      course: async (context, _id, options) => { capture(context, options); return publicCourseContent({ course, modules: [] }); },
+      assignments: async (context, _id, options) => { capture(context, options); return assignmentListFixture(); },
+      assignment: async (context, _id, _assignment, options) => { capture(context, options); return assignmentFixture(); },
+      tasks: async (context, options) => { capture(context, options); return taskData; },
+      calendar: async (context, _query, options) => { capture(context, options); return calendarData as any; },
+      validateTasks: async (_context, value) => { assert.equal(value, taskData); proofs++; },
+      validateCalendar: async (_context, value) => { assert.equal(value, calendarData); proofs++; },
+    };
+    const result = await call(provider, name, { ...args, ...(refresh ? { refresh } : {}) }, principal({ validate: async () => { checks++; } }));
+    assert.equal(result.isError, undefined, name + ': ' + JSON.stringify(result));
+    assert.equal(owner, 'owner-a'); assert.ok(captured);
+    assert.equal(captured.refresh, refresh ? true : undefined);
+    assert.equal(captured.refreshScope, refresh === 'resource' ? 'resource' : undefined);
+    assert.equal(captured.signal instanceof AbortSignal, true);
+    assert.equal(typeof captured.validate, 'function');
+    await (captured.validate as () => Promise<void>)();
+    assert.equal(checks >= 3, true);
+    assert.equal('generation' in captured || 'catalog' in captured || 'userId' in captured, false);
+    assert.equal(proofs, ['alms_list_tasks', 'alms_get_calendar'].includes(name) ? 1 : 0);
+  }
+});
+
+test('invalid refresh values and foreign authority arguments fail before any metadata source call', async () => {
+  let reads = 0;
+  const read = async () => { reads++; throw new Error('Source must not run'); };
+  const provider = { ...base(), course: read, assignments: read, assignment: read, tasks: read, calendar: read } as McpReadProvider;
+  for (const [name, args] of refreshingTools) {
+    for (const refresh of [true, false, null, 1, 'full', '0', ['resource'], {}]) {
+      assert.equal(payload(await call(provider, name, { ...args, refresh })).error.code, 'MCP_INVALID_ARGUMENTS');
+    }
+    for (const authority of [{ userId: 'other' }, { generation: 'other' }, { catalog: [] }, { token: 'private' }]) {
+      assert.equal(payload(await call(provider, name, { ...args, refresh: 'resource', ...authority })).error.code, 'MCP_INVALID_ARGUMENTS');
+    }
+  }
+  assert.equal(reads, 0);
+});
+
+test('a requested fresh assignment read discovers the added source item without treating cached output as fresh', async () => {
+  const one = assignmentListFixture(), two = { ...one, items: [...one.items, { ...one.items[0]!, id: '91', title: '새 합성 과제' }] };
+  let schoolHasNew = false; const seen: unknown[] = [];
+  const provider = { ...base(), assignments: async (_context: unknown, _courseId: string, options: { refresh?: boolean; refreshScope?: string }) => {
+    seen.push({ refresh: options.refresh, refreshScope: options.refreshScope }); return options.refresh && schoolHasNew ? two : one;
+  } } as McpReadProvider;
+  assert.equal(payload(await call(provider, 'alms_list_assignments', { courseId: '10' })).data.items.length, 1);
+  schoolHasNew = true;
+  assert.equal(payload(await call(provider, 'alms_list_assignments', { courseId: '10' })).data.items.length, 1);
+  assert.equal(payload(await call(provider, 'alms_list_assignments', { courseId: '10', refresh: 'resource' })).data.items.length, 2);
+  assert.deepEqual(seen, [{ refresh: undefined, refreshScope: undefined }, { refresh: undefined, refreshScope: undefined }, { refresh: true, refreshScope: 'resource' }]);
+});
+
+test('revocation and cancellation during explicit source revalidation suppress otherwise valid metadata', async () => {
+  let valid = true;
+  const revoked = await call({ ...base(), course: async (_context, _courseId, options) => {
+    assert.equal(options?.refreshScope, 'resource'); valid = false; await options!.validate!(); return publicCourseContent({ course, modules: [] });
+  } }, 'alms_get_course', { courseId: '10', refresh: 'resource' }, principal({ validate: async () => {
+    if (!valid) throw new AppError(401, 'MCP_AUTH_REQUIRED', 'private upstream content');
+  } }));
+  assert.equal(payload(revoked).error.code, 'MCP_AUTH_REQUIRED'); assert.doesNotMatch(JSON.stringify(revoked), /합성 강좌|private upstream/);
+
+  let began!: () => void; const started = new Promise<void>(resolve => { began = resolve; });
+  const controller = new AbortController();
+  const tools = createMcpReadTools({ store, provider: { ...base(), course: async (_context, _id, options) => {
+    assert.equal(options?.refresh, true); assert.ok(options.signal); began();
+    await new Promise<void>(resolve => options.signal!.addEventListener('abort', () => resolve(), { once: true }));
+    return publicCourseContent({ course, modules: [] });
+  } } });
+  const pending = tools.call('alms_get_course', { courseId: '10', refresh: '1' }, principal(), { signal: controller.signal });
+  await started; controller.abort(); const cancelled = await pending;
+  assert.equal(payload(cancelled).error.code, 'MCP_CANCELLED'); assert.equal(payload(cancelled).data, undefined);
+});
+
+test('source refresh admission saturation is normalized as MCP_BUSY without upstream diagnostic content', async () => {
+  const result = await call({ ...base(), assignments: async () => { throw new AppError(429, 'SOURCE_REFRESH_BUSY', 'private source diagnostic'); } },
+    'alms_list_assignments', { courseId: '10', refresh: 'resource' });
+  assert.equal(result.isError, true); assert.equal(payload(result).error.code, 'MCP_BUSY');
+  assert.doesNotMatch(JSON.stringify(result), /private source diagnostic|SOURCE_REFRESH_BUSY/);
+});
