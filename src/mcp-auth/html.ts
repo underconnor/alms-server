@@ -3,7 +3,7 @@ export function consentHtml(input: { action: string; csrf: string; nonce: string
   return page('ALMS 연결 승인', `<p class="eyebrow">ALMS · MCP</p><h1>학습 정보 조회를 허용할까요?</h1>
     <p>${escape(input.displayName ?? '로그인한 사용자')} 계정으로 <strong>${escape(input.clientId)}</strong>에 연결합니다.</p>
     <ul><li>본인의 강좌·주차·과제 설명과 제출 현황</li><li>시간표·할 일·캘린더·학교 학습 상태</li></ul>
-    <p class="muted">허용한 조회 권한은 이 ALMS 로그인 유효기간 안에서 자동 갱신됩니다. 로그아웃하거나 로그인 유효기간이 끝나면 연결과 갱신 권한도 만료됩니다. 파일 제출, 수강 시작, 학교 진도·출석 변경 권한은 제공하지 않습니다.</p>
+    <p class="muted">허용한 조회 권한은 이번 승인에 사용한 ALMS 로그인 유효기간 안에서 자동 갱신됩니다. 해당 로그인을 로그아웃하거나 유효기간이 끝나면 연결과 갱신 권한도 만료됩니다. 새 연결을 승인해도 기존 연결은 유지되며, 연결마다 별도 권한을 가집니다. 파일 제출, 수강 시작, 학교 진도·출석 변경 권한은 제공하지 않습니다.</p>
     <form method="post" action="${escape(input.action)}"><input type="hidden" name="csrf" value="${escape(input.csrf)}"><input type="hidden" name="nonce" value="${escape(input.nonce)}">
     <div class="actions"><button name="decision" value="approve">조회 허용</button><button class="secondary" name="decision" value="deny">취소</button></div></form>`);
 }

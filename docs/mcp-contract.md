@@ -70,7 +70,11 @@ Issuer는 정확한 `API_ORIGIN/oauth`, resource와 access token audience는 정
 
 승인·취소 POST는 Provider에 결과를 저장한 뒤 **200 private HTML**로 응답한다. 새 문서의 즉시 meta refresh가 동일 Origin의 정확한 interaction resume URL을 GET으로 열며, 같은 URL의 ‘계속하기’ 링크도 제공한다. `form-action 'self'`와 기존 Origin·CSRF·nonce·세션 검증은 유지하고, 폼 POST의 303 연쇄로 loopback callback까지 이동하지 않는다. resume에서 등록된 native callback으로 돌려보낸 뒤, 승인된 경우 클라이언트가 code를 교환한다.
 
-Interaction은 최대 **15분**, 화면의 단회 동의 nonce는 최대 **10분**이며 nonce는 승인할 ALMS 세션보다 오래 유효하지 않다. Code는 최대 **60초**, access token은 최대 **300초**, refresh token은 발급마다 최대 **24시간**이며 모두 원래 승인 세션의 남은 유효기간으로 제한된다. 명시적으로 조회·갱신을 승인한 등록 클라이언트에만 refresh token을 발급한다. 갱신 요청마다 원래 승인·소유자·ALMS 세션을 다시 확인하고 토큰을 회전하며, ALMS 세션 밖의 오프라인 접근은 허용하지 않는다. 이전 refresh token을 다시 사용하면 관련 grant를 폐기한다.
+Interaction은 최대 **15분**, 화면의 단회 동의 nonce는 최대 **10분**이며 nonce는 승인할 ALMS 세션보다 오래 유효하지 않다. Code는 최대 **60초**, access token은 최대 **300초**, refresh token은 발급마다 최대 **24시간**이다. 새 발급의 TTL은 최초 승인 만료와 발급 시 다시 확인한 정확한 부모 ALMS 세션 만료 중 이른 값으로 제한한다. 이미 발급한 토큰의 exp를 DB에서 다시 쓰지는 않으며, 부모가 그 뒤 만료되면 exp가 남아도 live 검증에서 차단한다. 명시적으로 조회·갱신을 승인한 등록 클라이언트에만 refresh token을 발급한다. 갱신 요청마다 원래 승인·소유자·ALMS 세션을 다시 확인하고 토큰을 회전하며, ALMS 세션 밖의 오프라인 접근은 허용하지 않는다. 이전 refresh token을 다시 사용하면 관련 grant를 폐기한다.
+
+각 명시 승인은 별도 Grant를 생성한다. 같은 브라우저에서 새 연결을 승인해도 이전 연결의 Grant·권한·만료를 교체하거나 연장하지 않는다. 등록 native client·단일 read scope/resource·S256·유효한 account/Grant/ALMS 부모를 확인한 AuthorizationCode에만 조건부 `expiresWithSession` 정책을 적용한다. 이 연결의 수명 기준은 해당 ALMS 승인과 정확한 부모 세션이며 OIDC browser Session의 최신 Grant 포인터·cookie 소멸만으로 종료하지 않는다. provider가 이를 `persistsLogout`으로 표시하더라도 `offline_access`를 허용하거나 부모의 수명을 연장하는 의미가 아니다. 다른 source kind에는 이 정책을 적용하지 않는다.
+
+이 정책은 새 버전에서 발급하는 연결부터 적용된다. 이미 발급된 Session-bound code/token flag를 DB에서 바꾸지 않으므로, 이전 재승인으로 종료된 연결은 새 명시 승인이 필요하다. 두 번째 승인을 완료한 뒤 아직 code를 교환하지 않은 경우에도, 새 정책으로 이미 발급한 첫 연결은 유지한다. 개별 Grant 폐기·refresh replay는 해당 연결에만 적용하고 다른 연결까지 조용히 폐기하지 않는다.
 
 기존 OIDC 쿠키가 있어도 현재 유효한 기본 ALMS 로그인이 필요하다. 이전 OIDC 계정과 현재 ALMS 계정이 다르면 동의 화면과 승인 POST에서 중단한다. 다른 계정의 기존 grant를 재사용하거나 현재 계정의 승인으로 바꾸지 않는다. 같은 계정으로 새 ALMS 세션을 만든 경우에도 새 동의가 필요하며, 이전 승인·refresh의 만료를 연장하지 않는다.
 
