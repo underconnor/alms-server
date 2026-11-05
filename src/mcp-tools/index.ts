@@ -7,6 +7,7 @@ import { AppError } from '../errors.js';
 import { providerFeatures } from '../feature-support.js';
 import { calendarQuery } from '../calendar.js';
 import { publicVerifiedSchoolResult } from '../job-verification.js';
+import { sourceRefresh, sourceReadOptions } from '../source-read-query.js';
 import { checked, equalTarget, features, object, project, rows, type Projection } from './validation.js';
 import { mcpOutputSchema } from './output-schema.js';
 
@@ -20,12 +21,12 @@ const schemas = {
   alms_get_capabilities: z.object({}).strict(),
   alms_list_terms: z.object({ limit }).strict(),
   alms_list_courses: z.object({ termId: id.optional(), limit }).strict(),
-  alms_get_course: z.object({ courseId: id, weekId: id.optional(), limit }).strict(),
+  alms_get_course: z.object({ courseId: id, weekId: id.optional(), limit, refresh: sourceRefresh.optional() }).strict(),
   alms_get_activity: z.object({ courseId: id, activityId: id, maxTextChars }).strict(),
-  alms_list_assignments: z.object({ courseId: id, limit }).strict(),
-  alms_get_assignment: z.object({ courseId: id, assignmentId: id, maxTextChars }).strict(),
-  alms_list_tasks: z.object({ courseId: id.optional(), limit }).strict(),
-  alms_get_calendar: z.object({ start: z.string(), end: z.string(), courseId: id.optional(), limit }).strict(),
+  alms_list_assignments: z.object({ courseId: id, limit, refresh: sourceRefresh.optional() }).strict(),
+  alms_get_assignment: z.object({ courseId: id, assignmentId: id, maxTextChars, refresh: sourceRefresh.optional() }).strict(),
+  alms_list_tasks: z.object({ courseId: id.optional(), limit, refresh: sourceRefresh.optional() }).strict(),
+  alms_get_calendar: z.object({ start: z.string(), end: z.string(), courseId: id.optional(), limit, refresh: sourceRefresh.optional() }).strict(),
   alms_get_timetable: z.object({ limit }).strict(),
   alms_get_attendance: z.object({ courseId: id.optional(), limit }).strict(),
   alms_get_learning_status: z.object({ courseId: id, activityId: id }).strict(),
@@ -35,12 +36,12 @@ const descriptions: Record<ToolName, string> = {
   alms_get_capabilities: 'Read supported school features and the separate read-only MCP policy. Target permissions still require a selected school read.',
   alms_list_terms: 'Read this user’s school-returned academic terms. Default terms are not an assertion of the calendar-current term.',
   alms_list_courses: 'Read owned courses, optionally in a school-returned term. No enrollment or school login is started.',
-  alms_get_course: 'Read owned weeks and activity metadata. Optional weekId narrows output; limit caps activities across all returned weeks.',
+  alms_get_course: 'Read owned weeks and activity metadata. Optional weekId narrows output; limit caps activities across all returned weeks. Optional refresh="resource" revalidates school metadata; refresh="1" retains full catalog verification.',
   alms_get_activity: 'Read one activity’s plain text and school metadata. No media, viewer URL, playback, progress report or read receipt.',
-  alms_list_assignments: 'Read the full school assignment collection, bounded for this response. Submission and learning completion remain separate.',
-  alms_get_assignment: 'Read one assignment’s instructions and current school submission, grading and attachment metadata. Never submit or reconcile.',
-  alms_list_tasks: 'Read school pending activities and owner personal completion overrides. Absence from this feed is not submission proof.',
-  alms_get_calendar: 'Read school events and own submission flags in a Seoul [start,end) date range of at most31days.',
+  alms_list_assignments: 'Read the full school assignment collection, bounded for this response. Submission and learning completion remain separate. Optional refresh="resource" revalidates school metadata; refresh="1" retains full catalog verification.',
+  alms_get_assignment: 'Read one assignment’s instructions and current school submission, grading and attachment metadata. Never submit or reconcile. Optional refresh="resource" revalidates school metadata; refresh="1" retains full catalog verification.',
+  alms_list_tasks: 'Read school pending activities and owner personal completion overrides. Absence from this feed is not submission proof. Optional refresh="resource" revalidates school metadata; refresh="1" retains full catalog verification.',
+  alms_get_calendar: 'Read school events and own submission flags in a Seoul [start,end) date range of at most31days. Optional refresh="resource" revalidates school metadata; refresh="1" retains full catalog verification.',
   alms_get_timetable: 'Read the owner’s school timetable and verified course links. No inferred cross-course identifiers.',
   alms_get_attendance: 'Read school lesson attendance. Keep lesson status separate from individual video progress and recognized values.',
   alms_get_learning_status: 'Fresh read of one activity’s school progress and evidence. Does not play, report, or change learning completion.',
@@ -86,7 +87,8 @@ function toolError(error: unknown): McpReadToolResult {
       MCP_TIMEOUT: '조회 시간이 초과됐습니다.', MCP_BUSY: '이전 조회가 진행 중입니다. 잠시 후 다시 시도해 주세요.',
       RATE_LIMITED: '잠시 후 다시 시도해 주세요.', NOT_FOUND: '선택한 학교 항목을 찾지 못했습니다.',
     };
-    if (Object.hasOwn(messages, error.code)) { code = error.code; message = messages[code]!; }
+    const safeCode = error.code === 'SOURCE_REFRESH_BUSY' ? 'MCP_BUSY' : error.code;
+    if (Object.hasOwn(messages, safeCode)) { code = safeCode; message = messages[code]!; }
   } else if (error instanceof SchoolError) {
     const normalized = {
       authentication_required: ['SCHOOL_AUTH_REQUIRED', '학교 인증을 갱신해 주세요.'],
@@ -124,6 +126,7 @@ export function createMcpReadTools({ provider, store }: { provider: McpReadProvi
         const run = async () => {
           const context = { userId: principal.userId };
           const validate = async () => { live(signal); await wait(principal.validate(signal), signal); live(signal); };
+          const revalidation = sourceReadOptions(parsed.refresh as '1' | 'resource' | undefined);
           const projection: Projection = { textTruncated: false, textLimit: Number(parsed.maxTextChars ?? 10_000) };
           const meta: Record<string, unknown> = { source: 'school', schoolRecordWrites: false, textTruncated: false };
           let data: unknown, finalProof = false;
@@ -160,7 +163,7 @@ export function createMcpReadTools({ provider, store }: { provider: McpReadProvi
             }
             case 'alms_get_course': {
               if (!provider.course) throw unavailable();
-              const raw = safeSource('CourseContent', await read(() => provider.course!(context, String(parsed.courseId))));
+              const raw = safeSource('CourseContent', await read(() => provider.course!(context, String(parsed.courseId), { ...revalidation, signal, validate })));
               equalTarget(raw.course, String(parsed.courseId), 'id');
               const all = rows(raw.weeks); let left = Number(parsed.limit), total = 0;
               for (const week of all) for (const activity of rows(week.activities)) equalTarget(activity, String(parsed.courseId));
@@ -184,7 +187,7 @@ export function createMcpReadTools({ provider, store }: { provider: McpReadProvi
             }
             case 'alms_list_assignments': {
               if (!provider.assignments) throw unavailable();
-              const raw = safeSource('Assignments', await read(() => provider.assignments!(context, String(parsed.courseId), { signal, validate })));
+              const raw = safeSource('Assignments', await read(() => provider.assignments!(context, String(parsed.courseId), { ...revalidation, signal, validate })));
               equalTarget(raw, String(parsed.courseId)); for (const item of rows(raw.items)) equalTarget(item, String(parsed.courseId));
               data = { courseId: raw.courseId, ...(raw.course ? { course: project('AssignmentCourseContext', raw.course, projection) } : {}),
                 items: take(rows(raw.items), raw.complete).map(item => project('Assignment', item, projection)),
@@ -192,14 +195,14 @@ export function createMcpReadTools({ provider, store }: { provider: McpReadProvi
             }
             case 'alms_get_assignment': {
               if (!provider.assignment) throw unavailable();
-              const raw = safeSource('AssignmentDetail', await read(() => provider.assignment!(context, String(parsed.courseId), String(parsed.assignmentId), { signal, validate })));
+              const raw = safeSource('AssignmentDetail', await read(() => provider.assignment!(context, String(parsed.courseId), String(parsed.assignmentId), { ...revalidation, signal, validate })));
               equalTarget(raw, String(parsed.courseId)); equalTarget(raw, String(parsed.assignmentId), 'id');
               if (raw.course) equalTarget(raw.course, String(parsed.courseId), 'id');
               data = project('AssignmentDetail', raw, projection); break;
             }
             case 'alms_list_tasks': {
               if (!provider.tasks || !provider.validateTasks) throw unavailable();
-              const original = await read(() => provider.tasks!(context, { signal, validate, personalCompletionCourses: completionCourses }));
+              const original = await read(() => provider.tasks!(context, { ...revalidation, signal, validate, personalCompletionCourses: completionCourses }));
               const raw = safeSource('Tasks', original), all = rows(raw.items);
               const courses = rows(raw.courses).map(course => String(course.id));
               if (parsed.courseId && !courses.includes(String(parsed.courseId))) throw new AppError(404, 'NOT_FOUND', 'Missing course');
@@ -218,7 +221,7 @@ export function createMcpReadTools({ provider, store }: { provider: McpReadProvi
             case 'alms_get_calendar': {
               if (!provider.calendar || !provider.validateCalendar) throw unavailable();
               const query = calendarQuery.parse({ start: parsed.start, end: parsed.end, ...(parsed.courseId ? { courseId: parsed.courseId } : {}) });
-              const original = await read(() => provider.calendar!(context, query, { signal, validate, personalCompletionCourses: completionCourses }));
+              const original = await read(() => provider.calendar!(context, query, { ...revalidation, signal, validate, personalCompletionCourses: completionCourses }));
               const raw = safeSource('Calendar', original), all = rows(raw.items);
               if (raw.start !== query.start || raw.end !== query.end || parsed.courseId && all.some(item => item.courseId !== parsed.courseId)) throw invalid();
               const courses = rows(raw.courses).map(course => String(course.id));

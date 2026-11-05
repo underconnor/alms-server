@@ -2,6 +2,10 @@
 
 이 문서는 조회 전용 Remote MCP의 구현 계약이다. REST API는 [HTTP 계약](http-contract.md)을 따른다.
 
+현재 Codex CLI 연결·등록 예시는 [Codex CLI 안내](codex-cli.md)를 따른다. 아래0.141.0 운영 검증은 당시 이력이며 현재 설치 버전의 합성 상호운용 결과와 구분한다.
+
+2026-11-05에는 설치0.164.0의 실제 localhost 합성 상호운용을 확인했다. 별도 운영 OAuth1회는 CLI exit0 뒤 callback 오류와 MCP401/refresh400·도구 조회0회를 관찰했으므로 현재 운영 조회 성공으로 확대하지 않는다. 해당 진단과 명령 설정의 범위는 위 CLI 안내를 따른다.
+
 ## 실제 검증 범위
 
 2026-10-23 Codex CLI 0.141.0으로 운영 OAuth 연결과 아래 조회 도구 각각의 실제 호출 한 표본을 확인했다.
@@ -153,17 +157,25 @@ CLI 버전이나 명령 형식만으로 프로토콜 상호운용 성공을 판�
 | `alms_get_capabilities` | 없음 | 학교 기능 지원 상태와 MCP의 별도 읽기 정책. 대상별 권한 성공은 의미하지 않음 |
 | `alms_list_terms` | `limit?` | 학교가 반환한 학기 목록. 달력상 현재 학기를 추정하지 않음 |
 | `alms_list_courses` | `termId?`, `limit?` | 본인 강좌 목록과 선택된 학기 |
-| `alms_get_course` | `courseId`, `weekId?`, `limit?` | 주차·활동 metadata. limit은 반환할 모든 주차의 활동 합계에 적용 |
+| `alms_get_course` | `courseId`, `weekId?`, `limit?`, `refresh?` | 주차·활동 metadata. limit은 반환할 모든 주차의 활동 합계에 적용 |
 | `alms_get_activity` | `courseId`, `activityId`, `maxTextChars?` | 활동 본문 텍스트·학습 metadata. 파일·영상 bytes나 viewer URL 없음 |
-| `alms_list_assignments` | `courseId`, `limit?` | 학교 과제 목록. 제출·학습 완료는 별도 값 |
-| `alms_get_assignment` | `courseId`, `assignmentId`, `maxTextChars?` | 과제 설명·제출 현황·평가·첨부 metadata. 업로드·재확인·제출 없음 |
-| `alms_list_tasks` | `courseId?`, `limit?` | 본인 학교 TODO와 개인 완료값. 목록에 없다는 사실은 제출 증거가 아님 |
-| `alms_get_calendar` | `start`, `end`, `courseId?`, `limit?` | Asia/Seoul 날짜의 `[start,end)` 학교 일정·본인 제출/개인 완료값. 최대 31일 |
+| `alms_list_assignments` | `courseId`, `limit?`, `refresh?` | 학교 과제 목록. 제출·학습 완료는 별도 값 |
+| `alms_get_assignment` | `courseId`, `assignmentId`, `maxTextChars?`, `refresh?` | 과제 설명·제출 현황·평가·첨부 metadata. 업로드·제출 결과 정리 없음 |
+| `alms_list_tasks` | `courseId?`, `limit?`, `refresh?` | 본인 학교 TODO와 개인 완료값. 목록에 없다는 사실은 제출 증거가 아님 |
+| `alms_get_calendar` | `start`, `end`, `courseId?`, `limit?`, `refresh?` | Asia/Seoul 날짜의 `[start,end)` 학교 일정·본인 제출/개인 완료값. 최대 31일 |
 | `alms_get_timetable` | `limit?` | 본인 시간표와 검증한 강좌 관계 |
 | `alms_get_attendance` | `courseId?`, `limit?` | 학교 차시 출결. 영상 진도·개별 출석·인정값과 구분 |
 | `alms_get_learning_status` | `courseId`, `activityId` | 해당 활동의 fresh 학교 진도·근거. 재생·보고·완료 변경 없음 |
 
 `limit`은 기본 50, 1–200이다. `maxTextChars`는 기본 10,000, 100–30,000이며 텍스트를 자르면 `meta.textTruncated`로 표시한다. 목록 cap은 응답 크기 제한이지 cursor pagination이 아니다. 다음 페이지 cursor를 제공한다고 가정하지 않는다.
+
+### 명시적 원본 재검증
+
+위5개 metadata 도구의 `refresh`는 선택적 문자열 enum `"resource"` 또는 `"1"`이다. 생략하면 기존 cache 허용 읽기를 유지한다. `"resource"`는 같은 owner/학교 세대의 검증된 표시용 catalog를 재사용할 수 있고, 학교 metadata·fresh 신원/수강권한은 재검증한다. `"1"`은 기존 전체 catalog 재확인 의미를 유지한다. HTTP와 같은 [원본 재검증 계약](source-refresh-contract.md)과 provider 옵션을 사용한다. 지원 여부는 연결된 서버의 실제 도구 input schema를 확인하며 구 서버가 이 인수를 받는다고 가정하지 않는다.
+
+예를 들어 `alms_list_assignments({"courseId":"10","refresh":"resource"})`로 최신 과제 metadata를 요청할 수 있다. ID10은 합성 예시이며 실제로 조회 권한이 있는 강좌 ID를 사용한다. 추가 owner·generation·catalog·토큰 인수, boolean refresh·알 수 없는 enum은 거절한다. 과제 제출·자료 읽음 ACK·영상 진도 보고를 실행하거나 첨부 bytes를 가져오지 않는다. Calendar/TODO는 같은 원본 DTO의 최종 proof와 개인 완료 분리를 유지한다.
+
+MCP 도구의 기존30초 예산과 caller 취소·권한 재검사는 그대로다. 하위 reader의90초 상한을 MCP의 무조건90초 대기로 확대하지 않으며, source 대기가30초를 넘으면 실패로 반환한다. 비중단 legacy 작업은 종료될 때까지 사용자 슬롯을 유지한다. 원본 갱신 admission의 `SOURCE_REFRESH_BUSY`는 안전한 기존 `MCP_BUSY`로 정규화한다. 재검증 모드를 요청했다는 사실을 공통 sourceCheckedAt·전체 feed 완전성·새 학교 항목 발견의 증거로 표현하지 않는다.
 
 현재는 **tools만 제공**한다. MCP resources·prompts, 첨부 파일/PDF/영상 bytes, 자료 텍스트 추출·검색·임베딩, 새 학교 로그인 실행, 학교 수강·과제 제출·개인 완료 변경 도구는 제공하지 않는다. 미지원 자료를 원문 URL로 대신 열거나 학교 쓰기 경로를 자동 호출하지 않는다.
 
