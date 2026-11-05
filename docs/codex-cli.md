@@ -10,7 +10,7 @@ ALMS는 별도 OAuth를 사용하는 조회 전용 Streamable HTTP MCP 서버다
 
 이 검증은0.164.0의 실제 운영 OAuth·학교 데이터 성공을 대신하지 않는다. 별도0.141.0의 과거 운영 OAuth와7개 조회 성공은 [MCP 계약의 실제 검증 이력](mcp-contract.md#실제-검증-범위)에 보존한다. 다른 클라이언트/계정/네트워크와 운영 refresh 회전·폐기는 별도 검증이 필요하다.
 
-같은 날 별도로 운영 OAuth를1회 시작해 CLI exit0을 확인했지만, 브라우저 callback 오류 관찰과 이후 MCP401/refresh400·app-server 초기화 실패를 함께 보존했다. 이 시도의 학교 조회 도구 성공은0회다. 명시적 runtime read scope를 넣은 상태 진단에서도 `notLoggedIn`/`authenticationRequired`였다. 따라서 로컬 상호운용 성공이나 OAuth CLI 종료만으로 현재 운영의0.164.0 조회가 성공했다고 보고하지 않는다. 같은 OIDC browser session의 재승인 뒤 이전 연결이 종료되는 문제는 합성 재현으로 확인했으며 [Issue14](https://github.com/underconnor/alms-server/issues/14)에서 별도로 추적한다. 이 source-refresh 변경은 해당 OAuth 수명 문제를 수정하지 않는다. 전역 설정·권한·학교 기록은 이 진단 때문에 변경하지 않았다.
+같은 날 별도로 운영 OAuth를1회 시작해 CLI exit0을 확인했지만, 브라우저 callback 오류 관찰과 이후 MCP401/refresh400·app-server 초기화 실패를 함께 보존했다. 이 시도의 학교 조회 도구 성공은0회다. 명시적 runtime read scope를 넣은 상태 진단에서도 `notLoggedIn`/`authenticationRequired`였다. 따라서 로컬 상호운용 성공이나 OAuth CLI 종료만으로 현재 운영의0.164.0 조회가 성공했다고 보고하지 않는다. 같은 OIDC browser session의 재승인 뒤 이전 연결이 종료되는 문제는 실제 provider의 합성 흐름으로 재현했으며 [Issue14](https://github.com/underconnor/alms-server/issues/14)에서 추적한다. 후속 구현은 아래 연결별 Grant 수명 정책을 적용한다. 후보 코드·회귀 통과와 운영 배포 뒤 실제 조회는 별도로 확정한다. 전역 설정·학교 기록은 이 진단 때문에 변경하지 않았다.
 
 ## 이번 명령에만 연결 설정 적용
 
@@ -26,6 +26,8 @@ codex \
 ```
 
 `-c`는 이 프로세스에만 적용돼 전역 서버 설정을 추가하지 않는다. 정상 OAuth 로그인은 Codex의 자격 증명 저장소에 연결 토큰을 저장할 수 있다. 승인한 기본 ALMS 세션이 로그아웃·만료되면 연결도 더 이상 사용할 수 없다. 학교 인증 만료와 MCP 권한 만료는 별도로 확인한다.
+
+새 버전의 명시 승인은 연결별 Grant를 사용해 다른 연결을 승인해도 기존 연결을 유지한다. 연결의 owner·원래 ALMS 부모·만료는 각각 유지하며, 해당 부모의 로그아웃·만료나 개별 폐기는 계속 적용된다. 배포 전 발급된 Session-bound 토큰을 바꾸지는 않으므로 이전 재승인으로 종료된 연결은 새로 승인해야 한다. 실제 운영에 이 정책이 반영됐는지는 해당 배포·조회 QA 결과로 확인한다.
 
 같은 설정으로 Codex를 시작한다. 이 명령 뒤 대화는 모델을 사용하며 모델 호출 비용·데이터 처리는 사용 중인 Codex 설정을 따른다.
 

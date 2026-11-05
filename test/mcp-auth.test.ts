@@ -138,5 +138,6 @@ test('consent HTML escapes all untrusted labels and does not expose a school cre
   assert.doesNotMatch(html, /<script>|type="password"|sToken|<input[^>]*name="userId"/);
   assert.match(html, /&lt;script&gt;/); assert.match(html, /name="csrf"/); assert.match(html, /name="nonce"/);
   assert.match(html, /ALMS 로그인 유효기간 안에서 자동 갱신/);
+  assert.match(html, /이번 승인에 사용한 ALMS 로그인/); assert.match(html, /새 연결을 승인해도 기존 연결은 유지/);
   assert.match(signInHtml('https://lms.flyjung.kr/#/login'), /noopener noreferrer/);
 });

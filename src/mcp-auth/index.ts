@@ -59,8 +59,10 @@ export function createMcpAuthorization(options: McpAuthorizationOptions) {
     if (!grant || grant.clientId !== options.client.id || grant.resource !== options.resource || grant.scopes.length !== 1 || grant.scopes[0] !== 'alms:read'
       || accountId !== undefined && grant.userId !== accountId) throw mcpDenied();
     const session = await options.store.getSession(grant.sessionTokenHash);
-    if (!session || session.user.id !== grant.userId || (session.clientId ?? 'alms-web') !== 'alms-web' || Date.parse(session.expiresAt) <= Date.now()) throw mcpDenied();
-    return grant;
+    const parentExpiry = session ? Date.parse(session.expiresAt) : NaN;
+    if (!session || session.user.id !== grant.userId || (session.clientId ?? 'alms-web') !== 'alms-web' || !Number.isFinite(parentExpiry) || parentExpiry <= Date.now()) throw mcpDenied();
+    // A shortened parent lifetime also caps newly issued codes and tokens.
+    return { ...grant, expiresAt: new Date(Math.min(Date.parse(grant.expiresAt), parentExpiry)).toISOString() };
   };
   const ttl = (ctx: KoaContextWithOIDC, maximum: number) => {
     const value = authority.get(ctx); if (!value) throw new errors.InvalidGrant('authorization unavailable');
@@ -81,6 +83,21 @@ export function createMcpAuthorization(options: McpAuthorizationOptions) {
       } } },
     responseTypes: ['code'], scopes: ['alms:read'], pkce: { required: () => true },
     clientBasedCORS: () => false,
+    // Each explicit approval owns its own grant. OIDC's latest-grant pointer
+    // must not invalidate an earlier connection while its exact ALMS parent
+    // remains live. Only this verified native read-code flow gets that policy;
+    // authentication, refresh and tool validation still recheck the parent.
+    expiresWithSession: async (ctx, source) => {
+      if (source.kind !== 'AuthorizationCode') return true;
+      if (ctx.oidc.params?.response_type !== 'code' || ctx.oidc.client?.clientId !== options.client.id || source.clientId !== options.client.id
+        || source.scope !== 'alms:read' || source.resource !== options.resource || source.codeChallengeMethod !== 'S256'
+        || typeof source.codeChallenge !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(source.codeChallenge)
+        || typeof source.accountId !== 'string' || !source.accountId || typeof source.grantId !== 'string' || !source.grantId)
+        throw new errors.InvalidGrant('unsupported authorization source');
+      try { authority.set(ctx, await assertAuthorization(source.grantId, source.accountId)); }
+      catch { throw new errors.InvalidGrant('authorization unavailable'); }
+      return false;
+    },
     // This refresh permission is part of the explicit ALMS read consent. It is
     // bounded by that ALMS session, never an offline authorization.
     issueRefreshToken: async (ctx, client, source) => {

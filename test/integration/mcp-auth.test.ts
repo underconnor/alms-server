@@ -6,13 +6,14 @@ import cookie from '@fastify/cookie';
 import formbody from '@fastify/formbody';
 import { Pool } from 'pg';
 import type { JWKS } from 'oidc-provider';
-import { PgStore } from '../../src/store.js';
+import { hashToken, PgStore } from '../../src/store.js';
 import { migrate } from '../../src/migrations.js';
 import { createMcpAuthorization } from '../../src/mcp-auth/index.js';
 import type { Session } from '../../src/domain.js';
 import { buildApp } from '../../src/app.js';
 import { loadConfig } from '../../src/config.js';
 import { mcpNativeRedirectUris } from '../../src/mcp-config.js';
+import { digest, McpAuthorizationRepository } from '../../src/mcp-auth/repository.js';
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 if (databaseUrl && !['/alms_test', '/alms_qa'].includes(new URL(databaseUrl).pathname)) throw new Error('Use an isolated alms_test or alms_qa database');
@@ -32,7 +33,8 @@ describe('real PostgreSQL: MCP consent, OAuth code/refresh, revocation and sessi
     }
   });
   async function fixture(ttl = 3600, withHttpApp = false, callback = redirectUri) {
-    const own = await store.issueVerifiedSession({ provider: 'mcp-integration-test', subject: randomUUID(), displayName: '합성 사용자' }, ttl);
+    const identity = { provider: 'mcp-integration-test', subject: randomUUID(), displayName: '합성 사용자' };
+    const own = await store.issueVerifiedSession(identity, ttl);
     users.push(own.user.id);
     const service = createMcpAuthorization({ apiOrigin, frontendOrigin: 'https://lms.flyjung.kr', issuer, resource, pool, store, encryptionKey: Buffer.alloc(32, 9), signingJwks,
       cookieKeys: ['synthetic-pg-cookie-signing-key-'.repeat(3)], cookieName: 'alms_session_dev', client: { id: clientId,
@@ -84,18 +86,22 @@ describe('real PostgreSQL: MCP consent, OAuth code/refresh, revocation and sessi
       assert.equal(target, expected); assert.ok(response.body.includes('href="' + expected + '"'));
       return expected;
     };
-    const approve = async () => {
+    const approveCode = async () => {
       const pending = await begin();
       const consent = await request(pending.interactionUrl, { body: { csrf: pending.csrf, nonce: pending.nonce, decision: 'approve' } });
       const finished = await request(handoffTarget(consent, pending.interactionUrl)); assert.equal(finished.statusCode, 303, finished.body);
       const returned = new URL(finished.headers.location!); assert.equal(returned.origin + returned.pathname, callback);
       assert.equal(returned.searchParams.get('state'), 'synthetic-state'); const code = returned.searchParams.get('code'); assert.ok(code, returned.search);
-      const exchanged = await request('/oauth/token', { useCookies: false, body: { grant_type: 'authorization_code', client_id: clientId,
-        redirect_uri: callback, code, code_verifier: pending.verifier, resource } });
-      assert.equal(exchanged.statusCode, 200, exchanged.body);
-      return { pending, code, tokens: exchanged.json() as { access_token: string; refresh_token: string; expires_in: number; scope: string; token_type: string } };
+      return { pending, code };
     };
-    return { app, service, own, request, start, begin, approve, handoffTarget, setBrowserToken: (token: string) => jar.set('alms_session_dev', token), close: async () => { await app.close(); await service.close(); } };
+    const exchange = async (flow: Awaited<ReturnType<typeof approveCode>>) => {
+      const exchanged = await request('/oauth/token', { useCookies: false, body: { grant_type: 'authorization_code', client_id: clientId,
+        redirect_uri: callback, code: flow.code, code_verifier: flow.pending.verifier, resource } });
+      assert.equal(exchanged.statusCode, 200, exchanged.body);
+      return exchanged.json() as { access_token: string; refresh_token: string; expires_in: number; scope: string; token_type: string };
+    };
+    const approve = async () => { const flow = await approveCode(); return { ...flow, tokens: await exchange(flow) }; };
+    return { app, service, own, identity, request, start, begin, approve, approveCode, exchange, handoffTarget, setBrowserToken: (token: string) => jar.set('alms_session_dev', token), close: async () => { await app.close(); await service.close(); } };
   }
 
   it('native variable loopback port completes code+S256 and authenticates only the verified owner, with bounded lifetime', async () => {
@@ -186,6 +192,117 @@ describe('real PostgreSQL: MCP consent, OAuth code/refresh, revocation and sessi
       assert.equal(replay.statusCode, 400); assert.equal(replay.json().error, 'invalid_grant');
       await assert.rejects(f.service.authenticate(next.access_token), { code: 'MCP_AUTH_REQUIRED' });
       await assert.rejects(f.service.authenticate(tokens.access_token), { code: 'MCP_AUTH_REQUIRED' });
+    } finally { await f.close(); }
+  });
+
+  it('a second explicit approval without code exchange leaves the first connection and refresh usable', async () => {
+    const f = await fixture();
+    try {
+      const first = await f.approve(), firstPrincipal = await f.service.authenticate(first.tokens.access_token);
+      const second = await f.approveCode();
+      await firstPrincipal.validate();
+      const refreshed = await f.request('/oauth/token', { useCookies: false, body: { grant_type: 'refresh_token', client_id: clientId,
+        refresh_token: first.tokens.refresh_token, resource } });
+      assert.equal(refreshed.statusCode, 200, refreshed.body);
+      await f.service.authenticate(refreshed.json().access_token);
+      const secondPrincipal = await f.service.authenticate((await f.exchange(second)).access_token);
+      assert.notEqual(firstPrincipal.authorizationId, secondPrincipal.authorizationId);
+      assert.equal(firstPrincipal.sessionTokenHash, secondPrincipal.sessionTokenHash);
+      assert.equal((await pool.query('SELECT id FROM mcp_authorizations WHERE user_id=$1 AND revoked_at IS NULL', [f.own.user.id])).rowCount, 2);
+    } finally { await f.close(); }
+  });
+
+  it('two approved codes exchange in reverse order and each refresh family and revocation remain isolated', async () => {
+    const f = await fixture();
+    try {
+      const firstCode = await f.approveCode(), secondCode = await f.approveCode();
+      const second = await f.exchange(secondCode), first = await f.exchange(firstCode), third = (await f.approve()).tokens;
+      const principals = await Promise.all([first, second, third].map(tokens => f.service.authenticate(tokens.access_token)));
+      assert.equal(new Set(principals.map(p => p.authorizationId)).size, 3);
+      const rotated = await f.request('/oauth/token', { useCookies: false, body: { grant_type: 'refresh_token', client_id: clientId,
+        refresh_token: first.refresh_token, resource } });
+      assert.equal(rotated.statusCode, 200, rotated.body);
+      const replay = await f.request('/oauth/token', { useCookies: false, body: { grant_type: 'refresh_token', client_id: clientId,
+        refresh_token: first.refresh_token, resource } });
+      assert.equal(replay.statusCode, 400); assert.equal(replay.json().error, 'invalid_grant');
+      await assert.rejects(f.service.authenticate(rotated.json().access_token), { code: 'MCP_AUTH_REQUIRED' });
+      await principals[1]!.validate(); await principals[2]!.validate();
+      const revoked = await f.request('/oauth/token/revocation', { useCookies: false, body: { client_id: clientId,
+        token: second.refresh_token, token_type_hint: 'refresh_token' } });
+      assert.equal(revoked.statusCode, 200, revoked.body);
+      await assert.rejects(principals[1]!.validate(), { code: 'MCP_AUTH_REQUIRED' });
+      await principals[2]!.validate(); assert.ok(await store.getSession(hashToken(f.own.token)));
+      const thirdRefresh = await f.request('/oauth/token', { useCookies: false, body: { grant_type: 'refresh_token', client_id: clientId,
+        refresh_token: third.refresh_token, resource } });
+      assert.equal(thirdRefresh.statusCode, 200, thirdRefresh.body);
+      await f.service.authenticate(thirdRefresh.json().access_token);
+    } finally { await f.close(); }
+  });
+
+  it('OIDC Session loss preserves a verified ALMS-bound connection but deleting its exact ALMS parent blocks access and refresh', async () => {
+    const f = await fixture();
+    try {
+      const { tokens } = await f.approve(), principal = await f.service.authenticate(tokens.access_token);
+      const repo = new McpAuthorizationRepository(pool, Buffer.alloc(32, 9));
+      const access = await repo.adapter('AccessToken').find(tokens.access_token);
+      assert.ok(access); assert.notEqual(access.expiresWithSession, true); assert.equal(typeof access.sessionUid, 'string');
+      const oidc = await repo.adapter('Session').findByUid!(String(access.sessionUid));
+      assert.equal((oidc?.authorizations as Record<string, { persistsLogout?: boolean }>)[clientId]?.persistsLogout, true);
+      const removed = await pool.query("DELETE FROM mcp_oauth_objects WHERE model='Session' AND uid_hash=$1", [digest(String(access.sessionUid))]);
+      assert.equal(removed.rowCount, 1);
+      await principal.validate();
+      const refreshed = await f.request('/oauth/token', { useCookies: false, body: { grant_type: 'refresh_token', client_id: clientId,
+        refresh_token: tokens.refresh_token, resource } });
+      assert.equal(refreshed.statusCode, 200, refreshed.body);
+      await store.deleteSession(principal.sessionTokenHash);
+      await assert.rejects(principal.validate(), { code: 'MCP_AUTH_REQUIRED' });
+      await assert.rejects(f.service.authenticate(refreshed.json().access_token), { code: 'MCP_AUTH_REQUIRED' });
+      const afterLogout = await f.request('/oauth/token', { useCookies: false, body: { grant_type: 'refresh_token', client_id: clientId,
+        refresh_token: refreshed.json().refresh_token, resource } });
+      assert.equal(afterLogout.statusCode, 400); assert.equal(afterLogout.json().error, 'invalid_grant');
+    } finally { await f.close(); }
+  });
+
+  it('same-owner parents stay separately approved and logging out one parent leaves the other connection valid', async () => {
+    const f = await fixture();
+    try {
+      const first = await f.approve(), firstPrincipal = await f.service.authenticate(first.tokens.access_token);
+      const nextParent = await store.issueVerifiedSession(f.identity, 3600);
+      assert.equal(nextParent.user.id, f.own.user.id); f.setBrowserToken(nextParent.token);
+      const second = await f.approve(), secondPrincipal = await f.service.authenticate(second.tokens.access_token);
+      assert.notEqual(firstPrincipal.authorizationId, secondPrincipal.authorizationId);
+      assert.notEqual(firstPrincipal.sessionTokenHash, secondPrincipal.sessionTokenHash);
+      await store.deleteSession(hashToken(nextParent.token));
+      await assert.rejects(secondPrincipal.validate(), { code: 'MCP_AUTH_REQUIRED' }); await firstPrincipal.validate();
+      const refresh = await f.request('/oauth/token', { useCookies: false, body: { grant_type: 'refresh_token', client_id: clientId,
+        refresh_token: first.tokens.refresh_token, resource } });
+      assert.equal(refresh.statusCode, 200, refresh.body);
+      await store.deleteSession(firstPrincipal.sessionTokenHash);
+      await assert.rejects(f.service.authenticate(refresh.json().access_token), { code: 'MCP_AUTH_REQUIRED' });
+    } finally { await f.close(); }
+  });
+
+  it('a shortened live parent caps newly issued code, access and rotated refresh lifetimes without extending the original grant', async () => {
+    const f = await fixture();
+    try {
+      const first = await f.approve(), principal = await f.service.authenticate(first.tokens.access_token);
+      const original = (await pool.query('SELECT expires_at FROM mcp_authorizations WHERE id=$1', [principal.authorizationId])).rows[0].expires_at;
+      const parent = await pool.query("UPDATE sessions SET expires_at=clock_timestamp()+interval '30 seconds' WHERE token_hash=$1 RETURNING expires_at", [principal.sessionTokenHash]);
+      const expiry = Math.floor(new Date(parent.rows[0].expires_at).getTime() / 1000);
+      const refreshed = await f.request('/oauth/token', { useCookies: false, body: { grant_type: 'refresh_token', client_id: clientId,
+        refresh_token: first.tokens.refresh_token, resource } });
+      assert.equal(refreshed.statusCode, 200, refreshed.body); assert.ok(refreshed.json().expires_in > 0 && refreshed.json().expires_in <= 30);
+      const repo = new McpAuthorizationRepository(pool, Buffer.alloc(32, 9));
+      for (const [model, token] of [['AccessToken', refreshed.json().access_token], ['RefreshToken', refreshed.json().refresh_token]])
+        assert.ok(Number((await repo.adapter(model!).find(token))?.exp) <= expiry);
+      const next = await f.approveCode(), code = await repo.adapter('AuthorizationCode').find(next.code);
+      assert.ok(code); assert.ok(Number(code.exp) <= expiry); assert.notEqual(code.expiresWithSession, true);
+      assert.equal(new Date((await pool.query('SELECT expires_at FROM mcp_authorizations WHERE id=$1', [principal.authorizationId])).rows[0].expires_at).getTime(), new Date(original).getTime());
+      await pool.query("UPDATE sessions SET expires_at=clock_timestamp()-interval '1 second' WHERE token_hash=$1", [principal.sessionTokenHash]);
+      await assert.rejects(f.service.authenticate(refreshed.json().access_token), { code: 'MCP_AUTH_REQUIRED' });
+      const rejected = await f.request('/oauth/token', { useCookies: false, body: { grant_type: 'authorization_code', client_id: clientId,
+        redirect_uri: redirectUri, code: next.code, code_verifier: next.pending.verifier, resource } });
+      assert.equal(rejected.statusCode, 400); assert.equal(rejected.json().error, 'invalid_grant');
     } finally { await f.close(); }
   });
 
