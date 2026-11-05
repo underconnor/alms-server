@@ -5,8 +5,10 @@ import { createLearningxReader } from '../src/school-reader.js';
 import { encryptSchoolSession } from '../src/crypto.js';
 import type { SchoolReadCache, SchoolCacheScope, SchoolCacheEntry } from '../src/school-read-cache.js';
 import { assignmentListFixture } from './helpers/assignment-fixture.js';
+import { publicTasks } from '../src/school-read.js';
 
-type State = { ids: string[]; fail: boolean; loadAssignments?: () => Promise<void>;
+type State = { ids: string[]; moduleIds?: string[]; todoIds?: string[]; commonsResource?: 'movie' | 'readystream'; fail: boolean;
+  loadAssignments?: () => Promise<void>; loadModules?: () => Promise<void>;
   calls: { modules: number; assignments: number; todos: number; terms: number; courses: number } };
 const options = () => ({ signal: new AbortController().signal, validate: async () => {}, personalCompletionCourses: async (ids: readonly string[]) => ids });
 const resourceOptions = () => ({ ...options(), refresh: true, refreshScope: 'resource' as const });
@@ -65,11 +67,15 @@ function fixture() {
   const create = () => createLearningxReader(store, key, async () => ({ serialize: async () => ({}), client: {
     terms: async () => { state.calls.terms++; return [{ id: '1', name: '2099 synthetic term', default: true }]; },
     courses: async () => { state.calls.courses++; return ['10', '11'].map(id => ({ id, name: `Synthetic course ${id}`, termId: '1', usePureCanvas: true })); },
-    modules: async (course: string) => { state.calls.modules++; return [{ id: '40', title: 'Synthetic week', week: 1,
-      items: (course === '10' ? state.ids : ['90']).map((id, index) => ({ id: String(70 + index), title: `Synthetic ${id}`, assignmentId: id, contentType: 'assignment', published: true })) }]; },
+    modules: async (course: string) => { state.calls.modules++; await state.loadModules?.(); return [{ id: '40', title: 'Synthetic week', week: 1,
+      items: (course === '10' ? state.moduleIds ?? state.ids : ['90']).map((id, index) => ({ id: String(70 + index), title: `Synthetic ${id}`, published: true,
+        ...(state.commonsResource ? {contentType:'attendance_item', itemContentType:'commons', attendanceItemId:id, resourceType:state.commonsResource,
+          activityDetailAvailable:true, todoReferenceAvailable:state.commonsResource==='readystream'} : {assignmentId:id,contentType:'assignment'}) })) }]; },
     assignments: async (course: string) => { state.calls.assignments++; await state.loadAssignments?.(); if (state.fail) throw new Error('synthetic upstream failure');
       const value = assignmentListFixture(); return { ...value, courseId: course, items: (course === '10' ? state.ids : ['90']).map(id => ({ ...value.items[0], id, courseId: course, title: `Synthetic ${id}`, sourceUrl: `https://canvas.ssu.ac.kr/courses/${course}/assignments/${id}` })) }; },
-    todos: async () => { state.calls.todos++; return [{ courseId: '10', activities: {}, items: state.ids.map(id => ({ componentType: 'assignment', assignmentId: id, title: `Synthetic ${id}` })) }]; },
+    todos: async () => { state.calls.todos++; return [{ courseId: '10', activities: {}, items: (state.todoIds ?? state.ids).map(id => ({title:`Synthetic ${id}`,
+      ...(state.commonsResource ? {componentType:'commons', componentId:id, commonsType:state.commonsResource==='movie'?'mp4':'readystream',assignmentId:null,
+        quizId:null,discussionId:null,sectionId:'1',unitId:'2'} : {componentType:'assignment',assignmentId:id}) })) }]; },
   } as any }), undefined, durable, undefined, null);
   return { reader: create(), create, state, records, scoped, seed, saved, personal, retainedFile, replaceLogin };
 }
@@ -98,6 +104,87 @@ test('fresh course metadata expires related assignments and TODOs while retainin
   assert.equal(f.saved('a', 'assignments:10'), undefined); assert.equal(f.saved('a', 'tasks'), undefined);
   assert.equal((await f.reader.readAssignments!('a', '10', options())).items.length, 2);
   assert.equal((await f.reader.readTasks('a', options())).groups[0]!.items.length, 2);
+});
+test('fresh TODO revalidates an already selected course relationship without requiring a personal override', async t => {
+  t.mock.method(Date, 'now', () => 1_900_000_000_000);
+  const f = fixture();
+  const noOverrides = { ...resourceOptions(), personalCompletionCourses: async () => [] };
+  await f.reader.readCourse('a', '10', resourceOptions());
+  const modules = f.state.calls.modules;
+  const fresh = await f.reader.readTasks('a', noOverrides);
+  assert.equal(publicTasks(fresh)[0]!.moduleItemId, '70');
+  assert.equal(f.state.calls.modules, modules + 1, 'refresh re-reads the selected native module instead of keeping stale proof');
+  assert.equal(f.state.calls.todos, 1);
+  await f.reader.validateTasks!('a', fresh, 'synthetic-current-session');
+});
+test('cold TODO source refresh still avoids module fanout for courses never selected and without overrides', async t => {
+  t.mock.method(Date, 'now', () => 1_900_000_000_000);
+  const f = fixture();
+  const fresh = await f.reader.readTasks('a', { ...resourceOptions(), personalCompletionCourses: async () => [] });
+  assert.equal(publicTasks(fresh)[0]!.moduleItemId, undefined);
+  assert.equal(f.state.calls.modules, 0);
+});
+test('fresh Commons and Readystream TODOs recover exact native video links after selected-course invalidation', async t => {
+  t.mock.method(Date, 'now', () => 1_900_000_000_000);
+  for (const type of ['movie','readystream'] as const) {
+    const f = fixture(); f.state.commonsResource = type;
+    await f.reader.readCourse('a','10',resourceOptions());
+    const fresh = await f.reader.readTasks('a', {...resourceOptions(),personalCompletionCourses:async()=>[]});
+    const task = publicTasks(fresh)[0]!;
+    assert.equal(task.type,'video',type); assert.equal(task.moduleItemId,'70',type); assert.equal(task.weekId,'40',type);
+    assert.equal(task.playbackAvailable,false,type); assert.equal(task.schoolStatus,null,type);
+    assert.equal(f.state.calls.modules,2,type);
+  }
+});
+test('fresh TODO rebuilds a selected durable proof after restart and finds newly added exact relationships', async t => {
+  t.mock.method(Date, 'now', () => 1_900_000_000_000);
+  const f = fixture();
+  await f.reader.readCourse('a', '10');
+  f.state.ids.push('91');
+  const before = f.state.calls.modules;
+  const fresh = await f.create().readTasks('a', { ...resourceOptions(), personalCompletionCourses: async () => [] });
+  assert.deepEqual(publicTasks(fresh).map(item => [item.assignmentId, item.moduleItemId]).sort(), [['90','70'],['91','71']]);
+  assert.equal(f.state.calls.modules, before + 1);
+});
+test('fresh TODO never retains a deleted or changed relationship from the selected course proof', async t => {
+  t.mock.method(Date, 'now', () => 1_900_000_000_000);
+  for (const ids of [[], ['91']]) {
+    const f = fixture(); await f.reader.readCourse('a', '10');
+    f.state.todoIds = ['90']; f.state.moduleIds = ids;
+    const fresh = await f.reader.readTasks('a', { ...resourceOptions(), personalCompletionCourses: async () => [] });
+    assert.equal(publicTasks(fresh)[0]!.assignmentId, '90');
+    assert.equal(publicTasks(fresh)[0]!.moduleItemId, undefined);
+    assert.deepEqual(fresh.moduleProofs?.[0]?.modules[0]?.items.map(item => item.assignmentId), ids);
+    assert.equal(f.state.calls.modules, 2);
+  }
+});
+test('expired, incompatible, other-owner and previous-generation selection never triggers a cold TODO module read', async t => {
+  t.mock.method(Date, 'now', () => 1_900_000_000_000);
+  for (const mode of ['expired','incompatible','other-owner','previous-generation']) {
+    const f = fixture(); await f.reader.readCourse(mode === 'other-owner' ? 'b' : 'a', '10');
+    if (mode === 'expired') f.saved('a','course:10')!.expiresAt = Date.now() - 1;
+    if (mode === 'incompatible') (f.saved('a','course:10')!.value as any).commonsMappingVersion = 1;
+    if (mode === 'previous-generation') f.replaceLogin('a');
+    const before = f.state.calls.modules;
+    const fresh = await f.create().readTasks('a', { ...resourceOptions(), personalCompletionCourses: async () => [] });
+    assert.equal(publicTasks(fresh)[0]!.moduleItemId, undefined, mode);
+    assert.equal(f.state.calls.modules, before, mode);
+  }
+});
+test('relogin during selected TODO module revalidation withholds the entire old-generation result', async t => {
+  t.mock.method(Date, 'now', () => 1_900_000_000_000);
+  const f = fixture(); await f.reader.readCourse('a', '10');
+  f.state.loadModules = async () => f.replaceLogin('a');
+  await assert.rejects(f.reader.readTasks('a', { ...resourceOptions(), personalCompletionCourses: async () => [] }), {statusCode:409});
+  assert.equal(f.saved('a','calendar-modules:10'), undefined);
+});
+test('failed selected-course revalidation returns an error and never restores a stale backlink', async t => {
+  t.mock.method(Date, 'now', () => 1_900_000_000_000);
+  const f = fixture(); await f.reader.readCourse('a', '10');
+  f.state.loadModules = async () => { throw Error('synthetic module read failure'); };
+  await assert.rejects(f.reader.readTasks('a', { ...resourceOptions(), personalCompletionCourses: async () => [] }), {statusCode:502});
+  assert.equal(f.saved('a','course:10'), undefined);
+  assert.equal(f.saved('a','calendar-modules:10'), undefined);
 });
 test('source failure never clears independently usable courses, other owners or retained byte records', async t => {
   t.mock.method(Date, 'now', () => 1_900_000_000_000);
