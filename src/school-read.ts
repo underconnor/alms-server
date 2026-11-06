@@ -418,7 +418,7 @@ export function createLearningxReads(reader: LearningxReader, playbackSelectable
   };
 }
 
-export function publicCourseContent({ course, modules, lessons, observedAt }: Pick<CourseRead, 'course' | 'modules'> & Partial<Pick<CourseRead, 'lessons' | 'observedAt'>>, detailsAvailable = false, playbackSelectable = false, now = Date.now()) {
+export function publicCourseContent({ course, modules, lessons, observedAt, usePureCanvas }: Pick<CourseRead, 'course' | 'modules'> & Partial<Pick<CourseRead, 'lessons' | 'observedAt' | 'usePureCanvas'>>, detailsAvailable = false, playbackSelectable = false, now = Date.now()) {
   const courseId = course.id;
   const currentWeek = currentSchoolWeek(lessons, observedAt, new Date(now));
   const weeks = modules.map(module => ({ id: module.id, number: module.week, title: module.title,
@@ -428,7 +428,8 @@ export function publicCourseContent({ course, modules, lessons, observedAt }: Pi
           const detailAvailable = Boolean(detailsAvailable && item.activityDetailAvailable === true);
           // List metadata only permits selection. Admission independently revalidates identity,
           // ownership, opened/report flags and the supported media before accepting a job.
-          const playbackAvailable = playbackSelectable && course.schoolDefaultTerm !== false && course.ended !== true && type === 'video' && item.resourceType !== 'readystream' && detailAvailable
+          const playbackAvailable = playbackSelectable && course.schoolDefaultTerm !== false && course.ended !== true && type === 'video'
+            && (item.resourceType !== 'readystream' || usePureCanvas === true) && detailAvailable
             && item.published === true && unlockAt !== null && Date.parse(unlockAt) <= now;
           const schoolAssignment = (item as ObservedModuleItem).assignmentId;
           return { id: item.id, courseId, title: item.title,

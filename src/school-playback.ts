@@ -30,6 +30,14 @@ export interface SchoolPlaybackRuntime<Source> {
   play(source: Source, signal: AbortSignal): Promise<{ ended: true; browserClosed: true; processExited: true }>;
   dispose(source: Source): Promise<void>;
 }
+/** Fixed outcome facts only; never include school targets, positions, tokens or payloads. */
+export type WorkerVideoReportAcknowledgement = Readonly<{
+  event: 'worker_video_report_acknowledged';
+  reportEvent: 'playing' | 'update' | 'ended';
+  resourceType: 'movie' | 'readystream';
+  controllerState: 'ready' | 'closed';
+  transport: 'acknowledged';
+}>;
 export interface SchoolPlaybackDependencies<Source, Admission, FinalProof> {
   school: SchoolVideoSessions;
   leases: PlaybackLeaseRepository;
@@ -42,6 +50,7 @@ export interface SchoolPlaybackDependencies<Source, Admission, FinalProof> {
   createFinalProof(claim: SchoolPlaybackClaim, value: SessionProof): FinalProof;
   stream?: ReturnType<typeof createVideoStreamer>;
   reportFailure?(diagnostic: ReturnType<typeof workerVideoReportDiagnostic>): void;
+  reportAcknowledged?(diagnostic: WorkerVideoReportAcknowledgement): void;
 }
 const changed = () => new AppError(409, 'PLAYBACK_AUTHORITY_CHANGED', '학교 인증이나 작업 상태가 바뀌었습니다. 다시 확인해 주세요.');
 const busy = () => new AppError(409, 'PLAYBACK_BUSY', '다른 영상이 실행 중입니다. 기존 재생이 종료된 뒤 다시 시도해 주세요.');
@@ -161,6 +170,10 @@ export function createSchoolPlayback<Source, Admission, FinalProof>(dependencies
                 } else if (result.state !== 'ready') {
                   const error = unknown(); rememberVideoReportPreparation(error, 'post_report', true); rememberVideoReportOutcomeFailure(error, result, 'nonterminal_controller_closed'); throw error;
                 }
+                // An observer cannot alter report authority, uncertainty, cleanup or retry policy.
+                try { dependencies.reportAcknowledged?.(Object.freeze({ event: 'worker_video_report_acknowledged',
+                  reportEvent: event, resourceType: media.resourceType === 'readystream' ? 'readystream' : 'movie',
+                  controllerState: result.state, transport: 'acknowledged' })); } catch {}
                 })();
                 owned.callbacks.add(callback);
                 void callback.then(() => owned.callbacks.delete(callback), () => owned.callbacks.delete(callback));

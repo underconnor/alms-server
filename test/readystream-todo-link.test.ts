@@ -20,7 +20,7 @@ const data: TasksRead = {catalog: {courses: [course], term: null, termIds: ['1']
 const changedItem = (change: object): TasksRead => ({...data, moduleProofs: [{...data.moduleProofs![0]!,
   modules: modules.map(module => ({...module, items: module.items.map(item => ({...item, ...change}))}))}]});
 
-test('canonical readystream TODO and course metadata agree on video while server playback remains unavailable', () => {
+test('canonical readystream TODO and course metadata agree on video without inferring server eligibility from a backlink', () => {
   const cold = publicTasks({...data, moduleProofs: []})[0]!, linked = publicTasks(data)[0]!;
   assert.equal(linked.id, cold.id); assert.notEqual(linked.id, '31');
   assert.equal(linked.moduleItemId, '90'); assert.equal(linked.weekId, '40'); assert.equal(linked.type, 'video'); assert.equal(cold.type, 'video');

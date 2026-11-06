@@ -9,13 +9,14 @@ import { createSchoolVideoSessions } from '../../src/school-video-session.js';
 export const noop = async () => {}, signal = () => AbortSignal.timeout(5_000);
 export const context = { owner: 'synthetic-owner', sessionHash: 'a'.repeat(64), courseId: '10', moduleItemId: '20' };
 export const observation = { positionSeconds: 0, durationSeconds: 600, playbackRate: 1, paused: false, ended: false, seeking: false, visible: true };
-export async function fixture(options: { durationSeconds?: number; allowPlaybackStart?: boolean; workerOnly?: boolean } = {}) {
+export async function fixture(options: { durationSeconds?: number; allowPlaybackStart?: boolean; workerOnly?: boolean; allowReadystreamWorker?: boolean; owner?: string } = {}) {
   const duration = options.durationSeconds ?? 600;
+  const owner = options.owner ?? context.owner;
   const key = randomBytes(32), seed = new SchoolHttpClient();
   await seed.jar.setCookie('xn_api_token=synthetic-learningx; Secure; Path=/learningx/', 'https://canvas.ssu.ac.kr');
   await seed.jar.setCookie('_canvas_session=synthetic-canvas; Secure; Path=/', 'https://canvas.ssu.ac.kr');
   const jar = await seed.jar.serialize(); let generation = randomUUID(), encrypted = '', released = 0, rawType = 'mp4', ack = true, reportStatus = 200;
-  const reset = () => { generation = randomUUID(); encrypted = encryptSchoolSession({ version: 1, generation, identity: { studentId: '90000001' }, jar }, key, context.owner, 'ssu'); }; reset();
+  const reset = () => { generation = randomUUID(); encrypted = encryptSchoolSession({ version: 1, generation, identity: { studentId: '90000001' }, jar }, key, owner, 'ssu'); }; reset();
   let owned = true, profile = true, details: Record<string, unknown> = {}, requests = 0, reports = 0, starts = 0, beforeReturn = async () => {}, cas = true, progress = 0, pureCanvas: boolean | null = true, xmlOverride: string | undefined;
   let reportResponse: ((callback: string) => Response) | undefined;
   let invalidationError: unknown;
@@ -62,8 +63,9 @@ export async function fixture(options: { durationSeconds?: number; allowPlayback
   };
   const invalidate = async () => { released++; if (invalidationError) throw invalidationError; };
   const school = createManualVideoSchool(store, key, invalidate, fetcher);
-  const sessions = createSchoolVideoSessions(store, key, invalidate, fetcher, { allowReadystreamManual: options.workerOnly !== true });
-  return { sessions, generation: () => generation, encrypted: () => encrypted, school, store, reset, paths, counts: () => ({ requests, reports, starts, invalidated: released }),
+  const sessions = createSchoolVideoSessions(store, key, invalidate, fetcher, { allowReadystreamManual: options.workerOnly !== true,
+    allowReadystreamWorker: options.allowReadystreamWorker === true });
+  return { sessions, generation: () => generation, encrypted: () => encrypted, school, store, fetcher, key, reset, paths, counts: () => ({ requests, reports, starts, invalidated: released }),
     setPureCanvas: (v: boolean | null) => { pureCanvas = v; }, setXml: (v: string) => { xmlOverride = v; },
     setOwned: (v: boolean) => { owned = v; }, setProfile: (v: boolean) => { profile = v; }, setDetails: (v: Record<string, unknown>) => { details = v; },
     setType: (v: string) => { rawType = v; }, setAck: (v: boolean) => { ack = v; }, setCas: (v: boolean) => { cas = v; },
@@ -71,5 +73,5 @@ export async function fixture(options: { durationSeconds?: number; allowPlayback
     setReportResponse: (value: (callback: string) => Response) => { reportResponse = value; },
     setInvalidationError: (value: unknown) => { invalidationError = value; },
     setProgress: (value: number) => { progress = value; },
-    onReturn: (fn: () => Promise<void>) => { beforeReturn = fn; }, prepare: () => school.prepare(context, noop, signal()) };
+    onReturn: (fn: () => Promise<void>) => { beforeReturn = fn; }, prepare: () => school.prepare({ ...context, owner }, noop, signal()) };
 }
