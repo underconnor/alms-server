@@ -16266,7 +16266,7 @@
       "post": {
         "operationId": "post_v1_jobs",
         "summary": "Accept a separate server lecture job",
-        "description": "Schedule at most1year ahead. Admission checks live worker readiness, school ownership and generation;202 is not completion. Read jobs on uncertain acceptance.",
+        "description": "Schedule at most1year ahead. Admission checks live worker readiness, school ownership and generation;202 is not completion. Readystream additionally requires confirmed pureCanvas and an exact opaque-launch proof for a supported single-story video1 UPF/MP4; slides, multiple stories/media, HLS and unknown manifests are rejected before acceptance. Read jobs on uncertain acceptance; never automatically replay an uncertain school write.",
         "security": [
           {
             "cookieSession": []
@@ -18969,7 +18969,8 @@
             ]
           },
           "playbackAvailable": {
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Selection eligibility only. Readystream requires confirmed pureCanvas course metadata; admission independently verifies a fresh owned launch and supported single-story video1 UPF/MP4 media. It is not a playback, progress or attendance guarantee."
           },
           "progressPercent": {
             "anyOf": [

@@ -20,10 +20,11 @@ export function createWorkerClaimValidator(store: Pick<PgStore, 'getWorkerJob'>,
 /** Trusted process wiring. Browser session authorization is supplied only by the API admission route. */
 export function withSchoolPlayback(provider: SchoolProvider, store: PgStore, key: Buffer,
   invalidate: (owner: string, courseId: string, activityId: string) => Promise<void>,
-  reportFailure?: SchoolPlaybackDependencies<unknown, unknown, unknown>['reportFailure']): SchoolProvider {
+  reportFailure?: SchoolPlaybackDependencies<unknown, unknown, unknown>['reportFailure'],
+  reportAcknowledged?: SchoolPlaybackDependencies<unknown, unknown, unknown>['reportAcknowledged']): SchoolProvider {
   const runtime = createControlledPlaybackRuntime();
   const playback = createSchoolPlayback({
-    school: createSchoolVideoSessions(store, key, invalidate),
+    school: createSchoolVideoSessions(store, key, invalidate, undefined, { allowReadystreamWorker: true }),
     leases: new PgPlaybackLeaseRepository(store.pool),
     validateClaim: createWorkerClaimValidator(store, 'execution'),
     validateFinalClaim: createWorkerClaimValidator(store, 'final'),
@@ -31,6 +32,7 @@ export function withSchoolPlayback(provider: SchoolProvider, store: PgStore, key
     createFinalProof: createPlaybackFinalProof,
     runtime: { createSource: createControlledPlaybackSource, play: runtime.play, dispose: runtime.dispose },
     reportFailure,
+    reportAcknowledged,
   });
   return { ...provider, ...playback, capabilities: { ...provider.capabilities, playback: true, pauseResume: false } };
 }

@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { AppError } from '../src/errors.js';
 import { SchoolVideoReportError } from '@alms/ssu-api';
 import { rememberVideoReportPreparation, videoReportDiagnostic, type workerVideoReportDiagnostic } from '../src/video-report-diagnostics.js';
-import { createSchoolPlayback, type SchoolPlaybackClaim, type SchoolPlaybackInput } from '../src/school-playback.js';
+import { createSchoolPlayback, type SchoolPlaybackClaim, type SchoolPlaybackInput, type WorkerVideoReportAcknowledgement } from '../src/school-playback.js';
 import type { PreparedSchoolVideo } from '../src/school-video-session.js';
 import type { PlaybackLeaseScope } from '../src/manual-video-lease.js';
 import type { SchoolResult } from '../src/domain.js';
@@ -23,6 +23,7 @@ function fixture(reportFailure?: (diagnostic: ReturnType<typeof workerVideoRepor
   let input: SchoolPlaybackInput | undefined, acquired: PlaybackLeaseScope | undefined;
   let reportHook = async (_event: string, _signal: AbortSignal) => {};
   const diagnostics: ReturnType<typeof workerVideoReportDiagnostic>[] = [];
+  const acknowledgements: WorkerVideoReportAcknowledgement[] = [];
   let playHook = async (value: SchoolPlaybackInput, running: AbortSignal) => {
     value.observe(observed); await value.report('playing', running);
     value.observe({ ...observed, positionSeconds: 600, ended: true, paused: true }); await value.report('ended', running); return evidence;
@@ -63,8 +64,9 @@ function fixture(reportFailure?: (diagnostic: ReturnType<typeof workerVideoRepor
     createAdmission: (scope, value) => { assert.deepEqual(scope, { userId: claim.userId, ...target }); assert.equal(value.generation, generation); return { kind: 'admission' as const }; },
     createFinalProof: (scope, value) => { assert.deepEqual(scope, claim); assert.equal(value.generation, generation); return { kind: 'final' as const }; },
     reportFailure: diagnostic => { diagnostics.push(diagnostic); reportFailure?.(diagnostic); },
+    reportAcknowledged: diagnostic => { acknowledgements.push(diagnostic); },
   });
-  return { adapter, claim, target, context, driver, diagnostics, input: () => input!, counts: () => ({ prepareCalls, mediaCalls, freshCalls, observeCalls, reportCalls, disposeCalls, releaseCalls }),
+  return { adapter, claim, target, context, driver, diagnostics, acknowledgements, input: () => input!, counts: () => ({ prepareCalls, mediaCalls, freshCalls, observeCalls, reportCalls, disposeCalls, releaseCalls }),
     prepare: () => adapter.preparePlayback(context, target, signal()), browserLoggedIn: () => browserLoggedIn,
     logout: () => { browserLoggedIn = false; }, reauthenticate: () => { generation = randomUUID(); }, revoke: () => { current = false; }, setStatus: (value: string) => { status = value; }, finalChecks: () => finalChecks,
     conflict: () => { leaseAvailable = false; }, loseLease: () => { leaseCurrent = false; },
@@ -92,6 +94,8 @@ test('browser logout preserves the accepted worker claim and explicit ended stay
   await prepared.dispose(); await prepared.dispose(); assert.equal(f.counts().releaseCalls, 1); assert.equal(f.counts().disposeCalls, 1);
   assert.deepEqual(await f.adapter.validatePlayback(prepared, signal()), { kind: 'final' });
   assert.deepEqual(f.diagnostics, []);
+  assert.deepEqual(f.acknowledgements, ['playing', 'ended'].map(reportEvent => ({ event: 'worker_video_report_acknowledged',
+    reportEvent, resourceType: 'movie', controllerState: reportEvent === 'ended' ? 'closed' : 'ready', transport: 'acknowledged' })));
   assert.doesNotMatch(JSON.stringify(prepared), /synthetic-private|https|generation|token|userId/);
 });
 test('disposed playback can read same-generation results but cannot cross a new login or revoked claim', async () => {
@@ -123,6 +127,7 @@ test('unknown school acknowledgement preserves the lease and permits only a late
   assert.equal(f.counts().reportCalls, 1); assert.equal(f.counts().releaseCalls, 0);
   assert.equal((await f.adapter.playbackLearningStatus(prepared, signal())).recognized, null);
   await assert.rejects(f.adapter.play(prepared, signal())); assert.equal(f.counts().reportCalls, 1);
+  assert.deepEqual(f.acknowledgements, []);
   assert.deepEqual(f.diagnostics, [{ event: 'worker_video_report_failed', reportEvent: 'playing', stage: 'post_report', code: 'unknown', mayHaveWritten: true,
     outcome: { reason:'transport_unknown', transport:'unknown', controllerPhase:'closed', transmissionCode:'unknown',
       publishedStillTrue:null, openedStillTrue:null, omitProgressStillFalse:null, durationExactlyMatches:null } }]);
@@ -139,7 +144,15 @@ test('acknowledged nonterminal closure and unclosed terminal stay uncertain with
       transport:'acknowledged',controllerPhase:event==='playing'?'closed':'ready',transmissionCode:'none',
       publishedStillTrue:null,openedStillTrue:null,omitProgressStillFalse:null,durationExactlyMatches:null});
     await assert.rejects(f.adapter.play(prepared,signal()));assert.equal(f.counts().reportCalls,1);
+    assert.deepEqual(f.acknowledgements, []);
   }
+});
+
+test('a lost claim after the school report cannot emit acknowledged-report telemetry', async () => {
+  const f = fixture(), prepared = await f.prepare(); f.reportWith(async () => { f.revoke(); });
+  await assert.rejects(f.adapter.play(prepared, signal()), { code: 'PLAYBACK_REPORT_UNKNOWN' });
+  assert.equal(f.counts().reportCalls, 1); assert.equal(f.counts().releaseCalls, 0);
+  assert.deepEqual(f.acknowledgements, []);
 });
 
 test('one periodic report failure preserves sanitized SDK evidence through runtime normalization and cleanup', async () => {

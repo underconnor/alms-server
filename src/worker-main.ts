@@ -22,7 +22,8 @@ const cache = config.sessionEncryptionKey ? new PgSchoolReadCache(pool, config.s
 const provider = config.playbackEnabled && config.sessionEncryptionKey && cache
   ? withSchoolPlayback(unavailableSchoolProvider, store, config.sessionEncryptionKey,
     (owner, courseId, lectureId) => cache.deleteMany(owner, 'ssu', progressCacheResources([{ courseId, lectureId }]), controller.signal),
-    diagnostic => process.stderr.write(JSON.stringify({ time: new Date().toISOString(), ...diagnostic }) + '\n'))
+    diagnostic => process.stderr.write(JSON.stringify({ time: new Date().toISOString(), ...diagnostic }) + '\n'),
+    diagnostic => process.stdout.write(JSON.stringify({ time: new Date().toISOString(), ...diagnostic }) + '\n'))
   : unavailableSchoolProvider;
 const started = (async () => {
   await store.health();

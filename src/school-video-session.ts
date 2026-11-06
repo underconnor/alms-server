@@ -42,7 +42,7 @@ export interface SchoolVideoSessions {
 }
 export function createSchoolVideoSessions(store: SchoolVideoSessionStore, key: Buffer,
   invalidate: (owner: string, courseId: string, activityId: string) => Promise<void>, fetcher: typeof fetch = fetch,
-  options: { allowReadystreamManual?: boolean } = {}): SchoolVideoSessions {
+  options: { allowReadystreamManual?: boolean; allowReadystreamWorker?: boolean } = {}): SchoolVideoSessions {
   const readSession = async (owner: string, signal: AbortSignal) => boundedWorkerOperation(async bounded => {
     const raw = await store.getEncryptedSchoolSession(owner, 'ssu'); bounded.throwIfAborted();
     if (!raw) throw required();
@@ -116,7 +116,10 @@ export function createSchoolVideoSessions(store: SchoolVideoSessionStore, key: B
     const prepared = await execute(context.owner, undefined, validate, signal,
       connection => ownedLaunch(connection, context.courseId, context.moduleItemId, signal), expectedGeneration);
     signal.throwIfAborted();
-    if (prepared.value.data.contentType === 'readystream' && options.allowReadystreamManual !== true) throw new SchoolError('unsupported');
+    // Only trusted process wiring opts into a reporting mode. Both paths still require the
+    // same fresh ownership/pureCanvas checks and exact single-video SDK media proof below.
+    if (prepared.value.data.contentType === 'readystream'
+      && options.allowReadystreamManual !== true && options.allowReadystreamWorker !== true) throw new SchoolError('unsupported');
     const lifetime = new AbortController();
     let original = prepared.value;
     const currentPrepared = async () => { signal.throwIfAborted(); await validate(); await sameSession(context.owner, prepared.session, signal); signal.throwIfAborted(); };

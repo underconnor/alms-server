@@ -28,7 +28,8 @@ const workflow = enumeration('unsubmitted', 'submitted', 'graded', 'pending_revi
 const completionFields = { moduleItemId: schoolId, weekId: schoolId, moduleCompleted: nullable(bool), personalCompleted: nullable(bool) };
 const activityFields = { id: identifier, courseId: identifier, title: text, type: enumeration('video', 'material', 'assignment', 'quiz', 'notice', 'other'),
   resourceType: nullable(enumeration('movie', 'readystream', 'pdf', 'file')),
-  sourceUrl: nullable(text), playbackAvailable: bool, progressPercent: nullable(number), schoolStatus: nullable(text), assignmentId: nullable(schoolId),
+  sourceUrl: nullable(text), playbackAvailable: { ...bool, description: 'Selection eligibility only. Readystream requires confirmed pureCanvas course metadata; admission independently verifies a fresh owned launch and supported single-story video1 UPF/MP4 media. It is not a playback, progress or attendance guarantee.' },
+  progressPercent: nullable(number), schoolStatus: nullable(text), assignmentId: nullable(schoolId),
   dueAt: nullable(instant), unlockAt: nullable(instant), moduleCompleted: nullable(bool), published: nullable(bool), detailAvailable: bool };
 const courseFields = { id: identifier, title: text, professor: nullable(text), term: nullable(text), sourceUrl: nullable(text),
   termId: schoolId, ended: nullable(bool), schoolDefaultTerm: bool,
@@ -383,7 +384,7 @@ add('get', '/v1/jobs', 'Owner playback jobs (at most 200)', object({ items: arra
   description: 'Newest owner jobs in the optional exact course scope, ordered by createdAt then id descending. complete and hasMore are exact inverses at the query snapshot, based on one extra bounded row. They describe list truncation, not execution or school completion. No cursor or total count is provided. Only returned jobs receive result-cache refresh.',
 });
 add('post', '/v1/jobs', 'Accept a separate server lecture job', ref('Job'), { status: 202, body: object({ courseId: identifier, lectureId: identifier, scheduledFor: instant }, ['courseId', 'lectureId'], true), headers: [parameters.idempotency, playbackAccept],
-  description: 'Schedule at most1year ahead. Admission checks live worker readiness, school ownership and generation;202 is not completion. Read jobs on uncertain acceptance.', errors: ['PLAYBACK_UNAVAILABLE', 'PLAYBACK_ADMISSION_UNCONFIRMED', 'IDEMPOTENCY_CONFLICT', 'JOB_ALREADY_ACTIVE', 'INVALID_SCHEDULE', 'CLIENT_UPDATE_REQUIRED'] });
+  description: 'Schedule at most1year ahead. Admission checks live worker readiness, school ownership and generation;202 is not completion. Readystream additionally requires confirmed pureCanvas and an exact opaque-launch proof for a supported single-story video1 UPF/MP4; slides, multiple stories/media, HLS and unknown manifests are rejected before acceptance. Read jobs on uncertain acceptance; never automatically replay an uncertain school write.', errors: ['PLAYBACK_UNAVAILABLE', 'PLAYBACK_ADMISSION_UNCONFIRMED', 'IDEMPOTENCY_CONFLICT', 'JOB_ALREADY_ACTIVE', 'INVALID_SCHEDULE', 'CLIENT_UPDATE_REQUIRED'] });
 add('get', '/v1/jobs/{id}', 'Exact owned playback job', ref('Job'), { headers: [playbackAccept], errors: ['CLIENT_UPDATE_REQUIRED'] });
 add('get', '/v1/jobs/{id}/verify', 'Read exact job school result', object({ job: ref('Job'), schoolResult: ref('SchoolResult'), stateChanged: { const: false } }),
   { headers: [playbackAccept], description: 'Fresh read-only result; job state/history are preserved.', errors: ['SCHOOL_RESULT_UNAVAILABLE', 'JOB_CHANGED', 'JOB_VERIFICATION_BUSY', 'CLIENT_UPDATE_REQUIRED'] });

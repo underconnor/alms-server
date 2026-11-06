@@ -1,7 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { loadConfig } from '../src/config.js';
-import { createWorkerClaimValidator } from '../src/playback-bootstrap.js';
+import { createWorkerClaimValidator, withSchoolPlayback } from '../src/playback-bootstrap.js';
+import { inspectPlaybackAdmission } from '../src/playback-authority.js';
+import { unavailableSchoolProvider } from '../src/provider.js';
+import { fixture, context, noop, signal } from './helpers/school-video-fixture.js';
 import type { Job } from '../src/domain.js';
 const claim = { jobId: 'job', userId: 'owner', courseId: '101', lectureId: '201',
   acceptedGeneration: '11111111-1111-4111-8111-111111111111', executionTokenHash: 'a'.repeat(64) };
@@ -40,4 +43,19 @@ test('a cancellation immediately blocks media/report authority while permitting 
   const store = { getWorkerJob: async () => ({ ...row, status: 'cancel_requested' as const }) };
   await assert.rejects(createWorkerClaimValidator(store, 'execution')(claim, new AbortController().signal), { code: 'PLAYBACK_AUTHORITY_CHANGED' });
   await createWorkerClaimValidator(store, 'final')(claim, new AbortController().signal);
+});
+
+test('trusted production bootstrap opts into proven Readystream admission without starting Chromium or querying a lease', async t => {
+  const f = await fixture({ workerOnly: true }); f.setType('readystream');
+  t.mock.method(globalThis, 'fetch', f.fetcher);
+  let databaseCalls = 0;
+  const store = { ...f.store, pool: { query: () => { databaseCalls++; throw new Error('admission must not query worker leases'); } } };
+  // The real trusted bootstrap constructs the SDK preparation, media and admission path.
+  // There is deliberately no browser session or worker claim during API admission.
+  const provider = withSchoolPlayback(unavailableSchoolProvider, store as any, f.key, noop);
+  const target = { courseId: context.courseId, lectureId: context.moduleItemId };
+  const admission = await provider.authorizePlayback!({ userId: context.owner }, target, { signal: signal(), validate: noop });
+  const proof = inspectPlaybackAdmission(admission, { userId: context.owner, ...target });
+  assert.equal(proof.generation, f.generation()); assert.equal(proof.encryptedSession, f.encrypted());
+  assert.equal(f.counts().reports, 0); assert.equal(f.counts().starts, 0); assert.equal(databaseCalls, 0);
 });

@@ -67,7 +67,9 @@ Bearer 성공은 등록 URI의 fragment에 `code`, `clientId`, `clientState`를 
 
 ## 수동 영상·학교 진도
 
-학교가 canonical `readystream`으로 제공한 강좌 활동 목록은 `type:'video'`와 `resourceType:'readystream'`을 반환하고, TODO는 `type:'video'`와 정확한 본문 연결을 반환한다. `detailAvailable:true`는 본문·학교 메타 조회 지원이며 수동 보고 권한이 아니다. 선택한 상세와 수동 준비는 같은 소유자·학교 세대의 fresh 신원/수강·pureCanvas·정확한 발급 대상을 확인하고, 단일 story/video1 UPF와 content/duration/CDN 관계까지 검증한 경우에만 기존 `manualVideoAvailable`, `manualVideoReportAvailable`, `manualVideoProgressMode`를 사용한다. 미지원 manifest는 본문을 유지하고 수동 권한을 닫는다. `playbackAvailable:false`와 직접 서버 수강 admission 거절은 유지한다.
+학교가 canonical `readystream`으로 제공한 강좌 활동 목록은 `type:'video'`와 `resourceType:'readystream'`을 반환하고, TODO는 `type:'video'`와 정확한 본문 연결을 반환한다. `detailAvailable:true`는 본문·학교 메타 조회 지원이며 수동 보고 권한이 아니다. 선택한 상세와 수동 준비는 같은 소유자·학교 세대의 fresh 신원/수강·pureCanvas·정확한 발급 대상을 확인하고, 단일 story/video1 UPF와 content/duration/CDN 관계까지 검증한 경우에만 기존 `manualVideoAvailable`, `manualVideoReportAvailable`, `manualVideoProgressMode`를 사용한다. 미지원 manifest는 본문을 유지하고 수동 권한을 닫는다.
+
+서버 자동수강의 강좌 목록 `playbackAvailable`은 선택 후보 여부다. 명시적으로 확인한 pureCanvas 강좌의 canonical Readystream도 기존의 current-term/종료 여부·상세 지원·공개·열림 시각 조건을 만족하면 후보가 될 수 있다. pureCanvas가 false·null·누락인 강좌는 후보가 아니며, TODO의 같은 이름 필드는 계속 false다. 목록은 manifest를 모두 미리 읽거나 재생 성공을 보장하지 않는다. 서버 접수는 fresh 본인 신원·수강권한·학교 세대와 정확한 발급 launch를 다시 확인하고, 같은 opaque launch의 단일 story/video1 UPF·MP4·content/duration·허용 CDN 관계 검증을 마친 뒤에만 진행한다. 다중 story/media·슬라이드·HLS·알 수 없는 구조는 접수 전에 거절하며 다른 재생 경로로 대체하지 않는다. 일반 수강은 1배속 실제 재생 관측과 기존 playing/5분 update/ended 보고·fresh 학교 결과 확인을 따르고, 거절·응답 유실은 자동 재전송하지 않는다. 다른 학교 재생을 정리하는 명시적 새 시작은 별도 사용자 확인 계약을 유지한다.
 
 `LearningEvidence.resourceType`의 `readystream`은 조회한 duration/progress/lastPosition 초 값과 원본 학교 출결값을 보존한다. `recognized:null`과 공용 `attendance:'unknown'`은 원본 개별 영상의 `schoolAttendanceStatus`와 별개이며, 미디어 검증이나 로컬 재생 성공으로 인정값을 만들지 않는다. 기존 movie·PDF·과제 계약은 유지한다.
 
