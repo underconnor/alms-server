@@ -4,7 +4,7 @@
 
 현재 Codex CLI 연결·등록 예시는 [Codex CLI 안내](codex-cli.md)를 따른다. 아래0.141.0 운영 검증은 당시 이력이며 현재 설치 버전의 합성 상호운용 결과와 구분한다.
 
-2026-11-05에는 설치0.164.0의 실제 localhost 합성 상호운용을 확인했다. 별도 운영 OAuth1회는 CLI exit0 뒤 callback 오류와 MCP401/refresh400·도구 조회0회를 관찰했으므로 현재 운영 조회 성공으로 확대하지 않는다. 해당 진단과 명령 설정의 범위는 위 CLI 안내를 따른다.
+2026-11-05에는 설치0.164.0의 실제 localhost 합성 상호운용을 확인했다. 최초 운영 OAuth1회는 CLI exit0 뒤 callback 오류와 MCP401/refresh400·도구 조회0회를 관찰했다. 이 초기 실패와 아래 수정 후 운영 표본을 구분하며, 해당 진단과 명령 설정은 위 CLI 안내를 따른다.
 
 ## 실제 검증 범위
 
@@ -30,6 +30,16 @@
 - 별도 차시 출결 확인
 
 합성 전송·PostgreSQL 회귀 검사와 위 실제 표본을 구분한다. 아래 연결 예시만으로 실제 조회 성공이나 범용 클라이언트 호환을 판단하지 않는다.
+
+## Codex0.164.0 운영 후속
+
+2026-11-05 main `127174b9` 배포 뒤 동일 read client의 정상 OAuth2회·native callback2회·CLI exit0을 확인했다. 서로 다른 alias에서 capabilities·학기·강좌를 각3개씩 조회했고, 재승인 뒤 새 OAuth 없이 원래 alias의 기존 자격 증명으로 capabilities 인증 조회도 성공했다. 다음 학기 조회의 `SCHOOL_AUTH_REQUIRED`와 호출하지 않은 강좌를 별도로 남긴다. 합계는 실제8개 호출 중7개 성공·학교 인증 필요1개이며, 자료·과제·출석 등의 나머지 도구 성공으로 확대하지 않는다.
+
+첫 동일 live process의 재승인 직후 access 재사용 검사는 엄격180초 시간창 중단으로 미검증이다. 큰 시간 간격의 원인은 확정하지 않았다. 이 guard 결과를 제품401로 계산하거나, 새 process의 기존 승인 사용 성공으로 덮지 않는다. 원래 alias의 normal credential·별도 alias의 승인과 CLI 처리만 사용했으며 token/store 값 추출·모델 turn·학교 쓰기·전역 설정 변경은0회다. 전체 운영 refresh/revoke/logout·다른 계정/클라이언트 검증은 계속 별도 범위다.
+
+11월6일 학교 인증 갱신 후 원래 alias의 기존 MCP 승인으로 capabilities·학기·강좌3개 조회가 모두 성공했다. 새 OAuth는0회이며 앞선8회 표본을 덮지 않는다. 두 표본을 합하면11호출 중10성공·당시 학교 인증 필요1회다. 새 process의 기존 승인 사용 성공이고 동일 live process 검사는 계속 미검증이다.
+
+원래 alias의 인증 성공에서 runtime refresh가 개입했는지는 아직 제한된 서버 route/status 근거가 없어 미검증이다. 이 문서 후속의 source commit과 운영 source를 구분하며, 위 표본의 runtime은 [`127174b9a3159a67462628616f11ad3a0446a972`](https://github.com/underconnor/alms-server/commit/127174b9a3159a67462628616f11ad3a0446a972)다. 이 후속 커밋은 두 문서만 갱신하며 운영 runtime은 해당 pin을 유지한다.
 
 ## 범위와 인증 경계
 
