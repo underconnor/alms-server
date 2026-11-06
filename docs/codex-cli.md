@@ -10,7 +10,17 @@ ALMS는 별도 OAuth를 사용하는 조회 전용 Streamable HTTP MCP 서버다
 
 이 검증은0.164.0의 실제 운영 OAuth·학교 데이터 성공을 대신하지 않는다. 별도0.141.0의 과거 운영 OAuth와7개 조회 성공은 [MCP 계약의 실제 검증 이력](mcp-contract.md#실제-검증-범위)에 보존한다. 다른 클라이언트/계정/네트워크와 운영 refresh 회전·폐기는 별도 검증이 필요하다.
 
-같은 날 별도로 운영 OAuth를1회 시작해 CLI exit0을 확인했지만, 브라우저 callback 오류 관찰과 이후 MCP401/refresh400·app-server 초기화 실패를 함께 보존했다. 이 시도의 학교 조회 도구 성공은0회다. 명시적 runtime read scope를 넣은 상태 진단에서도 `notLoggedIn`/`authenticationRequired`였다. 따라서 로컬 상호운용 성공이나 OAuth CLI 종료만으로 현재 운영의0.164.0 조회가 성공했다고 보고하지 않는다. 같은 OIDC browser session의 재승인 뒤 이전 연결이 종료되는 문제는 실제 provider의 합성 흐름으로 재현했으며 [Issue14](https://github.com/underconnor/alms-server/issues/14)에서 추적한다. 후속 구현은 아래 연결별 Grant 수명 정책을 적용한다. 후보 코드·회귀 통과와 운영 배포 뒤 실제 조회는 별도로 확정한다. 전역 설정·학교 기록은 이 진단 때문에 변경하지 않았다.
+같은 날 먼저 진행한 운영 OAuth1회는 CLI exit0 뒤 브라우저 callback 오류와 MCP401/refresh400·app-server 초기화 실패를 관찰했다. 이 초기 시도의 학교 조회 도구 성공은0회이고, 명시적 runtime read scope를 넣은 상태 진단도 `notLoggedIn`/`authenticationRequired`였다. 같은 OIDC browser session의 재승인 뒤 이전 연결이 종료되는 문제를 실제 provider의 합성 흐름으로 재현해 [Issue14](https://github.com/underconnor/alms-server/issues/14)에서 추적했다. 후속 구현은 아래 연결별 Grant 수명 정책을 적용한다. 초기 실패·합성 회귀와 다음 수정 후 운영 표본은 구분하며, 전역 설정·학교 기록은 이 진단 때문에 변경하지 않았다.
+
+## 수정 후 운영 검증
+
+2026-11-05 후속 배포(main `127174b9`) 뒤 Codex0.164.0의 정상 OAuth2회를 각각 별도 alias로 진행했다. 같은 `alms-codex`/`alms:read` 권한으로 두 native callback과 CLI exit0을 확인했고, 각 연결의 capabilities·학기·강좌3개씩 조회가 성공했다. 이후 새 OAuth 없이 원래 alias의 저장된 자격 증명으로 capabilities 인증 조회도 성공했다. 이때 뒤이은 학기 조회는 `SCHOOL_AUTH_REQUIRED`여서 강좌 조회를 실행하지 않았다. MCP 승인과 학교 인증의 수명을 구분한다.
+
+이 표본은 실제8개 도구 호출 중7개 성공·학교 인증 필요1개다. 첫 동일 process에서 재승인 직후 access token을 다시 쓰는 검사는 엄격180초 시간창 중단으로 미검증이다. 그 결과를 연결 오류나 성공으로 바꾸지 않고, 원래 alias의 새 process에서 기존 승인 사용이 가능했던 후속 결과와 구분한다. 모델 turn·학교 쓰기·전역 서버 등록·직접 credential 값 열람은0회다. 다른 계정/클라이언트와 운영 refresh·폐기·로그아웃의 전체 수명 검증은 후속이다.
+
+11월6일 학교 인증 갱신 뒤에는 원래 alias의 기존 MCP 승인을 그대로 사용해 새 OAuth 없이 capabilities·학기·강좌3조회가 모두 성공했다. 앞선 학교 인증 필요 이력을 보존하면 수정 후 운영 표본의 누계는11회 중10회 성공·당시 학교 인증 필요1회다. 이 후속도 새 process의 조회이며 동일 live process 검사의 미검증 상태를 바꾸지 않는다.
+
+원래 alias 조회에 정상 refresh가 개입했는지는 제한된 서버 route/status 근거를 확보하지 않아 미검증이다. 기존 자격 증명으로 인증됐다는 관찰과 refresh 교환·회전의 직접 검증을 구분한다. 이 후속은 문서만 갱신하며, 위 운영 표본의 Backend source는 [`127174b9a3159a67462628616f11ad3a0446a972`](https://github.com/underconnor/alms-server/commit/127174b9a3159a67462628616f11ad3a0446a972)로 고정한다. 이 문서 이후의 source commit과 운영 배포 commit은 같다고 가정하지 않는다.
 
 ## 이번 명령에만 연결 설정 적용
 
