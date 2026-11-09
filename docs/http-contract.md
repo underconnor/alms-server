@@ -83,6 +83,14 @@ Bearer 성공은 등록 URI의 fragment에 `code`, `clientId`, `clientState`를 
 
 `/playback-start-confirmations`의 영향 안내와 명시적 확인은 학교 진도 기록을 새로 시작하는 별도 동작이다. 작업 `completed/ended`는 실제 실행 종료이며 `recognized`, `attendance`는 fresh 학교 결과다. 개인 완료 override도 학교 결과와 별개다.
 
+### 서버 수강의 관측 진행률
+
+작업 응답의 선택적 `playbackProgress`는 서버 미디어 sampler가 직접 관측한 재생 상태다. `observedAt`, `positionSeconds`, `durationSeconds`, `percent`, `paused`, `ended`, `lastReport`를 반환한다. 최초 유효 관측 전과 과거 작업에는 null 또는 필드 부재가 가능하며 이를0%로 바꾸지 않는다. `percent`는 `min(100, positionSeconds/durationSeconds*100)`이며 미디어 반올림 오차0.25초만 허용한다. 시간 경과만으로 보간하거나 학교 완료로 처리하지 않는다.
+
+worker는 약2초 간격으로 최신 관측을 coalesce해 별도 `playback_job_progress`에 저장하고 종료 관측과 실제 보고 ACK는 즉시 저장을 시도한다. 활성 작업의 `observedAt`이15초 이상 오래됐으면 UI는 오래된 관측으로 표시하고 마지막 확인값을 유지한다. 종료 상태는 마지막 실제 관측을 유지하며 재생100%·`ended:true`만으로 학교 출석 인정이나 작업 성공을 추정하지 않는다.
+
+`lastReport`는 `{event:playing|update|ended,acknowledgedAt}` 또는 null이며 실제 학교 ACK와 후속 권한·controller상태 검증을 마친 뒤에만 기록한다. ACK만 있고 아직 미디어 관측이 없으면 공개 진행률은 계속 null이다. 최종 `schoolResult`와 학교 출석·완료·recognized는 별도 계약이다. 진행률 쓰기는 내부 worker의 exact job/owner/target/generation/실행token과 활성 상태에 묶이며 HTTP/MCP 쓰기 엔드포인트는 제공하지 않는다. 기존 jobs/학교 결과는 진행률 때문에 수정하지 않으며 migration016은 별도 테이블만 추가한다.
+
 ## 화면에서 독립적인 데이터
 
 `GET /v1/todos`의 개인 TODO와 `GET /v1/jobs`의 수강 작업 목록은 기존 `items`에 `{complete,hasMore,limit}`를 추가한다. 개인 TODO는 최신 500개, 작업은 최신 200개를 유지하며 `createdAt` 내림차순 뒤 `id` 내림차순으로 같은 시각의 순서도 고정한다. 서버는 같은 소유자·선택한 `courseId` 범위에서 한 행을 추가 조회해 잘림을 확인한다. 항목이 정확히 상한만큼 있고 더 없으면 `complete:true,hasMore:false`, 초과하면 `complete:false,hasMore:true`다. `complete`는 목록의 완전성이며 개별 TODO 완료·수강 종료·학교 인정 상태가 아니다.

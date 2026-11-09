@@ -10,6 +10,8 @@ import { inspectPlaybackTerminationProof, type PlaybackTerminationProof } from '
 import { playbackAccountLock, playbackAccountLockKey } from './playback-lock.js';
 import { publicVerifiedSchoolResult } from './job-verification.js';
 import type { LoginClientContext } from './frontend-clients.js';
+import { publicPlaybackProgress, validPlaybackObservation, validPlaybackReportAck, type PlaybackObservation, type PlaybackReportAck } from './playback-progress.js';
+import type { SchoolSessionLockRunner } from './school-session-lock.js';
 
 const iso = (value: Date | string): string => new Date(value).toISOString();
 type Row = Record<string, any>;
@@ -17,6 +19,7 @@ const userFrom = (r: Row): User => ({ id: r.user_id ?? r.id, displayName: r.disp
 const todoFrom = (r: Row): Todo => ({ id: r.id, title: r.title, completed: r.completed, dueAt: r.due_at ? iso(r.due_at) : null, createdAt: iso(r.created_at), updatedAt: iso(r.updated_at) });
 const completionFrom = (r: Row): PersonalCompletion => ({ courseId: r.course_id, activityId: r.activity_id, completed: r.completed, updatedAt: iso(r.updated_at) });
 const jobFrom = (r: Row): Job => ({ id: r.id, userId: r.user_id, courseId: r.course_id, lectureId: r.lecture_id, status: r.status, scheduledFor: iso(r.scheduled_for), createdAt: iso(r.created_at), updatedAt: iso(r.updated_at), schoolResult: r.school_result, errorCode: r.error_code, idempotencyKey: r.idempotency_key, requestHash: r.request_hash, acceptedGeneration: r.accepted_generation ?? null, executionTokenHash: r.execution_token_hash ?? null, executionOutcome: r.execution_outcome ?? null,
+  playbackProgress: publicPlaybackProgress(r.playback_observation, r.playback_report_ack),
   lastExecutionTokenHash: r.last_execution_token_hash ?? null, settledAt: r.settled_at ? iso(r.settled_at) : null,
   ...(r.recovery_reason ? { settlement: r.settlement_result ? { settledAt: iso(r.settled_at), schoolResult: r.settlement_result } : null,
     recovery: { eligible: r.recovery_reason === 'eligible', reason: r.recovery_reason, version: r.recovery_version ?? iso(r.updated_at) } } : {}) });
@@ -33,6 +36,7 @@ const claimValues = (claim: WorkerClaim) => [claim.jobId, claim.userId, claim.co
 const claimWhere = 'id=$1 AND user_id=$2 AND course_id=$3 AND lecture_id=$4 AND accepted_generation=$5 AND execution_token_hash=$6';
 const authorityChanged = () => new AppError(409, 'PLAYBACK_AUTHORITY_CHANGED', '학교 인증이나 작업 상태가 바뀌었습니다. 다시 확인해 주세요.');
 const jobRecoverySelect = `SELECT job.*, settlement.school_result AS settlement_result,
+  progress.observation AS playback_observation, progress.report_ack AS playback_report_ack,
   to_char(job.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS recovery_version,
   CASE WHEN job.settled_at IS NOT NULL THEN 'already_settled'
     WHEN job.status<>'needs_verification' OR job.execution_outcome IS DISTINCT FROM 'interrupted' THEN 'not_interrupted'
@@ -45,9 +49,12 @@ const jobRecoverySelect = `SELECT job.*, settlement.school_result AS settlement_
     WHEN EXISTS(SELECT 1 FROM playback_execution_leases lease WHERE lease.user_id=job.user_id
       AND lease.expires_at>clock_timestamp()) THEN 'lease_active'
     ELSE 'eligible' END AS recovery_reason
-  FROM playback_jobs job LEFT JOIN playback_job_settlements settlement ON settlement.job_id=job.id`;
+  FROM playback_jobs job LEFT JOIN playback_job_settlements settlement ON settlement.job_id=job.id
+  LEFT JOIN playback_job_progress progress ON progress.job_id=job.id
+    AND progress.execution_token_hash=COALESCE(job.execution_token_hash,job.last_execution_token_hash)`;
 
 export interface Store {
+  runWithSchoolSessionLock?: SchoolSessionLockRunner;
   analytics: AnalyticsRepository;
   health(): Promise<void>;
   getSession(tokenHash: string): Promise<Session | null>;
@@ -84,7 +91,10 @@ export interface Store {
 
 export class PgStore implements Store {
   readonly analytics: PgAnalyticsStore;
-  constructor(public pool: Pool) { this.analytics = new PgAnalyticsStore(pool); }
+  readonly runWithSchoolSessionLock?: SchoolSessionLockRunner;
+  constructor(public pool: Pool, options: { runWithSchoolSessionLock?: SchoolSessionLockRunner } = {}) {
+    this.analytics = new PgAnalyticsStore(pool); this.runWithSchoolSessionLock = options.runWithSchoolSessionLock;
+  }
   async query<T extends QueryResultRow = Row>(sql: string, params: unknown[] = []) { return this.pool.query<T>(sql, params); }
   async transaction<T>(run: (client: PoolClient) => Promise<T>): Promise<T> {
     const c = await this.pool.connect();
@@ -93,8 +103,8 @@ export class PgStore implements Store {
     finally { c.release(); }
   }
   async health() {
-    const result = await this.query("SELECT 1 FROM schema_migrations WHERE name IN ('011-playback-job-settlement.sql','012-frontend-clients.sql','013-analytics-frontend-client.sql','014-assignment-operation-recovery.sql')");
-    if (result.rowCount !== 4) throw new Error('Database migrations are pending');
+    const result = await this.query("SELECT 1 FROM schema_migrations WHERE name IN ('011-playback-job-settlement.sql','012-frontend-clients.sql','013-analytics-frontend-client.sql','014-assignment-operation-recovery.sql','016-playback-job-progress.sql')");
+    if (result.rowCount !== 5) throw new Error('Database migrations are pending');
   }
   async getSession(tokenHash: string): Promise<Session | null> {
     const { rows: [r] } = await this.query(`SELECT s.*,u.display_name,u.analytics_id,u.analytics_enabled FROM sessions s JOIN users u ON u.id=s.user_id WHERE token_hash=$1 AND expires_at>now()`, [tokenHash]);
@@ -381,6 +391,38 @@ export class PgStore implements Store {
         [...claimValues(claim),from,to,result ? JSON.stringify(result) : null,error,options.outcome ?? null,terminal,...(proof ? [proof.expiresAt] : [])]);
       return r ? jobFrom(r) : null;
     }, operation);
+  }
+  /** Trusted worker display observations. Existing job/school outcomes are never rewritten. */
+  async recordPlaybackObservation(claim: WorkerClaim, value: PlaybackObservation, operation?: WorkerOperation): Promise<boolean> {
+    if (!validPlaybackObservation(value)) return false;
+    const { rowCount } = await this.workerQuery(`WITH authorized AS (
+      SELECT id,execution_token_hash FROM playback_jobs WHERE ${claimWhere} AND status IN ('running','reconciling')
+        AND ($7::jsonb->>'observedAt')::timestamptz<=clock_timestamp()+interval '1 second' FOR UPDATE
+    ) INSERT INTO playback_job_progress(job_id,execution_token_hash,observation)
+      SELECT id,execution_token_hash,$7::jsonb FROM authorized
+      ON CONFLICT(job_id) DO UPDATE SET execution_token_hash=EXCLUDED.execution_token_hash,observation=EXCLUDED.observation,
+        report_ack=CASE WHEN playback_job_progress.execution_token_hash=EXCLUDED.execution_token_hash THEN playback_job_progress.report_ack ELSE NULL END
+      WHERE playback_job_progress.execution_token_hash<>EXCLUDED.execution_token_hash OR playback_job_progress.observation IS NULL
+        OR ((playback_job_progress.observation->>'observedAt')::timestamptz <= ($7::jsonb->>'observedAt')::timestamptz
+          AND (playback_job_progress.observation->>'positionSeconds')::numeric <= ($7::jsonb->>'positionSeconds')::numeric
+          AND ((playback_job_progress.observation->>'ended')::boolean IS NOT TRUE OR ($7::jsonb->>'ended')::boolean IS TRUE))`,
+      [...claimValues(claim), JSON.stringify(value)], operation);
+    return rowCount === 1;
+  }
+  async recordPlaybackReportAck(claim: WorkerClaim, value: PlaybackReportAck, operation?: WorkerOperation): Promise<boolean> {
+    if (!validPlaybackReportAck(value)) return false;
+    const { rowCount } = await this.workerQuery(`WITH authorized AS (
+      SELECT id,execution_token_hash FROM playback_jobs WHERE ${claimWhere} AND status IN ('running','reconciling')
+        AND ($7::jsonb->>'acknowledgedAt')::timestamptz<=clock_timestamp()+interval '1 second' FOR UPDATE
+    ) INSERT INTO playback_job_progress(job_id,execution_token_hash,report_ack)
+      SELECT id,execution_token_hash,$7::jsonb FROM authorized
+      ON CONFLICT(job_id) DO UPDATE SET execution_token_hash=EXCLUDED.execution_token_hash,report_ack=EXCLUDED.report_ack,
+        observation=CASE WHEN playback_job_progress.execution_token_hash=EXCLUDED.execution_token_hash THEN playback_job_progress.observation ELSE NULL END
+      WHERE playback_job_progress.execution_token_hash<>EXCLUDED.execution_token_hash OR playback_job_progress.report_ack IS NULL
+        OR ((playback_job_progress.report_ack->>'acknowledgedAt')::timestamptz <= ($7::jsonb->>'acknowledgedAt')::timestamptz
+          AND array_position(ARRAY['playing','update','ended'],playback_job_progress.report_ack->>'event') <= array_position(ARRAY['playing','update','ended'],$7::jsonb->>'event'))`,
+      [...claimValues(claim), JSON.stringify(value)], operation);
+    return rowCount === 1;
   }
   async heartbeat(claim: WorkerClaim, operation?: WorkerOperation) {
     const result = await this.workerQuery(`UPDATE playback_jobs SET heartbeat_at=clock_timestamp() WHERE ${claimWhere}

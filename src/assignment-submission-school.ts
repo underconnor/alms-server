@@ -14,15 +14,15 @@ const sessionSchema=z.object({version:z.literal(1),generation:z.uuid(),identity:
 export function createAssignmentSubmissionSchool(store:PgStore,key:Buffer,invalidateRead:(owner:string,course:string)=>Promise<void>,cache?:SchoolReadCache):SubmissionSchool {
  async function session(owner:string){const raw=await store.getEncryptedSchoolSession(owner,'ssu');if(!raw)throw new AppError(401,'SCHOOL_AUTH_REQUIRED','학교 인증을 다시 확인해 주세요.');try{return {raw,value:sessionSchema.parse(decryptSchoolSession(raw,key,owner,'ssu'))};}catch{throw new AppError(401,'SCHOOL_AUTH_REQUIRED','학교 인증을 다시 확인해 주세요.');}}
  async function execute<T>(owner:string,generation:string|undefined,validate:Validate,signal:AbortSignal,run:(client:Awaited<ReturnType<typeof initializeLearningxClient>>,validate:Validate,generation:string)=>Promise<T>):Promise<T>{
-  return boundedWorkerOperation(boundedSignal=>{signal=boundedSignal;return withSchoolSessionLock(owner,async()=>{await validate();signal.throwIfAborted();const before=await session(owner);if(generation&&before.value.generation!==generation)throw new AppError(409,'SCHOOL_SESSION_CHANGED','학교 인증이 변경됐습니다. 다시 확인해 주세요.');
+  return boundedWorkerOperation(boundedSignal=>{signal=boundedSignal;return withSchoolSessionLock(owner,async coordinated=>{signal=AbortSignal.any([boundedSignal,coordinated]);await validate();signal.throwIfAborted();const before=await session(owner);if(generation&&before.value.generation!==generation)throw new AppError(409,'SCHOOL_SESSION_CHANGED','학교 인증이 변경됐습니다. 다시 확인해 주세요.');
    const current=async()=>{await validate();signal.throwIfAborted();const after=await session(owner);if(after.value.generation!==before.value.generation||after.value.identity.studentId!==before.value.identity.studentId)throw new AppError(409,'SCHOOL_SESSION_CHANGED','학교 인증이 변경됐습니다. 다시 확인해 주세요.');};
    const guardedFetch:typeof fetch=async(input,init)=>{await current();const response=await fetch(input,{...init,signal:AbortSignal.any([signal,...(init?.signal?[init.signal]:[])])});return response;};
    const http=SchoolHttpClient.fromSessionJar(before.value.jar,guardedFetch);const client=await initializeLearningxClient(http,before.value.identity.studentId);await current();
    const result=await run(client,current,before.value.generation);await current();
    // Jar persistence is best effort after a school result. Generation changes are never hidden.
-   const latest=await session(owner);if(latest.value.generation!==before.value.generation)throw new AppError(409,'SCHOOL_SESSION_CHANGED','학교 인증이 변경됐습니다. 다시 확인해 주세요.');
-   const updated=encryptSchoolSession({...latest.value,jar:await http.jar.serialize()},key,owner,'ssu');await store.replaceEncryptedSchoolSession(owner,'ssu',latest.raw,updated).catch(()=>{});await current();return result;
-  });},{signal,timeoutMs:240000});
+   const latest=await session(owner);signal.throwIfAborted();if(latest.value.generation!==before.value.generation)throw new AppError(409,'SCHOOL_SESSION_CHANGED','학교 인증이 변경됐습니다. 다시 확인해 주세요.');
+   const jar=await http.jar.serialize();signal.throwIfAborted();const updated=encryptSchoolSession({...latest.value,jar},key,owner,'ssu');await store.replaceEncryptedSchoolSession(owner,'ssu',latest.raw,updated).catch(()=>{});await current();return result;
+  },{coordinate:store.runWithSchoolSessionLock,signal:boundedSignal});},{signal,timeoutMs:240000});
  }
  const receipt=(submission:{attempt:number|null;submittedAt:string|null}|null):Receipt|null=>submission?{attempt:submission.attempt,submittedAt:submission.submittedAt}:null;
  return {

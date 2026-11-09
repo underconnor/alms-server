@@ -1,3 +1,4 @@
+import { createPgSchoolSessionLockRunner } from './pg-school-session-lock.js';
 import { progressCacheResources } from './school-progress-cache.js';
 import { withSchoolPlayback } from './playback-bootstrap.js';
 import { PgSchoolReadCache } from './school-read-cache.js';
@@ -17,7 +18,9 @@ pool.on('error', () => process.stderr.write('{"code":"WORKER_DATABASE_ERROR"}\n'
 const boss = createQueueClient(config.databaseUrl);
 const controller = new AbortController();
 boss.on('error',() => { process.stderr.write('{"code":"QUEUE_ERROR"}\n'); controller.abort('queue-error'); void shutdown().catch(() => {}); });
-const store = new PgStore(pool);
+const schoolSessionPool = new Pool({ connectionString: config.databaseUrl, max: 2, connectionTimeoutMillis: 5000, statement_timeout: 5000, query_timeout: 5000, application_name: 'alms-school-session-coordinator' });
+schoolSessionPool.on('error', () => process.stderr.write('{"code":"SCHOOL_SESSION_POOL_ERROR"}\n'));
+const store = new PgStore(pool, { runWithSchoolSessionLock: createPgSchoolSessionLockRunner(schoolSessionPool) });
 const cache = config.sessionEncryptionKey ? new PgSchoolReadCache(pool, config.sessionEncryptionKey) : undefined;
 const provider = config.playbackEnabled && config.sessionEncryptionKey && cache
   ? withSchoolPlayback(unavailableSchoolProvider, store, config.sessionEncryptionKey,
@@ -47,7 +50,10 @@ const started = (async () => {
 let stopAnalytics: () => Promise<void> = async () => {};
 let ending: Promise<void> | undefined;
 const shutdown = () => ending ??= shutdownWorker({
-  controller, stop: [async () => (await started)(), () => stopAnalytics()], close: () => pool.end(),
+  controller, stop: [async () => (await started)(), () => stopAnalytics()], close: async () => {
+    const results = await Promise.allSettled([pool.end(), schoolSessionPool.end()]);
+    if (results.some(result => result.status === 'rejected')) throw new Error('WORKER_POOL_CLOSE_FAILED');
+  },
   failed: () => { process.stderr.write('{"code":"WORKER_SHUTDOWN_FAILED"}\n'); process.exit(1); },
 });
 for (const signal of ['SIGINT','SIGTERM'] as const) process.once(signal, () => { void shutdown().catch(() => {}); });

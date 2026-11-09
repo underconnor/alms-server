@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { AppError } from '../src/errors.js';
 import { SchoolVideoReportError } from '@alms/ssu-api';
 import { rememberVideoReportPreparation, videoReportDiagnostic, type workerVideoReportDiagnostic } from '../src/video-report-diagnostics.js';
-import { createSchoolPlayback, type SchoolPlaybackClaim, type SchoolPlaybackInput, type WorkerVideoReportAcknowledgement } from '../src/school-playback.js';
+import { createSchoolPlayback, type SchoolPlaybackClaim, type SchoolPlaybackInput, type WorkerVideoReportAcknowledgement, type SchoolPlaybackDependencies } from '../src/school-playback.js';
 import type { PreparedSchoolVideo } from '../src/school-video-session.js';
 import type { PlaybackLeaseScope } from '../src/manual-video-lease.js';
 import type { SchoolResult } from '../src/domain.js';
@@ -14,7 +14,8 @@ const signal = () => AbortSignal.timeout(5000), noop = async () => {};
 const schoolResult: SchoolResult = { observedAt: '2026-01-01T00:00:00Z', progressPercent: 100, attendance: 'unknown', recognized: null };
 const observed = { positionSeconds: 0, durationSeconds: 600, playbackRate: 1, paused: false, ended: false, seeking: false, visible: true };
 const evidence = { ended: true as const, browserClosed: true as const, processExited: true as const };
-function fixture(reportFailure?: (diagnostic: ReturnType<typeof workerVideoReportDiagnostic>) => void) {
+function fixture(reportFailure?: (diagnostic: ReturnType<typeof workerVideoReportDiagnostic>) => void,
+  progress: Pick<SchoolPlaybackDependencies<unknown, unknown, unknown>, 'observeProgress' | 'progressReportAcknowledged' | 'flushProgress'> = {}) {
   const claim: SchoolPlaybackClaim = { jobId: randomUUID(), userId: randomUUID(), courseId: '10', lectureId: '20',
     acceptedGeneration: randomUUID(), executionTokenHash: 'a'.repeat(64) };
   const target = { courseId: claim.courseId, lectureId: claim.lectureId }, context = { userId: claim.userId, claim };
@@ -65,6 +66,7 @@ function fixture(reportFailure?: (diagnostic: ReturnType<typeof workerVideoRepor
     createFinalProof: (scope, value) => { assert.deepEqual(scope, claim); assert.equal(value.generation, generation); return { kind: 'final' as const }; },
     reportFailure: diagnostic => { diagnostics.push(diagnostic); reportFailure?.(diagnostic); },
     reportAcknowledged: diagnostic => { acknowledgements.push(diagnostic); },
+    ...progress,
   });
   return { adapter, claim, target, context, driver, diagnostics, acknowledgements, input: () => input!, counts: () => ({ prepareCalls, mediaCalls, freshCalls, observeCalls, reportCalls, disposeCalls, releaseCalls }),
     prepare: () => adapter.preparePlayback(context, target, signal()), browserLoggedIn: () => browserLoggedIn,
@@ -80,12 +82,43 @@ test('admission checks school and supported media without acquiring a lease or s
   assert.deepEqual(proof, { kind: 'admission' }); assert.equal(f.counts().mediaCalls, 1); assert.equal(f.counts().reportCalls, 0);
   assert.equal(f.counts().disposeCalls, 0); assert.equal(f.counts().releaseCalls, 0);
 });
+test('jar and generation changes are conflicts, while proven school authentication failure alone requests login', async () => {
+  const conflict = fixture(), changed = new AppError(409, 'SCHOOL_SESSION_CHANGED', 'fixed');
+  conflict.driver.prepareMedia = async () => { throw changed; };
+  await assert.rejects(conflict.adapter.authorizePlayback({ userId: conflict.claim.userId }, conflict.target,
+    { signal: signal(), validate: noop }), error => error === changed);
+  assert.equal(conflict.counts().reportCalls, 0);
+  const expired = fixture(); expired.driver.prepareMedia = async () => { throw { code: 'authentication_required' }; };
+  await assert.rejects(expired.adapter.authorizePlayback({ userId: expired.claim.userId }, expired.target,
+    { signal: signal(), validate: noop }), { code: 'SCHOOL_AUTH_REQUIRED', statusCode: 401 });
+  assert.equal(expired.counts().reportCalls, 0);
+});
+test('display progress receives exact validated observations and ACKs and flushes once without granting school credit', async () => {
+  const positions: number[] = [], events: string[] = []; let flushed = 0;
+  const f = fixture(undefined, {
+    observeProgress: (claim, observation) => { assert.deepEqual(claim, f.claim); assert.equal(Object.isFrozen(observation), true); positions.push(observation.positionSeconds); },
+    progressReportAcknowledged: (claim, event) => { assert.deepEqual(claim, f.claim); events.push(event); },
+    flushProgress: async claim => { assert.deepEqual(claim, f.claim); flushed++; },
+  });
+  const prepared = await f.prepare(); await f.adapter.play(prepared, signal()); await prepared.dispose();
+  assert.deepEqual(positions, [0, 600]); assert.deepEqual(events, ['playing', 'ended']); assert.equal(flushed, 1);
+  assert.equal((await f.adapter.playbackLearningStatus(prepared, signal())).recognized, null);
+});
+test('display telemetry failures cannot stop playback, manufacture ACKs or alter uncertain school reports', async () => {
+  const f = fixture(undefined, { observeProgress: () => { throw new Error('display'); }, progressReportAcknowledged: () => { throw new Error('display'); }, flushProgress: async () => { throw new Error('display'); } });
+  const prepared = await f.prepare(); await f.adapter.play(prepared, signal()); assert.equal(f.counts().reportCalls, 2); assert.equal(f.counts().releaseCalls, 1);
+  let acknowledgements = 0, flushes = 0;
+  const g = fixture(undefined, { progressReportAcknowledged: () => { acknowledgements++; }, flushProgress: async () => { flushes++; } });
+  g.unknown(); const uncertain = await g.prepare();
+  await assert.rejects(g.adapter.play(uncertain, signal()), { code: 'PLAYBACK_REPORT_UNKNOWN' });
+  assert.equal(acknowledgements, 0); assert.equal(flushes, 1); assert.equal(g.counts().reportCalls, 1); assert.equal(g.counts().releaseCalls, 0);
+});
 test('owner, target and accepted generation are immutable worker preparation requirements', async () => {
   for (const field of ['userId','courseId','lectureId']) {
     const f = fixture(); await assert.rejects(f.adapter.preparePlayback({ ...f.context, claim: { ...f.claim, [field]: 'other' } }, f.target, signal()));
     assert.equal(f.counts().prepareCalls, 0);
   }
-  const f = fixture(); f.reauthenticate(); await assert.rejects(f.prepare(), { code: 'SCHOOL_AUTH_REQUIRED' }); assert.equal(f.counts().reportCalls, 0);
+  const f = fixture(); f.reauthenticate(); await assert.rejects(f.prepare(), { code: 'SCHOOL_SESSION_CHANGED' }); assert.equal(f.counts().reportCalls, 0);
 });
 test('browser logout preserves the accepted worker claim and explicit ended stays distinct from school recognition', async () => {
   const f = fixture(), prepared = await f.prepare(); f.logout(); assert.equal(f.browserLoggedIn(), false);
@@ -101,8 +134,8 @@ test('browser logout preserves the accepted worker claim and explicit ended stay
 test('disposed playback can read same-generation results but cannot cross a new login or revoked claim', async () => {
   const f = fixture(), prepared = await f.prepare(); await prepared.dispose();
   assert.equal((await f.adapter.playbackLearningStatus(prepared, signal())).recognized, null);
-  f.reauthenticate(); await assert.rejects(f.adapter.playbackLearningStatus(prepared, signal()), { code: 'SCHOOL_AUTH_REQUIRED' });
-  await assert.rejects(f.adapter.validatePlayback(prepared, signal()), { code: 'SCHOOL_AUTH_REQUIRED' });
+  f.reauthenticate(); await assert.rejects(f.adapter.playbackLearningStatus(prepared, signal()), { code: 'SCHOOL_SESSION_CHANGED' });
+  await assert.rejects(f.adapter.validatePlayback(prepared, signal()), { code: 'SCHOOL_SESSION_CHANGED' });
   const g = fixture(), other = await g.prepare(); await other.dispose(); g.revoke();
   await assert.rejects(g.adapter.validatePlayback(other, signal()), { code: 'PLAYBACK_AUTHORITY_CHANGED' });
 });

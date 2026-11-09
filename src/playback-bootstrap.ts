@@ -7,6 +7,7 @@ import { createPlaybackAdmission, createPlaybackFinalProof, claimMatchesJob, typ
 import type { PgStore } from './store.js';
 import type { SchoolProvider } from './provider.js';
 import { boundedWorkerOperation } from './worker-bounds.js';
+import { createPlaybackProgressRecorder } from './playback-progress.js';
 
 export function createWorkerClaimValidator(store: Pick<PgStore, 'getWorkerJob'>, mode: 'execution' | 'final') {
   return async (claim: WorkerClaim, signal: AbortSignal): Promise<void> => {
@@ -23,6 +24,7 @@ export function withSchoolPlayback(provider: SchoolProvider, store: PgStore, key
   reportFailure?: SchoolPlaybackDependencies<unknown, unknown, unknown>['reportFailure'],
   reportAcknowledged?: SchoolPlaybackDependencies<unknown, unknown, unknown>['reportAcknowledged']): SchoolProvider {
   const runtime = createControlledPlaybackRuntime();
+  const progress = createPlaybackProgressRecorder(store);
   const playback = createSchoolPlayback({
     school: createSchoolVideoSessions(store, key, invalidate, undefined, { allowReadystreamWorker: true }),
     leases: new PgPlaybackLeaseRepository(store.pool),
@@ -33,6 +35,9 @@ export function withSchoolPlayback(provider: SchoolProvider, store: PgStore, key
     runtime: { createSource: createControlledPlaybackSource, play: runtime.play, dispose: runtime.dispose },
     reportFailure,
     reportAcknowledged,
+    observeProgress: (claim, observation) => progress.observe(claim, observation),
+    progressReportAcknowledged: (claim, event) => progress.acknowledge(claim, event),
+    flushProgress: claim => progress.flushAndStop(claim),
   });
   return { ...provider, ...playback, capabilities: { ...provider.capabilities, playback: true, pauseResume: false } };
 }

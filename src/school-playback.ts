@@ -51,6 +51,10 @@ export interface SchoolPlaybackDependencies<Source, Admission, FinalProof> {
   stream?: ReturnType<typeof createVideoStreamer>;
   reportFailure?(diagnostic: ReturnType<typeof workerVideoReportDiagnostic>): void;
   reportAcknowledged?(diagnostic: WorkerVideoReportAcknowledgement): void;
+  /** Owner/claim-scoped display telemetry. It cannot authorize or report school progress. */
+  observeProgress?(claim: SchoolPlaybackClaim, observation: ManualVideoObservation): void;
+  progressReportAcknowledged?(claim: SchoolPlaybackClaim, event: 'playing' | 'update' | 'ended'): void;
+  flushProgress?(claim: SchoolPlaybackClaim): Promise<void>;
 }
 const changed = () => new AppError(409, 'PLAYBACK_AUTHORITY_CHANGED', '학교 인증이나 작업 상태가 바뀌었습니다. 다시 확인해 주세요.');
 const busy = () => new AppError(409, 'PLAYBACK_BUSY', '다른 영상이 실행 중입니다. 기존 재생이 종료된 뒤 다시 시도해 주세요.');
@@ -61,7 +65,7 @@ const unknown = (source?: unknown) => {
 };
 const normalize = async <T>(run: () => Promise<T>): Promise<T> => {
   try { return await run(); } catch (error) {
-    if (['authentication_required', 'identity_mismatch', 'SCHOOL_SESSION_CHANGED'].includes(String((error as { code?: unknown })?.code)))
+    if (['authentication_required', 'identity_mismatch'].includes(String((error as { code?: unknown })?.code)))
       throw new AppError(401, 'SCHOOL_AUTH_REQUIRED', '학교 인증을 다시 확인해 주세요.');
     throw error;
   }
@@ -105,7 +109,10 @@ export function createSchoolPlayback<Source, Admission, FinalProof>(dependencies
     const settledReport = state.reportPending
       ? boundedWorkerOperation(() => state.reportPending!, { timeoutMs: 1_000 }).catch(() => { state.uncertain = true; })
       : Promise.resolve();
-    try { await Promise.all([boundedWorkerOperation(() => runtime.dispose(state.source), { timeoutMs: 7_500 }), settledReport]); }
+    const settledProgress = dependencies.flushProgress
+      ? boundedWorkerOperation(() => dependencies.flushProgress!(state.claim), { timeoutMs: 500 }).catch(() => {})
+      : Promise.resolve();
+    try { await Promise.all([boundedWorkerOperation(() => runtime.dispose(state.source), { timeoutMs: 7_500 }), settledReport, settledProgress]); }
     catch { state.uncertain = true; throw cleanup(); }
     if (closeFailed) throw cleanup();
     state.runtimeStopped = true;
@@ -150,7 +157,12 @@ export function createSchoolPlayback<Source, Admission, FinalProof>(dependencies
               return stream(claim.userId, async () => ({ ...media, validate: () => guard(state!, current) }),
                 { ...request, signal: current, validate: async () => { await request.validate(); await guard(state!, current); } });
             },
-            observe: observation => { if (!state || state.disposed || lifetime.signal.aborted) throw changed(); driver!.observe(observation); },
+            observe: observation => {
+              if (!state || state.disposed || lifetime.signal.aborted) throw changed();
+              driver!.observe(observation);
+              // Sampling never waits for persistence, and a display observer cannot change playback.
+              try { dependencies.observeProgress?.(claim, Object.freeze({ ...observation })); } catch {}
+            },
             report: (event, reportSignal) => {
               if (!state || state.disposed || state.reporting || lifetime.signal.aborted) return Promise.reject(changed());
               const owned = state; owned.reporting = true; let enteredSchoolReport = false;
@@ -170,6 +182,7 @@ export function createSchoolPlayback<Source, Admission, FinalProof>(dependencies
                 } else if (result.state !== 'ready') {
                   const error = unknown(); rememberVideoReportPreparation(error, 'post_report', true); rememberVideoReportOutcomeFailure(error, result, 'nonterminal_controller_closed'); throw error;
                 }
+                try { dependencies.progressReportAcknowledged?.(claim, event); } catch {}
                 // An observer cannot alter report authority, uncertainty, cleanup or retry policy.
                 try { dependencies.reportAcknowledged?.(Object.freeze({ event: 'worker_video_report_acknowledged',
                   reportEvent: event, resourceType: media.resourceType === 'readystream' ? 'readystream' : 'movie',

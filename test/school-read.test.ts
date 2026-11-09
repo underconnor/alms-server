@@ -622,3 +622,20 @@ test('activity projection exposes verified seconds and percentage without raw vi
   assert.equal(result.durationSeconds,120);assert.equal(result.progressSeconds,30);assert.equal(result.progressPercent,25);
   assert.equal(result.completed,false);assert.equal(result.materialViewerUrl,null);assert.equal('viewerUrl' in result,false);
 });
+
+test('coordinator loss during an LMS read prevents publication without inventing login expiry', async () => {
+  const f=fixture(), before=f.states.get('owner-a'), life=new AbortController(); let writes=0;
+  const failure=new AppError(503,'SCHOOL_SESSION_LOCK_LOST','synthetic coordinator loss');
+  const store={...f.store, runWithSchoolSessionLock:async <T>(_owner:string,run:(signal:AbortSignal)=>Promise<T>)=>run(life.signal),
+    replaceEncryptedSchoolSession:async()=>{writes++;return false;}};
+  const reader=createLearningxReader(store,f.key,async()=>({serialize:async()=>({}),client:{terms:async()=>{life.abort(failure);return [];}} as unknown as LearningxClient}));
+  await assert.rejects(reader.catalog('owner-a'),error=>error===failure);
+  assert.equal(writes,0);assert.equal(f.states.get('owner-a'),before);
+});
+
+test('LMS jar publication and cache reads hold the coordinator',async()=>{
+ const f=fixture();let held=false,locks=0,connects=0;
+ const store={...f.store,runWithSchoolSessionLock:async<T>(owner:string,run:(signal:AbortSignal)=>Promise<T>)=>{assert.equal(owner,'owner-a');held=true;locks++;try{return await run(new AbortController().signal);}finally{held=false;}},replaceEncryptedSchoolSession:async(...args:Parameters<typeof f.store.replaceEncryptedSchoolSession>)=>{assert.equal(held,true);return f.store.replaceEncryptedSchoolSession(...args);}};
+ const reader=createLearningxReader(store,f.key,async()=>{assert.equal(held,true);connects++;return{serialize:async()=>({}),client:{terms:async()=>[]}as unknown as LearningxClient};});
+ await reader.catalog('owner-a');await reader.catalog('owner-a');assert.equal(locks,2);assert.equal(connects,1);assert.equal(held,false);
+});

@@ -1,3 +1,4 @@
+import { publicJobPlaybackProgress, type PlaybackProgress } from './playback-progress.js';
 export type JobStatus = 'queued' | 'scheduled' | 'running' | 'pause_requested' | 'paused' |
   'cancel_requested' | 'cancelled' | 'reconciling' | 'succeeded' | 'completed' | 'failed' |
   'needs_reauthentication' | 'needs_verification';
@@ -14,6 +15,8 @@ export interface Job {
   id: string; userId: string; courseId: string; lectureId: string; status: JobStatus;
   scheduledFor: string; createdAt: string; updatedAt: string;
   schoolResult: SchoolResult | null; errorCode: string | null;
+  /** Server-observed playback, independent of school completion or attendance. */
+  playbackProgress?: PlaybackProgress | null;
   idempotencyKey: string; requestHash: string;
   // Internal execution authority; never included in publicJob.
   acceptedGeneration: string | null; executionTokenHash: string | null;
@@ -63,5 +66,6 @@ export function publicJob(job: Job) {
   return { id: job.id, courseId: job.courseId, lectureId: job.lectureId, status: job.status,
     scheduledFor: job.scheduledFor, createdAt: job.createdAt, updatedAt: job.updatedAt,
     schoolResult: job.schoolResult, errorCode: job.errorCode, executionOutcome: job.executionOutcome ?? null,
+    ...(job.playbackProgress !== undefined ? { playbackProgress: publicJobPlaybackProgress(job.playbackProgress) } : {}),
     ...(job.recovery ? { settledAt: job.settledAt ?? null, settlement: job.settlement ?? null, recovery: job.recovery } : {}) };
 }

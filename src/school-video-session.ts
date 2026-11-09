@@ -7,7 +7,7 @@ import { SchoolHttpClient, initializeLearningxClient, selectDefaultTerms, inspec
   inspectSchoolVideoReportResponseFailure, createSchoolVideoPlaybackStartController, startSchoolVideoPlayback, closeSchoolVideoPlaybackStartController,
   SchoolError, type LearningxClient, type SchoolVideoLaunchData } from '@alms/ssu-api';
 import { decryptSchoolSession, encryptSchoolSession } from './crypto.js';
-import { withSchoolSessionLock } from './school-session-lock.js';
+import { withSchoolSessionLock, type SchoolSessionLockRunner } from './school-session-lock.js';
 import { boundedWorkerOperation } from './worker-bounds.js';
 import { AppError, notFound } from './errors.js';
 import { projectLearningStatus } from './learning-status.js';
@@ -20,7 +20,8 @@ import { playbackStartFailureDiagnostic, rememberPlaybackStartDiagnostic, type P
 const stored = z.object({ version: z.literal(1), generation: z.uuid(),
   identity: z.object({ studentId: z.string().regex(/^\d{6,12}$/) }).passthrough(), jar: z.unknown() }).passthrough();
 export type SchoolVideoSessionStore = { getEncryptedSchoolSession(owner: string, provider: string): Promise<string | null>;
-  replaceEncryptedSchoolSession(owner: string, provider: string, before: string, after: string): Promise<boolean> };
+  replaceEncryptedSchoolSession(owner: string, provider: string, before: string, after: string): Promise<boolean>;
+  runWithSchoolSessionLock?: SchoolSessionLockRunner };
 const changed = () => new AppError(409, 'SCHOOL_SESSION_CHANGED', '학교 인증이 변경됐습니다. 다시 확인해 주세요.');
 const required = () => new AppError(401, 'SCHOOL_AUTH_REQUIRED', '학교 인증을 다시 확인해 주세요.');
 type Session = z.infer<typeof stored>;
@@ -56,7 +57,8 @@ export function createSchoolVideoSessions(store: SchoolVideoSessionStore, key: B
   };
   async function execute<T>(owner: string, expected: Session | undefined, validate: () => Promise<void>, signal: AbortSignal,
     run: (connection: Connection) => Promise<T>, expectedGeneration?: string): Promise<{ value: T; encrypted: string; session: Session }> {
-    return withSchoolSessionLock(owner, async () => {
+    return withSchoolSessionLock(owner, async coordinated => {
+      signal = AbortSignal.any([signal, coordinated]);
       signal.throwIfAborted(); await validate(); signal.throwIfAborted();
       const before = expected ? await sameSession(owner, expected, signal) : await readSession(owner, signal);
       if (expectedGeneration !== undefined && before.value.generation !== expectedGeneration) throw changed();
@@ -83,7 +85,7 @@ export function createSchoolVideoSessions(store: SchoolVideoSessionStore, key: B
         // SDK HTTP normalization must not hide a concurrent ALMS logout or school generation change.
         await current(); throw error;
       }
-    });
+    }, { coordinate: store.runWithSchoolSessionLock, signal });
   }
   async function ownedLaunch(connection: Connection, courseId: string, activityId: string, signal: AbortSignal,
     mark?: (stage: VideoReportPreparationStage) => void) {

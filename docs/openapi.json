@@ -21696,6 +21696,76 @@
         ],
         "additionalProperties": true
       },
+      "PlaybackProgress": {
+        "type": "object",
+        "properties": {
+          "observedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "positionSeconds": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 14400.25
+          },
+          "durationSeconds": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "maximum": 14400
+          },
+          "percent": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "paused": {
+            "type": "boolean"
+          },
+          "ended": {
+            "type": "boolean"
+          },
+          "lastReport": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "event": {
+                    "type": "string",
+                    "enum": [
+                      "playing",
+                      "update",
+                      "ended"
+                    ]
+                  },
+                  "acknowledgedAt": {
+                    "type": "string",
+                    "format": "date-time"
+                  }
+                },
+                "required": [
+                  "event",
+                  "acknowledgedAt"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "observedAt",
+          "positionSeconds",
+          "durationSeconds",
+          "percent",
+          "paused",
+          "ended",
+          "lastReport"
+        ],
+        "additionalProperties": false,
+        "description": "Actual server media observations, not school progress or attendance. Optional/null until observed; percent is min(100, positionSeconds/durationSeconds*100), with up to 0.25s media rounding tolerance. Active observations older than 15s are stale; never interpolate. lastReport records only a validated school ACK and may be null."
+      },
       "Job": {
         "type": "object",
         "properties": {
@@ -21774,6 +21844,16 @@
                   "ended",
                   "interrupted"
                 ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "playbackProgress": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PlaybackProgress"
               },
               {
                 "type": "null"

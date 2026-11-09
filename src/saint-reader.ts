@@ -4,19 +4,26 @@ import { z } from 'zod';
 import { decryptSchoolSession, encryptSchoolSession } from './crypto.js';
 import { AppError } from './errors.js';
 import { normalizeSchoolReadError } from './school-read.js';
-import { withSchoolSessionLock } from './school-session-lock.js';
+import { withSchoolSessionLock, type SchoolSessionLockRunner } from './school-session-lock.js';
 import { schoolCacheTtl, type SchoolReadCache } from './school-read-cache.js';
 
 const stateSchema = z.object({ version: z.literal(1), generation: z.uuid().optional(), identity: z.object({ studentId: z.string().regex(/^\d{6,12}$/) }).passthrough(), jar: z.unknown() }).passthrough();
 type Store = {
+  runWithSchoolSessionLock?: SchoolSessionLockRunner;
   getEncryptedSchoolSession(owner: string, provider: string): Promise<string | null>;
   replaceEncryptedSchoolSession(owner: string, provider: string, previous: string, next: string): Promise<boolean>;
 };
 export type Schedule = { id: string; courseId: string | null; courseTitle: string; dayOfWeek: number; startTime: string; endTime: string; room: string | null; professor: string | null };
 export interface SaintReader { timetable(owner: string): Promise<{ term: string; entries: Schedule[] }> }
-type Connector = (state: z.infer<typeof stateSchema>) => Promise<{ timetable: SaintTimetable; jar: unknown }>;
-const open: Connector = async state => {
-  const http = SchoolHttpClient.fromSessionJar(state.jar);
+type Connector = (state: z.infer<typeof stateSchema>, signal?: AbortSignal) => Promise<{ timetable: SaintTimetable; jar: unknown }>;
+const open: Connector = async (state, signal) => {
+  const scopedFetch: typeof fetch | undefined = signal ? async (input, init) => {
+    signal.throwIfAborted();
+    const response = await fetch(input, { ...init, signal: AbortSignal.any([signal, ...(init?.signal ? [init.signal] : [])]) });
+    if (signal.aborted) { void response.body?.cancel().catch(() => {}); signal.throwIfAborted(); }
+    return response;
+  } : undefined;
+  const http = SchoolHttpClient.fromSessionJar(state.jar, scopedFetch);
   const portal = await http.get('https://saint.ssu.ac.kr/webSSUMain/main_student.jsp');
   parseUsaintIdentity(portal.body, state.identity.studentId);
   const timetable = await new SaintTimetableClient(http).read();
@@ -30,7 +37,8 @@ export function createSaintReader(store: Store, key: Buffer, connect: Connector 
   return { timetable(owner) {
     const active = pending.get(owner);
     if (active) return active;
-    const result = withSchoolSessionLock(owner, async () => {
+    const result = withSchoolSessionLock(owner, async signal => {
+      signal.throwIfAborted();
       const encrypted = await store.getEncryptedSchoolSession(owner, 'ssu');
       if (!encrypted) { cache.delete(owner); throw new AppError(401, 'SCHOOL_AUTH_REQUIRED', '학교 로그인이 필요합니다.'); }
       let state: z.infer<typeof stateSchema>;
@@ -40,6 +48,7 @@ export function createSaintReader(store: Store, key: Buffer, connect: Connector 
       const generation = state.generation ?? randomUUID();
       const scope = (encryptedSession: string) => ({ owner, provider: 'ssu', generation, resource: 'saint:timetable', encryptedSession });
       const currentSession = async (expected: string) => {
+        signal.throwIfAborted();
         if (await store.getEncryptedSchoolSession(owner, 'ssu') !== expected)
           throw new AppError(409, 'SCHOOL_SESSION_CHANGED', '학교 세션이 갱신됐습니다. 다시 조회해 주세요.');
       };
@@ -53,7 +62,8 @@ export function createSaintReader(store: Store, key: Buffer, connect: Connector 
           return persisted.value;
         }
       }
-      const response = await connect(state);
+      const response = await connect(state, signal);
+      signal.throwIfAborted();
       const updated = encryptSchoolSession({ ...state, generation, jar: response.jar }, key, owner, 'ssu');
       if (!await store.replaceEncryptedSchoolSession(owner, 'ssu', encrypted, updated)) {
         throw new AppError(409, 'SCHOOL_SESSION_CHANGED', '학교 세션이 갱신됐습니다. 다시 조회해 주세요.');
@@ -68,7 +78,7 @@ export function createSaintReader(store: Store, key: Buffer, connect: Connector 
       if (cache.size >= 100) cache.delete(cache.keys().next().value!);
       cache.set(owner, { generation, expiresAt: Date.now() + 60_000, value });
       return value;
-    }).catch(async error => { cache.delete(owner); if (durable) await durable.delete(owner, 'ssu', 'saint:timetable').catch(() => {}); return normalizeSchoolReadError(error); }).finally(() => { pending.delete(owner); });
+    }, { coordinate: store.runWithSchoolSessionLock }).catch(async error => { cache.delete(owner); if (durable) await durable.delete(owner, 'ssu', 'saint:timetable').catch(() => {}); return normalizeSchoolReadError(error); }).finally(() => { pending.delete(owner); });
     pending.set(owner, result);
     return result;
   } };

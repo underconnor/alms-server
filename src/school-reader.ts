@@ -14,7 +14,7 @@ import { type SyllabusRenderInput, type SyllabusAuthCheck } from './syllabus-run
 import { z } from 'zod';
 import type { SchoolResult } from './domain.js';
 import { boundedWorkerOperation } from './worker-bounds.js';
-import { withSchoolSessionLock } from './school-session-lock.js';
+import { withSchoolSessionLock, type SchoolSessionLockRunner } from './school-session-lock.js';
 import { createSourceReadFlights } from './source-read-flight.js';
 import { decryptSchoolSession, encryptSchoolSession } from './crypto.js';
 import { AppError, notFound } from './errors.js';
@@ -29,6 +29,7 @@ import { materialViewFailureDiagnostic, rememberMaterialViewFailure, type Materi
 
 const storedSession = z.object({ version: z.literal(1), generation: z.uuid().optional(), identity: z.object({ studentId: z.string().regex(/^\d{6,12}$/) }).passthrough(), jar: z.unknown() }).passthrough();
 type SessionStore = {
+  runWithSchoolSessionLock?: SchoolSessionLockRunner;
   getEncryptedSchoolSession(userId: string, provider: string): Promise<string | null>;
   getAuthenticatedSchoolSession?(userId: string, provider: string, tokenHash: string): Promise<AuthenticatedSchoolSessionSnapshot>;
   replaceEncryptedSchoolSession(userId: string, provider: string, previous: string, next: string): Promise<boolean>;
@@ -80,6 +81,8 @@ export function createLearningxReader(store: SessionStore, key: Buffer, connect:
   videoOperations = { resolve: resolveSchoolVideoMedia, inspect: inspectSchoolVideoMedia, stream: createVideoStreamer() },
   materialReporter: MaterialReporter | null = reportMaterial,
   renderSyllabus: ((input: SyllabusRenderInput, signal: AbortSignal) => Promise<{ bytes: Uint8Array; pageCount: number }>) | null = null): LearningxReader & { invalidate(owner: string, courseId?: string, moduleItemId?: string): Promise<void>; invalidateActivities(owner: string, targets: readonly ProgressCacheTarget[], signal: AbortSignal): Promise<void> } {
+  const schoolLock = <T>(owner: string, run: (signal: AbortSignal) => Promise<T>, signal?: AbortSignal) =>
+    withSchoolSessionLock(owner, run, { coordinate: store.runWithSchoolSessionLock, signal });
   type Cached = { expiresAt: number; value: unknown };
   type OwnerCache = { generation: string; values: Map<string, Cached> };
   const cache = new Map<string, OwnerCache>();
@@ -212,7 +215,11 @@ export function createLearningxReader(store: SessionStore, key: Buffer, connect:
       : selectedCatalog === 'default' ? 'catalog' : `catalog:${selectedCatalog}`;
     const active = transient || fresh || validateCached ? undefined : pending.get(owner)?.get(resource);
     if (active) return active as Promise<T>;
-    const result = abortableRead(withSchoolSessionLock(owner, async () => {
+    const requestSignal = signal;
+    const result = abortableRead(schoolLock(owner, async coordinated => {
+      const signal = store.runWithSchoolSessionLock
+        ? requestSignal ? AbortSignal.any([requestSignal, coordinated]) : coordinated
+        : requestSignal;
       signal?.throwIfAborted();
       const encrypted = await store.getEncryptedSchoolSession(owner, 'ssu');
       attemptedSchoolState = encrypted ?? undefined;
@@ -386,7 +393,7 @@ export function createLearningxReader(store: SessionStore, key: Buffer, connect:
       remember(owner, generation, values);
       if (reused) remember(owner, generation, [[resource, value]], reused.expiresAt);
       return value;
-    }), signal, abortKind).catch(async error => {
+    }, signal), signal, abortKind).catch(async error => {
       if (error instanceof WarmupCancelled) throw error;
       // Authentication/session changes clear the account; one failed resource must not
       // evict independently usable courses/timetable/catalog and restart the whole screen.
