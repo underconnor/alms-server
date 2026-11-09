@@ -16818,8 +16818,8 @@
     "/v1/jobs/requests/{key}": {
       "get": {
         "operationId": "get_v1_jobs_requests_key",
-        "summary": "Read exact owned admission key",
-        "description": "Read-only, no school refresh. Consent-backed requests retain exact original client; legacy owner reads retain their old policy.404 during in-flight admission is not negative proof. Compare exact target and startConsent.id before acknowledging response loss.",
+        "summary": "Inspect exact owned admission key",
+        "description": "Read-only, no school refresh. Exact-key Job is returned first in any status. With original startConsentId, only an owner/account-lock-serialized absence plus irrevocably expired/revoked/retired-generation original consent returns not_admitted. Current session and exact registered client are checked; immutable grant prevents a late original body from binding afterwards. Valid grant, missing/corrupt/not-ready school generation, USED and404 are not negative proof. Negative receipt is scoped to exact original key/consent; it grants no permission and never replays unknown school work. Legacy owner reads retain their old policy.",
         "security": [
           {
             "cookieSession": []
@@ -16860,6 +16860,15 @@
             "description": "Exact registered origin; required on writes and on every bearer request."
           },
           {
+            "name": "startConsentId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
             "name": "Accept",
             "in": "header",
             "required": true,
@@ -16875,7 +16884,14 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Job"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Job"
+                    },
+                    {
+                      "$ref": "#/components/schemas/NotAdmittedJobRequest"
+                    }
+                  ]
                 }
               }
             }
@@ -17000,7 +17016,8 @@
           "SCHOOL_AUTH_REQUIRED",
           "SCHOOL_SESSION_CHANGED",
           "CLIENT_UPDATE_REQUIRED",
-          "PLAYBACK_START_CONSENT_INVALID"
+          "PLAYBACK_START_CONSENT_INVALID",
+          "PLAYBACK_REQUEST_INSPECTION_INVALID"
         ],
         "x-alms-bearer-required-headers": [
           "Authorization",
@@ -17010,8 +17027,8 @@
       },
       "head": {
         "operationId": "head_v1_jobs_requests_key",
-        "summary": "Headers only: Read exact owned admission key",
-        "description": "Read-only, no school refresh. Consent-backed requests retain exact original client; legacy owner reads retain their old policy.404 during in-flight admission is not negative proof. Compare exact target and startConsent.id before acknowledging response loss.",
+        "summary": "Headers only: Inspect exact owned admission key",
+        "description": "Read-only, no school refresh. Exact-key Job is returned first in any status. With original startConsentId, only an owner/account-lock-serialized absence plus irrevocably expired/revoked/retired-generation original consent returns not_admitted. Current session and exact registered client are checked; immutable grant prevents a late original body from binding afterwards. Valid grant, missing/corrupt/not-ready school generation, USED and404 are not negative proof. Negative receipt is scoped to exact original key/consent; it grants no permission and never replays unknown school work. Legacy owner reads retain their old policy.",
         "security": [
           {
             "cookieSession": []
@@ -17050,6 +17067,15 @@
               "format": "uri"
             },
             "description": "Exact registered origin; required on writes and on every bearer request."
+          },
+          {
+            "name": "startConsentId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
           },
           {
             "name": "Accept",
@@ -17108,7 +17134,8 @@
           "SCHOOL_AUTH_REQUIRED",
           "SCHOOL_SESSION_CHANGED",
           "CLIENT_UPDATE_REQUIRED",
-          "PLAYBACK_START_CONSENT_INVALID"
+          "PLAYBACK_START_CONSENT_INVALID",
+          "PLAYBACK_REQUEST_INSPECTION_INVALID"
         ],
         "x-alms-bearer-required-headers": [
           "Authorization",
@@ -17339,7 +17366,7 @@
       "post": {
         "operationId": "post_v1_jobs",
         "summary": "Accept a separate server lecture job",
-        "description": "Schedule at most1year ahead. Admission checks live worker readiness, school ownership and generation;202 is not completion. Readystream additionally requires confirmed pureCanvas and an exact opaque-launch proof for a supported single-story video1 UPF/MP4; slides, multiple stories/media, HLS and unknown manifests are rejected before acceptance. Read jobs on uncertain acceptance; never automatically replay an uncertain school write.",
+        "description": "Schedule at most1year ahead; consent-backed scheduledFor must strictly precede consent.expiresAt or409PLAYBACK_START_CONSENT_SCHEDULE_INVALID rolls back admission. Admission checks live worker readiness, school ownership and generation;202 is not completion. Readystream additionally requires confirmed pureCanvas and an exact opaque-launch proof for a supported single-story video1 UPF/MP4; slides, multiple stories/media, HLS and unknown manifests are rejected before acceptance. Read jobs on uncertain acceptance; never automatically replay an uncertain school write.",
         "security": [
           {
             "cookieSession": []
@@ -17535,7 +17562,12 @@
           "IDEMPOTENCY_CONFLICT",
           "JOB_ALREADY_ACTIVE",
           "INVALID_SCHEDULE",
-          "CLIENT_UPDATE_REQUIRED"
+          "CLIENT_UPDATE_REQUIRED",
+          "PLAYBACK_START_CONSENT_INVALID",
+          "PLAYBACK_START_CONSENT_EXPIRED",
+          "PLAYBACK_START_CONSENT_REVOKED",
+          "PLAYBACK_START_CONSENT_USED",
+          "PLAYBACK_START_CONSENT_SCHEDULE_INVALID"
         ],
         "x-alms-bearer-required-headers": [
           "Authorization",
@@ -18315,7 +18347,7 @@
       "post": {
         "operationId": "post_v1_jobs_id_continue",
         "summary": "Explicitly continue a proven-unstarted authentication wait",
-        "description": "Only server-created wait markers for known-before-play failures qualify. Requires newer verified school SSO, fresh native identity/enrollment/media admission, worker readiness, live session/client/CSRF and unchanged school seal. A transaction preserves the old accepted generation and original error evidence, retires the old intent, creates one new normal job/outbox and records one durable old-to-new relation. Future schedules are preserved. Existing completed school videos are excluded. Exact same-key replay returns the same child in any known status without new school admission. The original job UUID may be used as its stable continuation key across reloads; unrelated existing use yields IDEMPOTENCY_CONFLICT, never a fallback key. Response loss requires GET originalJob.authWait.continuedAsJobId then GET that child; a missing pointer during an in-flight request is not proof of failure. Never generate a new key or automatically retry uncertain acceptance. Unknown/interrupted/running/cleanup-uncertain/unmarked historical jobs are ineligible.",
+        "description": "Only server-created wait markers for known-before-play failures qualify. Requires newer verified school SSO, fresh native identity/enrollment/media admission, worker readiness, live session/client/CSRF and unchanged school seal. A transaction preserves the old accepted generation and original error evidence, retires the old intent, creates one new normal job/outbox and records one durable old-to-new relation. Future schedules are preserved and must strictly precede the new consent expiry when startConsentId is supplied; otherwise409PLAYBACK_START_CONSENT_SCHEDULE_INVALID preserves the old intent. Existing completed school videos are excluded. Exact same-key replay returns the same child in any known status without new school admission. The original job UUID may be used as its stable continuation key across reloads; unrelated existing use yields IDEMPOTENCY_CONFLICT, never a fallback key. Response loss requires GET originalJob.authWait.continuedAsJobId then GET that child; a missing pointer during an in-flight request is not proof of failure. Never generate a new key or automatically retry uncertain acceptance. Unknown/interrupted/running/cleanup-uncertain/unmarked historical jobs are ineligible.",
         "security": [
           {
             "cookieSession": []
@@ -18544,7 +18576,12 @@
           "SCHOOL_AUTH_REQUIRED",
           "IDEMPOTENCY_CONFLICT",
           "JOB_ALREADY_ACTIVE",
-          "CLIENT_UPDATE_REQUIRED"
+          "CLIENT_UPDATE_REQUIRED",
+          "PLAYBACK_START_CONSENT_INVALID",
+          "PLAYBACK_START_CONSENT_EXPIRED",
+          "PLAYBACK_START_CONSENT_REVOKED",
+          "PLAYBACK_START_CONSENT_USED",
+          "PLAYBACK_START_CONSENT_SCHEDULE_INVALID"
         ],
         "x-alms-bearer-required-headers": [
           "Authorization",
@@ -23170,6 +23207,28 @@
           "expiresAt",
           "courseId",
           "lectureIds"
+        ],
+        "additionalProperties": false
+      },
+      "NotAdmittedJobRequest": {
+        "type": "object",
+        "properties": {
+          "requestStatus": {
+            "const": "not_admitted"
+          },
+          "requestKey": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "startConsentId": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "requestStatus",
+          "requestKey",
+          "startConsentId"
         ],
         "additionalProperties": false
       },

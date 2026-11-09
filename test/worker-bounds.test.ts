@@ -126,3 +126,8 @@ test('the complete worker shutdown budget fits inside the Compose grace period',
   assert.ok(workerShutdownTimeoutMs < seconds * 1000);
   assert.ok(workerQueueLimits.stopMs + 5000 <= workerShutdownTimeoutMs);
 });
+
+test('opted-in consent transactions start read committed before any configuration snapshot',async()=>{
+ const db=database();await workerTransaction(db.pool,query=>query('SELECT synthetic'),{timeoutMs:500,readCommitted:true});
+ assert.equal(db.queries[0]!.sql,'BEGIN ISOLATION LEVEL READ COMMITTED');assert.ok(db.queries[1]!.sql.includes('set_config'));assert.equal(db.queries.at(-1)!.sql,'COMMIT');assert.deepEqual(db.releases,[false]);
+});

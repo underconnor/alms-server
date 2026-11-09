@@ -42,12 +42,23 @@ export function registerPlaybackStartConsents(
     return result;
   });
   app.get('/v1/jobs/requests/:key', protectedRoute, async (r) => {
-    empty.parse(r.query);
+    const query = z.object({ startConsentId: z.uuid().optional() }).strict().parse(r.query);
     const { key: requestKey } = z.object({ key: z.uuid() }).strict().parse(r.params);
     requirePlaybackClient(r, true);
     if (!store.getJobRequest) throw unavailable('PLAYBACK_START_CONSENT_UNAVAILABLE');
-    const job = await store.getJobRequest(r.session!.user.id, requestKey, auth(r), { timeoutMs: 5000 });
+    const job = await store.getJobRequest(
+      r.session!.user.id,
+      requestKey,
+      auth(r),
+      { timeoutMs: 5000 },
+      { ...query, encryptionKey: key },
+    );
     if (!job) throw notFound();
+    if ('requestStatus' in job) {
+      if (!query.startConsentId || job.requestKey !== requestKey || job.startConsentId !== query.startConsentId)
+        throw new AppError(502, 'PLAYBACK_REQUEST_INSPECTION_INVALID', '접수 상태를 다시 확인해 주세요.');
+      return { requestStatus: 'not_admitted' as const, requestKey, startConsentId: query.startConsentId };
+    }
     return publicJob(job);
   });
   app.post('/v1/playback-start-consents', protectedRoute, async (r, reply) => {

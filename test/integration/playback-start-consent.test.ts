@@ -529,4 +529,430 @@ describe('exact queue start consent and one-use attempts in isolated PostgreSQL'
       assert.equal((await pool.query('SELECT 1 FROM playback_auth_waits WHERE job_id=$1', [claim.jobId])).rowCount, 0);
     }
   });
+  it('rejects consent-backed schedules at or after the public expiry atomically while retaining legacy schedules', async () => {
+    for (const offset of [0, 60000]) {
+      const f = await fixture(),
+        scheduledFor = new Date(Date.parse(f.consent.expiresAt) + offset).toISOString();
+      const input = {
+        courseId: '10',
+        lectureId: '20',
+        scheduledFor,
+        idempotencyKey: randomUUID(),
+        requestHash: hashToken(randomUUID()),
+        startConsentId: f.consent.id,
+      };
+      await assert.rejects(store.createJob(f.owner, input, { ...f.auth, admission: f.admission() }), {
+        code: 'PLAYBACK_START_CONSENT_SCHEDULE_INVALID',
+      });
+      assert.equal((await pool.query('SELECT 1 FROM playback_jobs WHERE user_id=$1', [f.owner])).rowCount, 0);
+      assert.equal(
+        (await pool.query('SELECT 1 FROM playback_job_start_consents WHERE consent_id=$1', [f.consent.id])).rowCount,
+        0,
+      );
+      const legacy = await store.createJob(
+        f.owner,
+        { ...input, startConsentId: undefined, idempotencyKey: randomUUID() },
+        { ...f.auth, admission: f.admission() },
+      );
+      assert.equal(legacy.status, 'scheduled');
+      assert.equal(legacy.startConsent, null);
+    }
+  });
+  it('an over-expiry future continuation preserves the old scheduled intent and creates no child', async () => {
+    const f = await fixture(),
+      scheduledFor = new Date(Date.now() + 36 * 3600000).toISOString();
+    const future = await store.createJob(
+      f.owner,
+      { courseId: '10', lectureId: '20', scheduledFor, idempotencyKey: randomUUID(), requestHash: hashToken('future') },
+      { ...f.auth, admission: f.admission() },
+    );
+    const cause = await f.create(false, '21'),
+      claim = jobClaim((await store.claimJob(cause.id))!);
+    await store.transitionJob(claim, ['running'], 'needs_reauthentication', null, 'AUTH_REQUIRED', {
+      outcome: 'not_started',
+      authenticationWaitReason: 'school_auth_required',
+    });
+    const generation = randomUUID();
+    let sealed = '';
+    const session = await store.issueVerifiedSession(f.identity, 3600, {
+      provider: 'ssu',
+      seal: (owner) => (sealed = encryptSchoolSession(f.school(generation), key, owner, 'ssu')),
+    });
+    const auth = { almsTokenHash: hashToken(session.token), csrfToken: session.csrfToken, clientId: null };
+    const input = startConsentInput.parse({ courseId: '10', lectureIds: ['20'], confirmed: true });
+    const consent = await store.createPlaybackStartConsent(
+      f.owner,
+      input,
+      randomUUID(),
+      hashToken(JSON.stringify(input)),
+      { ...auth, generation, encryptedSession: sealed },
+      op,
+    );
+    const before = (await pool.query('SELECT to_jsonb(j) AS row FROM playback_jobs j WHERE id=$1', [future.id])).rows[0]
+      .row;
+    const { playbackContinuationHash } = await import('../../src/playback-continuation-routes.js');
+    await assert.rejects(
+      store.continueJob(f.owner, future.id, future.id, playbackContinuationHash(future.id, consent.id), {
+        ...auth,
+        startConsentId: consent.id,
+        admission: createPlaybackAdmission(
+          { userId: f.owner, courseId: '10', lectureId: '20' },
+          { generation, encryptedSession: sealed },
+        ),
+      }),
+      { code: 'PLAYBACK_START_CONSENT_SCHEDULE_INVALID' },
+    );
+    assert.deepEqual(
+      (await pool.query('SELECT to_jsonb(j) AS row FROM playback_jobs j WHERE id=$1', [future.id])).rows[0].row,
+      before,
+    );
+    assert.equal((await store.getJob(f.owner, future.id))?.authWait?.continuedAsJobId, null);
+    assert.equal(
+      (await pool.query('SELECT count(*)::int AS n FROM playback_jobs WHERE user_id=$1', [f.owner])).rows[0].n,
+      2,
+    );
+  });
+  it('negative receipts require permanently invalid original permission, never a valid grant, USED or uncertain school state', async () => {
+    for (const mode of ['expired', 'revoked', 'retired', 'valid', 'used', 'missing', 'corrupt', 'not-ready'] as const) {
+      const f = await fixture(mode === 'expired' ? 1000 : undefined),
+        requestKey = randomUUID();
+      if (mode === 'expired') await f.expire();
+      if (mode === 'revoked') await store.revokePlaybackStartConsent(f.owner, f.consent.id, f.auth, op);
+      if (mode === 'used') await f.create();
+      if (mode === 'missing') await pool.query('DELETE FROM school_sessions WHERE user_id=$1', [f.owner]);
+      if (mode === 'corrupt')
+        await pool.query("UPDATE school_sessions SET encrypted_state='synthetic-corrupt' WHERE user_id=$1", [f.owner]);
+      if (mode === 'retired' || mode === 'not-ready')
+        await store.issueVerifiedSession(f.identity, 3600, {
+          provider: 'ssu',
+          seal: (owner) =>
+            encryptSchoolSession(
+              { ...f.school(randomUUID()), ...(mode === 'not-ready' ? { lmsExchange: { status: 'failed' } } : {}) },
+              key,
+              owner,
+              'ssu',
+            ),
+        });
+      const result = await store.getJobRequest(f.owner, requestKey, f.auth, op, {
+        startConsentId: f.consent.id,
+        encryptionKey: key,
+      });
+      if (['expired', 'revoked', 'retired'].includes(mode))
+        assert.deepEqual(result, { requestStatus: 'not_admitted', requestKey, startConsentId: f.consent.id });
+      else assert.equal(result, null, mode);
+      assert.equal(await store.getJobRequest(f.owner, randomUUID(), f.auth), null);
+    }
+  });
+  it('accepted exact-key jobs win over invalid permission and mismatched lookup IDs; foreign owner/client never get negative proof', async () => {
+    const f = await fixture(),
+      job = await f.create();
+    await store.revokePlaybackStartConsent(f.owner, f.consent.id, f.auth, op);
+    await store.cancelJob(f.owner, job.id);
+    const existing = await store.getJobRequest(f.owner, job.idempotencyKey, f.auth, op, {
+      startConsentId: randomUUID(),
+      encryptionKey: key,
+    });
+    assert.ok(existing && 'id' in existing);
+    assert.equal(existing.id, job.id);
+    assert.equal(existing.status, 'cancelled');
+    const other = await fixture();
+    assert.equal(
+      await store.getJobRequest(other.owner, randomUUID(), other.auth, op, {
+        startConsentId: f.consent.id,
+        encryptionKey: key,
+      }),
+      null,
+    );
+    const session = await store.issueVerifiedSession(f.identity, 3600, undefined, 'other-client');
+    await assert.rejects(
+      store.getJobRequest(
+        f.owner,
+        randomUUID(),
+        { almsTokenHash: hashToken(session.token), csrfToken: session.csrfToken, clientId: 'other-client' },
+        op,
+        { startConsentId: f.consent.id, encryptionKey: key },
+      ),
+      { code: 'PLAYBACK_START_CONSENT_INVALID' },
+    );
+  });
+  it('proof waits for an earlier original admission and observes its accepted job instead of inventing absence', async () => {
+    const f = await fixture(),
+      requestKey = randomUUID(),
+      locker = await pool.connect();
+    const rr = new Pool({ connectionString: url, max: 1, options: `-c search_path=${schema}` });
+    await rr.query('SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+    const inspectingStore = new PgStore(rr);
+    let original: Promise<any> | undefined, inspection: Promise<any> | undefined;
+    const waitBy = async (pid: number) => {
+      const until = Date.now() + 2500;
+      while (Date.now() < until) {
+        const {
+          rows: [row],
+        } = await pool.query('SELECT pid FROM pg_stat_activity WHERE $1::int=ANY(pg_blocking_pids(pid))', [pid]);
+        if (row) return Number(row.pid);
+        await delay(5);
+      }
+      assert.fail('Expected exact backend lock wait');
+    };
+    try {
+      await locker.query('BEGIN');
+      await locker.query('SELECT id FROM playback_start_consents WHERE id=$1 FOR UPDATE', [f.consent.id]);
+      const pid = Number((await locker.query('SELECT pg_backend_pid() AS pid')).rows[0].pid);
+      original = store
+        .createJob(
+          f.owner,
+          {
+            courseId: '10',
+            lectureId: '20',
+            scheduledFor: new Date().toISOString(),
+            idempotencyKey: requestKey,
+            requestHash: hashToken('delayed-accepted'),
+            startConsentId: f.consent.id,
+          },
+          { ...f.auth, admission: f.admission() },
+        )
+        .then(
+          (value) => ({ value }),
+          (error) => ({ error }),
+        );
+      const createPid = await waitBy(pid);
+      inspection = inspectingStore.getJobRequest(f.owner, requestKey, f.auth, op, {
+        startConsentId: f.consent.id,
+        encryptionKey: key,
+      });
+      await waitBy(createPid);
+      await locker.query('COMMIT');
+      const accepted = await original;
+      assert.ok(accepted.value);
+      const result = await inspection;
+      assert.equal(result.id, accepted.value.id);
+      assert.equal(result.startConsent.id, f.consent.id);
+    } finally {
+      await locker.query('ROLLBACK');
+      locker.release();
+      await original;
+      await inspection;
+      await rr.end();
+    }
+  });
+  it('expired-permission proof and original admission serialize; late original bind cannot commit or create outbox', async () => {
+    const f = await fixture(1500),
+      requestKey = randomUUID(),
+      input = {
+        courseId: '10',
+        lectureId: '20',
+        scheduledFor: new Date().toISOString(),
+        idempotencyKey: requestKey,
+        requestHash: hashToken('delayed-expired'),
+        startConsentId: f.consent.id,
+      },
+      locker = await pool.connect();
+    let original: Promise<any> | undefined, inspection: Promise<any> | undefined;
+    const waitBy = async (pid: number) => {
+      const until = Date.now() + 2500;
+      while (Date.now() < until) {
+        const {
+          rows: [row],
+        } = await pool.query('SELECT pid FROM pg_stat_activity WHERE $1::int=ANY(pg_blocking_pids(pid))', [pid]);
+        if (row) return Number(row.pid);
+        await delay(5);
+      }
+      assert.fail('Expected exact backend lock wait');
+    };
+    try {
+      await locker.query('BEGIN');
+      await locker.query('SELECT id FROM playback_start_consents WHERE id=$1 FOR UPDATE', [f.consent.id]);
+      const pid = Number((await locker.query('SELECT pg_backend_pid() AS pid')).rows[0].pid);
+      original = store.createJob(f.owner, input, { ...f.auth, admission: f.admission() }).then(
+        (value) => ({ value }),
+        (error) => ({ error }),
+      );
+      const createPid = await waitBy(pid);
+      inspection = store.getJobRequest(f.owner, requestKey, f.auth, op, {
+        startConsentId: f.consent.id,
+        encryptionKey: key,
+      });
+      await waitBy(createPid);
+      await f.expire();
+      await locker.query('COMMIT');
+      assert.equal((await original).error.code, 'PLAYBACK_START_CONSENT_EXPIRED');
+      assert.deepEqual(await inspection, { requestStatus: 'not_admitted', requestKey, startConsentId: f.consent.id });
+      await assert.rejects(store.createJob(f.owner, input, { ...f.auth, admission: f.admission() }), {
+        code: 'PLAYBACK_START_CONSENT_EXPIRED',
+      });
+      assert.equal((await pool.query('SELECT 1 FROM playback_jobs WHERE user_id=$1', [f.owner])).rowCount, 0);
+      assert.equal(
+        (
+          await pool.query('SELECT 1 FROM job_outbox o JOIN playback_jobs j ON j.id=o.job_id WHERE j.user_id=$1', [
+            f.owner,
+          ])
+        ).rowCount,
+        0,
+      );
+    } finally {
+      await locker.query('ROLLBACK');
+      locker.release();
+      await original;
+      await inspection;
+    }
+  });
+  it('negative proof also prevents a late authentication continuation with its original revoked consent', async () => {
+    const f = await fixture(),
+      old = await f.claim();
+    await store.transitionJob(old, ['running'], 'needs_reauthentication', null, 'AUTH_REQUIRED', {
+      outcome: 'not_started',
+      authenticationWaitReason: 'school_auth_required',
+    });
+    const generation = randomUUID();
+    let sealed = '';
+    const session = await store.issueVerifiedSession(f.identity, 3600, {
+      provider: 'ssu',
+      seal: (owner) => (sealed = encryptSchoolSession(f.school(generation), key, owner, 'ssu')),
+    });
+    const auth = { almsTokenHash: hashToken(session.token), csrfToken: session.csrfToken, clientId: null },
+      input = startConsentInput.parse({ courseId: '10', lectureIds: ['20'], confirmed: true });
+    const consent = await store.createPlaybackStartConsent(
+      f.owner,
+      input,
+      randomUUID(),
+      hashToken(JSON.stringify(input)),
+      { ...auth, generation, encryptedSession: sealed },
+      op,
+    );
+    await store.revokePlaybackStartConsent(f.owner, consent.id, auth, op);
+    const before = (await pool.query('SELECT to_jsonb(j) AS row FROM playback_jobs j WHERE id=$1', [old.jobId])).rows[0]
+      .row;
+    assert.deepEqual(
+      await store.getJobRequest(f.owner, old.jobId, auth, op, { startConsentId: consent.id, encryptionKey: key }),
+      { requestStatus: 'not_admitted', requestKey: old.jobId, startConsentId: consent.id },
+    );
+    const { playbackContinuationHash } = await import('../../src/playback-continuation-routes.js');
+    await assert.rejects(
+      store.continueJob(f.owner, old.jobId, old.jobId, playbackContinuationHash(old.jobId, consent.id), {
+        ...auth,
+        startConsentId: consent.id,
+        admission: createPlaybackAdmission(
+          { userId: f.owner, courseId: '10', lectureId: '20' },
+          { generation, encryptedSession: sealed },
+        ),
+      }),
+      { code: 'PLAYBACK_START_CONSENT_REVOKED' },
+    );
+    assert.deepEqual(
+      (await pool.query('SELECT to_jsonb(j) AS row FROM playback_jobs j WHERE id=$1', [old.jobId])).rows[0].row,
+      before,
+    );
+    assert.equal((await store.getJob(f.owner, old.jobId))?.authWait?.continuedAsJobId, null);
+    assert.equal((await pool.query('SELECT 1 FROM playback_jobs WHERE user_id=$1', [f.owner])).rowCount, 1);
+  });
+  it('consent-backed operations override a repeatable-read pool before any snapshot while legacy keeps its default', async () => {
+    const f = await fixture(),
+      rr = new Pool({ connectionString: url, max: 1, options: `-c search_path=${schema}` });
+    try {
+      await rr.query('SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+      assert.equal(
+        (await rr.query('SHOW default_transaction_isolation')).rows[0].default_transaction_isolation,
+        'repeatable read',
+      );
+      const reader = new PgStore(rr),
+        levels: string[] = [];
+      const original = reader.workerTransaction.bind(reader);
+      reader.workerTransaction = ((run: any, operation: any) =>
+        original(async (query) => {
+          levels.push((await query('SHOW transaction_isolation')).rows[0]!.transaction_isolation);
+          return run(query);
+        }, operation)) as typeof reader.workerTransaction;
+      await store.revokePlaybackStartConsent(f.owner, f.consent.id, f.auth, op);
+      const proof = await reader.getJobRequest(f.owner, randomUUID(), f.auth, op, {
+        startConsentId: f.consent.id,
+        encryptionKey: key,
+      });
+      assert.ok(proof && 'requestStatus' in proof);
+      await assert.rejects(
+        reader.createJob(
+          f.owner,
+          {
+            courseId: '10',
+            lectureId: '20',
+            scheduledFor: new Date().toISOString(),
+            idempotencyKey: randomUUID(),
+            requestHash: hashToken('rr'),
+            startConsentId: f.consent.id,
+          },
+          { ...f.auth, admission: f.admission() },
+        ),
+        { code: 'PLAYBACK_START_CONSENT_REVOKED' },
+      );
+      assert.deepEqual(levels, ['read committed', 'read committed']);
+      // A failed transaction destroys its connection; prime the replacement too.
+      await rr.query('SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+      await reader.createJob(
+        f.owner,
+        {
+          courseId: '10',
+          lectureId: '21',
+          scheduledFor: new Date().toISOString(),
+          idempotencyKey: randomUUID(),
+          requestHash: hashToken('legacy-rr'),
+        },
+        {
+          ...f.auth,
+          admission: createPlaybackAdmission(
+            { userId: f.owner, courseId: '10', lectureId: '21' },
+            { generation: f.generation, encryptedSession: f.seal() },
+          ),
+        },
+      );
+      assert.equal(levels.at(-1), 'repeatable read');
+      assert.equal(
+        (await rr.query('SHOW default_transaction_isolation')).rows[0].default_transaction_isolation,
+        'repeatable read',
+      );
+    } finally {
+      await rr.end();
+    }
+  });
+  it('validation reads revocation after a blocked immutable-consent lock, even with a repeatable-read pool default', async () => {
+    const f = await fixture(),
+      claim = await f.claim();
+    await f.lease(claim);
+    const rr = new Pool({ connectionString: url, max: 1, options: `-c search_path=${schema}` }),
+      locker = await pool.connect();
+    let pending: Promise<any> | undefined;
+    try {
+      await rr.query('SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+      const validator = new PgStore(rr);
+      await locker.query('BEGIN');
+      await locker.query('SELECT id FROM playback_start_consents WHERE id=$1 FOR UPDATE', [f.consent.id]);
+      await locker.query('INSERT INTO playback_start_consent_revocations(consent_id) VALUES($1)', [f.consent.id]);
+      const pid = Number((await locker.query('SELECT pg_backend_pid() AS pid')).rows[0].pid);
+      pending = validator.validatePlaybackStartConsent(claim, key, op).then(
+        () => ({ allowed: true }),
+        (error) => ({ error }),
+      );
+      const until = Date.now() + 2500;
+      let blocked = false;
+      while (Date.now() < until) {
+        if (
+          (await pool.query('SELECT 1 FROM pg_stat_activity WHERE $1::int=ANY(pg_blocking_pids(pid))', [pid])).rowCount
+        ) {
+          blocked = true;
+          break;
+        }
+        await delay(5);
+      }
+      assert.equal(blocked, true, 'Validator must wait for exact pending revocation');
+      await locker.query('COMMIT');
+      assert.equal((await pending).error.code, 'PLAYBACK_START_CONSENT_REVOKED');
+      assert.equal(
+        (await pool.query('SELECT 1 FROM playback_start_attempts WHERE job_id=$1', [claim.jobId])).rowCount,
+        0,
+      );
+    } finally {
+      await locker.query('ROLLBACK');
+      locker.release();
+      await pending;
+      await rr.end();
+    }
+  });
 });

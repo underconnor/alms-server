@@ -526,7 +526,7 @@ export async function buildApp(config: Config, store: Store, provider: SchoolPro
         const existing = await store.findJobRequest(userId, idempotencyKey, requestHash, operation);
         await validate();
         if (existing) {
-          if(existing.startConsent){if(!store.getJobRequest)throw unavailable('PLAYBACK_START_CONSENT_UNAVAILABLE');return (await store.getJobRequest(userId,idempotencyKey,{almsTokenHash:tokenHash,csrfToken:request.session!.csrfToken,clientId:request.session!.clientId??null},operation))!;}
+          if(existing.startConsent){if(!store.getJobRequest)throw unavailable('PLAYBACK_START_CONSENT_UNAVAILABLE');const accepted=await store.getJobRequest(userId,idempotencyKey,{almsTokenHash:tokenHash,csrfToken:request.session!.csrfToken,clientId:request.session!.clientId??null},operation);if(!accepted||'requestStatus' in accepted)throw new AppError(409,'PLAYBACK_AUTHORITY_CHANGED','접수 상태를 다시 확인해 주세요.');return accepted;}
           return existing;
         }
         if (!await playbackIsReady(playbackReadiness, signal)) throw unavailable('PLAYBACK_UNAVAILABLE');

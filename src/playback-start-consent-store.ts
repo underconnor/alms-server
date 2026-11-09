@@ -40,21 +40,23 @@ export async function bindPlaybackStartConsent(
   query: WorkerQuery,
   owner: string,
   jobId: string,
-  target: { courseId: string; lectureId: string },
+  target: { courseId: string; lectureId: string; scheduledFor: string },
   consentId: string,
   generation: string,
   auth: ConsentAuthorization,
 ) {
   await validateConsentSession(query, owner, auth);
+  await query('SELECT id FROM playback_start_consents WHERE id=$1 AND user_id=$2 FOR SHARE', [consentId, owner]);
   const {
     rows: [r],
   } = await query<Row>(
-    `SELECT c.*,c.expires_at>clock_timestamp() AS valid,
+    `SELECT c.*,c.expires_at>clock_timestamp() AS valid,$3::timestamptz<c.expires_at AS schedule_valid,
   EXISTS(SELECT 1 FROM playback_start_consent_revocations revoked WHERE revoked.consent_id=c.id) AS revoked
   FROM playback_start_consents c WHERE c.id=$1 AND c.user_id=$2 FOR SHARE OF c`,
-    [consentId, owner],
+    [consentId, owner, target.scheduledFor],
   );
   validConsent(r, generation, auth.clientId);
+  if (r.schedule_valid !== true) throw consentFailure('PLAYBACK_START_CONSENT_SCHEDULE_INVALID');
   if (r.course_id !== target.courseId || !r.lecture_ids.includes(target.lectureId))
     throw consentFailure('PLAYBACK_START_CONSENT_INVALID');
   if (
@@ -70,13 +72,16 @@ export async function bindPlaybackStartConsent(
   const bound = await query(
     `INSERT INTO playback_job_start_consents(job_id,consent_id,course_id,lecture_id)
   SELECT $1,$2,$3,$4 WHERE EXISTS(SELECT 1 FROM playback_start_consents c WHERE c.id=$2 AND c.user_id=$5
-   AND c.expires_at>clock_timestamp() AND NOT EXISTS(SELECT 1 FROM playback_start_consent_revocations r WHERE r.consent_id=c.id)) RETURNING job_id`,
-    [jobId, consentId, target.courseId, target.lectureId, owner],
+   AND c.expires_at>clock_timestamp() AND $6::timestamptz<c.expires_at AND NOT EXISTS(SELECT 1 FROM playback_start_consent_revocations r WHERE r.consent_id=c.id)) RETURNING job_id`,
+    [jobId, consentId, target.courseId, target.lectureId, owner, target.scheduledFor],
   );
   if (bound.rowCount !== 1) throw consentFailure('PLAYBACK_START_CONSENT_EXPIRED');
 }
 export class PgPlaybackStartConsentRepository {
   constructor(private readonly pool: Pool) {}
+  private transaction<T>(run: (query: WorkerQuery) => Promise<T>, operation: WorkerOperation) {
+    return workerTransaction(this.pool, run, { ...operation, readCommitted: true });
+  }
   async find(
     owner: string,
     requestKey: string,
@@ -84,24 +89,20 @@ export class PgPlaybackStartConsentRepository {
     operation: WorkerOperation,
     requestHash?: string,
   ) {
-    return workerTransaction(
-      this.pool,
-      async (query) => {
-        await validateConsentSession(query, owner, auth);
-        const {
-          rows: [r],
-        } = await query<Row>('SELECT * FROM playback_start_consents WHERE user_id=$1 AND idempotency_key=$2', [
-          owner,
-          requestKey,
-        ]);
-        if (!r) return null;
-        if (r.client_id !== auth.clientId) throw consentFailure('PLAYBACK_START_CONSENT_INVALID');
-        if (requestHash !== undefined && r.request_hash !== requestHash)
-          throw new AppError(409, 'IDEMPOTENCY_CONFLICT', '같은 요청 키에 다른 동의 내용이 있습니다.');
-        return receipt(r);
-      },
-      operation,
-    );
+    return this.transaction(async (query) => {
+      await validateConsentSession(query, owner, auth);
+      const {
+        rows: [r],
+      } = await query<Row>('SELECT * FROM playback_start_consents WHERE user_id=$1 AND idempotency_key=$2', [
+        owner,
+        requestKey,
+      ]);
+      if (!r) return null;
+      if (r.client_id !== auth.clientId) throw consentFailure('PLAYBACK_START_CONSENT_INVALID');
+      if (requestHash !== undefined && r.request_hash !== requestHash)
+        throw new AppError(409, 'IDEMPOTENCY_CONFLICT', '같은 요청 키에 다른 동의 내용이 있습니다.');
+      return receipt(r);
+    }, operation);
   }
   async create(
     owner: string,
@@ -112,74 +113,65 @@ export class PgPlaybackStartConsentRepository {
     operation: WorkerOperation,
   ) {
     input = startConsentInput.parse(input);
-    return workerTransaction(
-      this.pool,
-      async (query) => {
-        await query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [owner + ':start-consent:' + requestKey]);
-        await validateConsentSession(query, owner, auth);
-        const {
-          rows: [existing],
-        } = await query<Row>('SELECT * FROM playback_start_consents WHERE user_id=$1 AND idempotency_key=$2', [
-          owner,
-          requestKey,
-        ]);
-        if (existing) {
-          if (existing.request_hash !== requestHash)
-            throw new AppError(409, 'IDEMPOTENCY_CONFLICT', '같은 요청 키에 다른 동의 내용이 있습니다.');
-          if (existing.client_id !== auth.clientId) throw consentFailure('PLAYBACK_START_CONSENT_INVALID');
-          return receipt(existing);
-        }
-        if (
-          !(
-            await query(
-              "SELECT user_id FROM school_sessions WHERE user_id=$1 AND provider='ssu' AND encrypted_state=$2 FOR SHARE",
-              [owner, auth.encryptedSession],
-            )
-          ).rowCount
-        )
-          throw changed();
-        const {
-          rows: [created],
-        } = await query<Row>(
-          `WITH instant AS (SELECT clock_timestamp() AS t)
+    return this.transaction(async (query) => {
+      await query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [owner + ':start-consent:' + requestKey]);
+      await validateConsentSession(query, owner, auth);
+      const {
+        rows: [existing],
+      } = await query<Row>('SELECT * FROM playback_start_consents WHERE user_id=$1 AND idempotency_key=$2', [
+        owner,
+        requestKey,
+      ]);
+      if (existing) {
+        if (existing.request_hash !== requestHash)
+          throw new AppError(409, 'IDEMPOTENCY_CONFLICT', '같은 요청 키에 다른 동의 내용이 있습니다.');
+        if (existing.client_id !== auth.clientId) throw consentFailure('PLAYBACK_START_CONSENT_INVALID');
+        return receipt(existing);
+      }
+      if (
+        !(
+          await query(
+            "SELECT user_id FROM school_sessions WHERE user_id=$1 AND provider='ssu' AND encrypted_state=$2 FOR SHARE",
+            [owner, auth.encryptedSession],
+          )
+        ).rowCount
+      )
+        throw changed();
+      const {
+        rows: [created],
+      } = await query<Row>(
+        `WITH instant AS (SELECT clock_timestamp() AS t)
     INSERT INTO playback_start_consents(id,user_id,client_id,generation,course_id,lecture_ids,idempotency_key,request_hash,created_at,expires_at)
-    SELECT $1,$2,$3,$4,$5,$6,$7,$8,t,t+interval '24 hours' FROM instant RETURNING *`,
-          [
-            randomUUID(),
-            owner,
-            auth.clientId,
-            auth.generation,
-            input.courseId,
-            input.lectureIds,
-            requestKey,
-            requestHash,
-          ],
-        );
-        await validateConsentSession(query, owner, auth);
-        return receipt(created!);
-      },
-      operation,
-    );
+    SELECT $1,$2,$3,$4,$5,$6,$7,$8,t,date_trunc('milliseconds',t+interval '24 hours') FROM instant RETURNING *`,
+        [
+          randomUUID(),
+          owner,
+          auth.clientId,
+          auth.generation,
+          input.courseId,
+          input.lectureIds,
+          requestKey,
+          requestHash,
+        ],
+      );
+      await validateConsentSession(query, owner, auth);
+      return receipt(created!);
+    }, operation);
   }
   async revoke(owner: string, id: string, auth: ConsentAuthorization, operation: WorkerOperation) {
-    await workerTransaction(
-      this.pool,
-      async (query) => {
-        await validateConsentSession(query, owner, auth);
-        const {
-          rows: [r],
-        } = await query<Row>('SELECT client_id FROM playback_start_consents WHERE user_id=$1 AND id=$2 FOR UPDATE', [
-          owner,
-          id,
-        ]);
-        if (!r) throw notFound();
-        if (r.client_id !== auth.clientId) throw consentFailure('PLAYBACK_START_CONSENT_INVALID');
-        await query('INSERT INTO playback_start_consent_revocations(consent_id) VALUES($1) ON CONFLICT DO NOTHING', [
-          id,
-        ]);
-      },
-      operation,
-    );
+    await this.transaction(async (query) => {
+      await validateConsentSession(query, owner, auth);
+      const {
+        rows: [r],
+      } = await query<Row>('SELECT client_id FROM playback_start_consents WHERE user_id=$1 AND id=$2 FOR UPDATE', [
+        owner,
+        id,
+      ]);
+      if (!r) throw notFound();
+      if (r.client_id !== auth.clientId) throw consentFailure('PLAYBACK_START_CONSENT_INVALID');
+      await query('INSERT INTO playback_start_consent_revocations(consent_id) VALUES($1) ON CONFLICT DO NOTHING', [id]);
+      await validateConsentSession(query, owner, auth);
+    }, operation);
   }
   private async inspect(query: WorkerQuery, claim: WorkerClaim, key: Buffer, lease: boolean) {
     const p = [
@@ -200,6 +192,12 @@ export class PgPlaybackStartConsentRepository {
     );
     if (!job) throw changed();
     if (!job.consent_id) return null;
+    // A SELECT that waited for an immutable row lock may retain an older statement
+    // snapshot of the separate revocation table. Lock first, then read all facts fresh.
+    await query('SELECT id FROM playback_start_consents WHERE id=$1 AND user_id=$2 FOR SHARE', [
+      job.consent_id,
+      claim.userId,
+    ]);
     const {
       rows: [c],
     } = await query<Row>(
@@ -267,82 +265,70 @@ export class PgPlaybackStartConsentRepository {
     return { consent: c, attempt };
   }
   async validate(claim: WorkerClaim, key: Buffer, operation: WorkerOperation) {
-    await workerTransaction(
-      this.pool,
-      async (q) => {
-        await this.inspect(q, claim, key, false);
-      },
-      operation,
-    );
+    await this.transaction(async (q) => {
+      await this.inspect(q, claim, key, false);
+    }, operation);
   }
   async reserve(claim: WorkerClaim, key: Buffer, operation: WorkerOperation): Promise<PlaybackStartAttempt | null> {
     try {
-      return await workerTransaction(
-        this.pool,
-        async (query) => {
-          await query(playbackAccountLock, [playbackAccountLockKey(claim.userId)]);
-          const current = await this.inspect(query, claim, key, true);
-          if (!current) return null;
-          if (current.attempt) throw consentFailure('PLAYBACK_START_ATTEMPT_EXISTS');
-          const attemptId = randomUUID();
-          const inserted = await query(
-            `INSERT INTO playback_start_attempts(id,job_id,user_id,generation,course_id,lecture_id,execution_token_hash)
+      return await this.transaction(async (query) => {
+        await query(playbackAccountLock, [playbackAccountLockKey(claim.userId)]);
+        const current = await this.inspect(query, claim, key, true);
+        if (!current) return null;
+        if (current.attempt) throw consentFailure('PLAYBACK_START_ATTEMPT_EXISTS');
+        const attemptId = randomUUID();
+        const inserted = await query(
+          `INSERT INTO playback_start_attempts(id,job_id,user_id,generation,course_id,lecture_id,execution_token_hash)
     SELECT $1,$2,$3,$4,$5,$6,$7 WHERE EXISTS(SELECT 1 FROM playback_start_consents c WHERE c.id=$8 AND c.expires_at>clock_timestamp()
      AND NOT EXISTS(SELECT 1 FROM playback_start_consent_revocations r WHERE r.consent_id=c.id)) RETURNING id`,
-            [
-              attemptId,
-              claim.jobId,
-              claim.userId,
-              claim.acceptedGeneration,
-              claim.courseId,
-              claim.lectureId,
-              claim.executionTokenHash,
-              current.consent.id,
-            ],
-          );
-          if (inserted.rowCount !== 1) throw consentFailure('PLAYBACK_START_CONSENT_EXPIRED');
-          return {
+          [
             attemptId,
-            consentId: current.consent.id,
-            expiresAt: new Date(current.consent.expires_at).toISOString(),
-          };
-        },
-        operation,
-      );
+            claim.jobId,
+            claim.userId,
+            claim.acceptedGeneration,
+            claim.courseId,
+            claim.lectureId,
+            claim.executionTokenHash,
+            current.consent.id,
+          ],
+        );
+        if (inserted.rowCount !== 1) throw consentFailure('PLAYBACK_START_CONSENT_EXPIRED');
+        return {
+          attemptId,
+          consentId: current.consent.id,
+          expiresAt: new Date(current.consent.expires_at).toISOString(),
+        };
+      }, operation);
     } catch (error) {
       if (error instanceof AppError) throw error;
       throw consentFailure('PLAYBACK_START_RESERVATION_UNCONFIRMED', 503);
     }
   }
   async recordTransportAck(claim: WorkerClaim, attemptId: string, operation: WorkerOperation) {
-    await workerTransaction(
-      this.pool,
-      async (query) => {
-        const args = [
-          attemptId,
-          claim.jobId,
-          claim.userId,
-          claim.acceptedGeneration,
-          claim.courseId,
-          claim.lectureId,
-          claim.executionTokenHash,
-        ];
-        const {
-          rows: [r],
-        } = await query<Row>(
-          `SELECT * FROM playback_start_attempts WHERE id=$1 AND job_id=$2 AND user_id=$3 AND generation=$4
+    await this.transaction(async (query) => {
+      const args = [
+        attemptId,
+        claim.jobId,
+        claim.userId,
+        claim.acceptedGeneration,
+        claim.courseId,
+        claim.lectureId,
+        claim.executionTokenHash,
+      ];
+      const {
+        rows: [r],
+      } = await query<Row>(
+        `SELECT * FROM playback_start_attempts WHERE id=$1 AND job_id=$2 AND user_id=$3 AND generation=$4
     AND course_id=$5 AND lecture_id=$6 AND execution_token_hash=$7 FOR UPDATE`,
-          args,
-        );
-        if (!r) throw changed();
-        if (r.transport_ack_received_at) return;
-        await query(
-          'UPDATE playback_start_attempts SET transport_ack_received_at=clock_timestamp() WHERE id=$1 AND transport_ack_received_at IS NULL',
-          [attemptId],
-        );
-      },
-      operation,
-    );
+        args,
+      );
+      if (!r) throw changed();
+      if (r.transport_ack_received_at) return;
+      await query(
+        'UPDATE playback_start_attempts SET transport_ack_received_at=clock_timestamp() WHERE id=$1 AND transport_ack_received_at IS NULL',
+        [attemptId],
+      );
+    }, operation);
   }
   async finish(
     claim: WorkerClaim,
@@ -351,40 +337,36 @@ export class PgPlaybackStartConsentRepository {
     key: Buffer,
     operation: WorkerOperation,
   ) {
-    await workerTransaction(
-      this.pool,
-      async (query) => {
-        await query(playbackAccountLock, [playbackAccountLockKey(claim.userId)]);
-        // Finalizing records the exact reserved attempt's observed outcome, not fresh play permission.
-        // Cancellation/revocation/expiry may race a real response and must not erase its ACK.
-        const args = [
-          attemptId,
-          claim.jobId,
-          claim.userId,
-          claim.acceptedGeneration,
-          claim.courseId,
-          claim.lectureId,
-          claim.executionTokenHash,
-        ];
-        const {
-          rows: [r],
-        } = await query<Row>(
-          `SELECT * FROM playback_start_attempts WHERE id=$1 AND job_id=$2 AND user_id=$3 AND generation=$4
+    await this.transaction(async (query) => {
+      await query(playbackAccountLock, [playbackAccountLockKey(claim.userId)]);
+      // Finalizing records the exact reserved attempt's observed outcome, not fresh play permission.
+      // Cancellation/revocation/expiry may race a real response and must not erase its ACK.
+      const args = [
+        attemptId,
+        claim.jobId,
+        claim.userId,
+        claim.acceptedGeneration,
+        claim.courseId,
+        claim.lectureId,
+        claim.executionTokenHash,
+      ];
+      const {
+        rows: [r],
+      } = await query<Row>(
+        `SELECT * FROM playback_start_attempts WHERE id=$1 AND job_id=$2 AND user_id=$3 AND generation=$4
     AND course_id=$5 AND lecture_id=$6 AND execution_token_hash=$7 FOR UPDATE`,
-          args,
-        );
-        if (!r) throw changed();
-        if (r.state === 'unknown' && outcome === 'acknowledged') throw consentFailure('PLAYBACK_START_ATTEMPT_EXISTS');
-        if (outcome === 'acknowledged' && !r.transport_ack_received_at)
-          throw consentFailure('PLAYBACK_START_ACK_REQUIRED');
-        if (r.state === outcome || (r.state === 'acknowledged' && outcome === 'unknown')) return;
-        if (r.state !== 'reserved') throw consentFailure('PLAYBACK_START_ATTEMPT_EXISTS');
-        await query(
-          "UPDATE playback_start_attempts SET state=$2,finished_at=clock_timestamp() WHERE id=$1 AND state='reserved'",
-          [attemptId, outcome],
-        );
-      },
-      operation,
-    );
+        args,
+      );
+      if (!r) throw changed();
+      if (r.state === 'unknown' && outcome === 'acknowledged') throw consentFailure('PLAYBACK_START_ATTEMPT_EXISTS');
+      if (outcome === 'acknowledged' && !r.transport_ack_received_at)
+        throw consentFailure('PLAYBACK_START_ACK_REQUIRED');
+      if (r.state === outcome || (r.state === 'acknowledged' && outcome === 'unknown')) return;
+      if (r.state !== 'reserved') throw consentFailure('PLAYBACK_START_ATTEMPT_EXISTS');
+      await query(
+        "UPDATE playback_start_attempts SET state=$2,finished_at=clock_timestamp() WHERE id=$1 AND state='reserved'",
+        [attemptId, outcome],
+      );
+    }, operation);
   }
 }

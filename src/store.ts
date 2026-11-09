@@ -1,4 +1,5 @@
-import { PgPlaybackStartConsentRepository, bindPlaybackStartConsent } from './playback-start-consent-store.js';
+import { consentGenerationForInspection,type NotAdmittedJobRequest } from './playback-start-consent.js';
+import { PgPlaybackStartConsentRepository, bindPlaybackStartConsent, validateConsentSession } from './playback-start-consent-store.js';
 import type { PlaybackStartConsentInput, PlaybackStartConsentReceipt, PlaybackStartAttempt, ConsentAuthorization, ConsentSchoolAuthorization } from './playback-start-consent.js';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
@@ -104,7 +105,7 @@ export interface Store {
   deleteTodo(userId: string, id: string): Promise<void>;
   listJobs(userId: string,courseId?: string,limit?: number): Promise<Job[]>;
   getJob(userId: string, id: string): Promise<Job | null>;
-  getJobRequest?(owner:string,key:string,auth:ConsentAuthorization,operation?:WorkerOperation):Promise<Job|null>;
+  getJobRequest?(owner:string,key:string,auth:ConsentAuthorization,operation?:WorkerOperation,inspection?:{startConsentId?:string;encryptionKey?:Buffer}):Promise<Job|NotAdmittedJobRequest|null>;
   findPlaybackStartConsent?(owner:string,requestKey:string,auth:ConsentAuthorization,operation:WorkerOperation,requestHash?:string):Promise<PlaybackStartConsentReceipt|null>;
   createPlaybackStartConsent?(owner:string,input:PlaybackStartConsentInput,requestKey:string,requestHash:string,auth:ConsentSchoolAuthorization,operation:WorkerOperation):Promise<PlaybackStartConsentReceipt>;
   revokePlaybackStartConsent?(owner:string,id:string,auth:ConsentAuthorization,operation:WorkerOperation):Promise<void>;
@@ -292,14 +293,37 @@ export class PgStore implements Store {
   reservePlaybackStart(claim:WorkerClaim,key:Buffer,operation:WorkerOperation):Promise<PlaybackStartAttempt|null>{return this.playbackStartConsents.reserve(claim,key,operation);}
   recordPlaybackStartTransportAck(claim:WorkerClaim,id:string,operation:WorkerOperation){return this.playbackStartConsents.recordTransportAck(claim,id,operation);}
   finishPlaybackStart(claim:WorkerClaim,id:string,outcome:'acknowledged'|'unknown',key:Buffer,operation:WorkerOperation){return this.playbackStartConsents.finish(claim,id,outcome,key,operation);}
-  async getJobRequest(owner:string,key:string,auth:ConsentAuthorization,operation:WorkerOperation={timeoutMs:5000}){
+  async getJobRequest(owner:string,key:string,auth:ConsentAuthorization,operation:WorkerOperation={timeoutMs:5000},inspection?:{startConsentId?:string;encryptionKey?:Buffer}):Promise<Job|NotAdmittedJobRequest|null>{
+   operation={...operation,readCommitted:true};
    return this.workerTransaction(async query=>{
-    const session=await query(`SELECT 1 FROM sessions WHERE user_id=$1 AND token_hash=$2 AND csrf_token=$3 AND client_id IS NOT DISTINCT FROM $4::text AND expires_at>clock_timestamp() FOR SHARE`,[owner,auth.almsTokenHash,auth.csrfToken,auth.clientId]);
-    if(!session.rowCount)throw new AppError(401,'AUTH_REQUIRED','다시 로그인해 주세요.');
+    // Same lock as admission/continuation. An absent job is never proof by itself.
+    await query(playbackAccountLock,[playbackAccountLockKey(owner)]);
+    await validateConsentSession(query,owner,auth);
     const {rows:[r]}=await query<Row>(`${jobRecoverySelect} WHERE job.user_id=$1 AND job.idempotency_key=$2`,[owner,key]);
-    if(!r)return null;
-    if(r.start_consent_id){const c=await query('SELECT 1 FROM playback_start_consents WHERE id=$1 AND client_id IS NOT DISTINCT FROM $2::text',[r.start_consent_id,auth.clientId]);if(!c.rowCount)throw new AppError(409,'PLAYBACK_START_CONSENT_INVALID','동의를 확인해 주세요.');}
-    return jobFrom(r);
+    if(r){
+     if(r.start_consent_id){const c=await query('SELECT 1 FROM playback_start_consents WHERE id=$1 AND user_id=$2 AND client_id IS NOT DISTINCT FROM $3::text',[r.start_consent_id,owner,auth.clientId]);if(!c.rowCount)throw new AppError(409,'PLAYBACK_START_CONSENT_INVALID','동의를 확인해 주세요.');}
+     return jobFrom(r);
+    }
+    if(!inspection?.startConsentId)return null;
+    const {rows:[consent]}=await query<Row>('SELECT c.* FROM playback_start_consents c WHERE c.id=$1 AND c.user_id=$2 FOR UPDATE OF c',[inspection.startConsentId,owner]);
+    if(!consent)return null;
+    if(consent.client_id!==auth.clientId)throw new AppError(409,'PLAYBACK_START_CONSENT_INVALID','동의를 확인해 주세요.');
+    // Refresh the clock/revocation snapshot after any row-lock wait.
+    const {rows:[fence]}=await query<Row>(`SELECT c.expires_at<=clock_timestamp() AS expired,
+     EXISTS(SELECT 1 FROM playback_start_consent_revocations revoked WHERE revoked.consent_id=c.id) AS revoked
+     FROM playback_start_consents c WHERE c.id=$1`,[inspection.startConsentId]);
+    consent.expired=fence?.expired===true;consent.revoked=fence?.revoked===true;
+    let retired=false;
+    if(!consent.expired&&!consent.revoked){
+     const {rows:[school]}=await query<Row>("SELECT encrypted_state FROM school_sessions WHERE user_id=$1 AND provider='ssu' FOR SHARE",[owner]);
+     const generation=consentGenerationForInspection(school?.encrypted_state??null,inspection.encryptionKey,owner);
+     retired=Boolean(generation&&generation!==consent.generation);
+    }
+    if(!consent.expired&&!consent.revoked&&!retired)return null;
+    await validateConsentSession(query,owner,auth);
+    // Immutable expiry/revocation and retired SSO prohibit every later binding of this
+    // original consent. This is only a receipt for that old body, not play permission.
+    return {requestStatus:'not_admitted' as const,requestKey:key,startConsentId:inspection.startConsentId};
    },operation);
   }
   async findJobRequest(userId: string, idempotencyKey: string, requestHash: string, operation?: WorkerOperation) {
@@ -309,6 +333,7 @@ export class PgStore implements Store {
     return jobFrom(row);
   }
   async createJob(userId: string, input: NewJobInput, authorization: JobAdmissionAuthorization, operation: WorkerOperation = { timeoutMs: 5000 }) {
+    if(input.startConsentId)operation={...operation,readCommitted:true};
     try {
       return await this.workerTransaction(async query => {
         await query(playbackAccountLock, [playbackAccountLockKey(userId)]);
@@ -377,6 +402,7 @@ export class PgStore implements Store {
   /** Fresh admission and retirement commit together. The old generation is never rebound. */
   async continueJob(userId: string, id: string, idempotencyKey: string, requestHash: string,
     authorization: JobContinuationAuthorization & {startConsentId?:string}, operation: WorkerOperation = { timeoutMs: 5000 }): Promise<JobContinuationResult> {
+    if(authorization.startConsentId)operation={...operation,readCommitted:true};
     try {
       return await this.workerTransaction(async query => {
         await query(playbackAccountLock, [playbackAccountLockKey(userId)]);
@@ -420,7 +446,7 @@ export class PgStore implements Store {
           [childId, userId, old.course_id, old.lecture_id, status, scheduledFor, idempotencyKey, requestHash, proof.generation, proof.expiresAt,
             authorization.almsTokenHash, authorization.csrfToken, authorization.clientId]);
         if (created.rowCount !== 1) throw authorityChanged();
-        if(authorization.startConsentId)await bindPlaybackStartConsent(query,userId,childId,{courseId:old.course_id,lectureId:old.lecture_id},authorization.startConsentId,proof.generation,authorization);
+        if(authorization.startConsentId)await bindPlaybackStartConsent(query,userId,childId,{courseId:old.course_id,lectureId:old.lecture_id,scheduledFor},authorization.startConsentId,proof.generation,authorization);
         await query('INSERT INTO job_outbox(job_id) VALUES($1)', [childId]);
         const related = await query(`UPDATE playback_auth_waits SET continued_job_id=$2,continued_at=clock_timestamp()
           WHERE job_id=$1 AND continued_job_id IS NULL RETURNING job_id`, [id, childId]);

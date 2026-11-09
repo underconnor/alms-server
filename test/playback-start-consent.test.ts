@@ -297,3 +297,57 @@ test('normal explicit admission passes the exact consent binding and existing fr
     await app.close();
   }
 });
+
+test('only a query-bound exact negative receipt is returned, while an absent key remains unconfirmed', async () => {
+  const f = fixture(),
+    requestKey = randomUUID(),
+    consentId = randomUUID();
+  let observed = 0;
+  f.store.getJobRequest = async (owner, key, auth, _operation, inspection) => {
+    assert.equal(owner, f.owner);
+    assert.equal(key, requestKey);
+    assert.equal(auth.clientId, null);
+    assert.equal(inspection?.startConsentId, consentId);
+    observed++;
+    return { requestStatus: 'not_admitted', requestKey: key, startConsentId: consentId };
+  };
+  const app = await f.app();
+  try {
+    const r = await app.inject({
+      method: 'GET',
+      url: '/v1/jobs/requests/' + requestKey + '?startConsentId=' + consentId,
+      headers,
+    });
+    assert.equal(r.statusCode, 200, r.body);
+    assert.deepEqual(r.json(), { requestStatus: 'not_admitted', requestKey, startConsentId: consentId });
+    assert.equal(observed, 1);
+    f.store.getJobRequest = async () => null;
+    assert.equal(
+      (
+        await app.inject({
+          method: 'GET',
+          url: '/v1/jobs/requests/' + requestKey + '?startConsentId=' + consentId,
+          headers,
+        })
+      ).statusCode,
+      404,
+    );
+    f.store.getJobRequest = async () => ({
+      requestStatus: 'not_admitted',
+      requestKey: randomUUID(),
+      startConsentId: consentId,
+    });
+    assert.equal(
+      (
+        await app.inject({
+          method: 'GET',
+          url: '/v1/jobs/requests/' + requestKey + '?startConsentId=' + consentId,
+          headers,
+        })
+      ).statusCode,
+      502,
+    );
+  } finally {
+    await app.close();
+  }
+});

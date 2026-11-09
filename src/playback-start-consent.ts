@@ -59,3 +59,17 @@ export function publicStartConsent(value: unknown): JobStartConsent | null {
     .safeParse(value);
   return parsed.success ? parsed.data : null;
 }
+
+export type NotAdmittedJobRequest = { requestStatus: 'not_admitted'; requestKey: string; startConsentId: string };
+export function consentGenerationForInspection(
+  raw: string | null,
+  key: Buffer | undefined,
+  owner: string,
+): string | null {
+  if (!raw || !key) return null;
+  try {
+    return state.parse(decryptSchoolSession(raw, key, owner, 'ssu')).generation;
+  } catch {
+    return null;
+  }
+}
