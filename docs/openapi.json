@@ -16044,6 +16044,1079 @@
         ]
       }
     },
+    "/v1/playback-start-consents": {
+      "post": {
+        "operationId": "post_v1_playback_start_consents",
+        "summary": "Approve one exact selected manifest",
+        "description": "Explicit permission to transition school playback for these targets only. Canonical numeric IDs sorted by length then lexical order; order is not FIFO. Maximum24hours and current school generation. Existing session/client/Origin/CSRF and readiness required. Exact-key replay returns the same receipt even expired; no school write occurs. A receipt is not job admission or school recognition. Logout does not stop already admitted jobs. Unknown consent response: read exact request key, never infer approval or switch keys.",
+        "security": [
+          {
+            "cookieSession": []
+          },
+          {
+            "bearerSession": [],
+            "clientHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "X-ALMS-Client-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+            },
+            "description": "Required with bearer authentication. If provided with cookie, must equal the session-bound registered client."
+          },
+          {
+            "name": "Origin",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uri"
+            },
+            "description": "Exact registered origin; required on writes and on every bearer request."
+          },
+          {
+            "name": "X-CSRF-Token",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Session CSRF token returned by /v1/me or bearer token exchange. All authenticated writes require it."
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Reuse only for the identical accepted request. Uncertain writes must be read back, not retried with a new key."
+          },
+          {
+            "name": "Accept",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "const": "application/json; alms-playback=2"
+            },
+            "description": "Required when playback is enabled or the job was admitted with school authority."
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlaybackStartConsent"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "x-alms-error-codes": [
+          "INVALID_REQUEST",
+          "RATE_LIMITED",
+          "INTERNAL_ERROR",
+          "AUTH_REQUIRED",
+          "CLIENT_ORIGIN_INVALID",
+          "SCHOOL_AUTH_REQUIRED",
+          "SCHOOL_SESSION_CHANGED",
+          "CSRF_INVALID",
+          "PLAYBACK_START_CONSENT_UNAVAILABLE",
+          "PLAYBACK_START_CONSENT_UNCONFIRMED",
+          "PLAYBACK_START_CONSENT_INVALID",
+          "PLAYBACK_START_CONSENT_EXPIRED",
+          "PLAYBACK_START_CONSENT_REVOKED",
+          "PLAYBACK_START_CONSENT_USED",
+          "PLAYBACK_UNAVAILABLE",
+          "SCHOOL_AUTH_REQUIRED",
+          "IDEMPOTENCY_CONFLICT",
+          "CLIENT_UPDATE_REQUIRED"
+        ],
+        "x-alms-bearer-required-headers": [
+          "Authorization",
+          "X-ALMS-Client-Id",
+          "Origin"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "courseId": {
+                    "type": "string",
+                    "pattern": "^[1-9]\\d{0,15}$"
+                  },
+                  "lectureIds": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "pattern": "^[1-9]\\d{0,15}$"
+                    },
+                    "maxItems": 100,
+                    "minItems": 1,
+                    "uniqueItems": true
+                  },
+                  "confirmed": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "courseId",
+                  "lectureIds",
+                  "confirmed"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/playback-start-consents/requests/{key}": {
+      "get": {
+        "operationId": "get_v1_playback_start_consents_requests_key",
+        "summary": "Read exact owned consent request",
+        "description": "Current exact owner/registered client. No school API call.404 while POST is pending is not negative acceptance proof.",
+        "security": [
+          {
+            "cookieSession": []
+          },
+          {
+            "bearerSession": [],
+            "clientHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "X-ALMS-Client-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+            },
+            "description": "Required with bearer authentication. If provided with cookie, must equal the session-bound registered client."
+          },
+          {
+            "name": "Origin",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uri"
+            },
+            "description": "Exact registered origin; required on writes and on every bearer request."
+          },
+          {
+            "name": "Accept",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "const": "application/json; alms-playback=2"
+            },
+            "description": "Required when playback is enabled or the job was admitted with school authority."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlaybackStartConsent"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "x-alms-error-codes": [
+          "INVALID_REQUEST",
+          "RATE_LIMITED",
+          "INTERNAL_ERROR",
+          "AUTH_REQUIRED",
+          "CLIENT_ORIGIN_INVALID",
+          "SCHOOL_AUTH_REQUIRED",
+          "SCHOOL_SESSION_CHANGED",
+          "PLAYBACK_START_CONSENT_UNAVAILABLE",
+          "PLAYBACK_START_CONSENT_UNCONFIRMED",
+          "PLAYBACK_START_CONSENT_INVALID",
+          "PLAYBACK_START_CONSENT_EXPIRED",
+          "PLAYBACK_START_CONSENT_REVOKED",
+          "PLAYBACK_START_CONSENT_USED",
+          "PLAYBACK_UNAVAILABLE",
+          "SCHOOL_AUTH_REQUIRED",
+          "IDEMPOTENCY_CONFLICT",
+          "CLIENT_UPDATE_REQUIRED"
+        ],
+        "x-alms-bearer-required-headers": [
+          "Authorization",
+          "X-ALMS-Client-Id",
+          "Origin"
+        ]
+      },
+      "head": {
+        "operationId": "head_v1_playback_start_consents_requests_key",
+        "summary": "Headers only: Read exact owned consent request",
+        "description": "Current exact owner/registered client. No school API call.404 while POST is pending is not negative acceptance proof.",
+        "security": [
+          {
+            "cookieSession": []
+          },
+          {
+            "bearerSession": [],
+            "clientHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "X-ALMS-Client-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+            },
+            "description": "Required with bearer authentication. If provided with cookie, must equal the session-bound registered client."
+          },
+          {
+            "name": "Origin",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uri"
+            },
+            "description": "Exact registered origin; required on writes and on every bearer request."
+          },
+          {
+            "name": "Accept",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "const": "application/json; alms-playback=2"
+            },
+            "description": "Required when playback is enabled or the job was admitted with school authority."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Normalized failure. Do not use message text as a state code."
+          },
+          "401": {
+            "description": "Normalized failure. Do not use message text as a state code."
+          },
+          "403": {
+            "description": "Normalized failure. Do not use message text as a state code."
+          },
+          "404": {
+            "description": "Normalized failure. Do not use message text as a state code."
+          },
+          "409": {
+            "description": "Normalized failure. Do not use message text as a state code."
+          },
+          "413": {
+            "description": "Normalized failure. Do not use message text as a state code."
+          },
+          "415": {
+            "description": "Normalized failure. Do not use message text as a state code."
+          },
+          "429": {
+            "description": "Normalized failure. Do not use message text as a state code."
+          },
+          "500": {
+            "description": "Normalized failure. Do not use message text as a state code."
+          },
+          "502": {
+            "description": "Normalized failure. Do not use message text as a state code."
+          },
+          "503": {
+            "description": "Normalized failure. Do not use message text as a state code."
+          }
+        },
+        "x-alms-error-codes": [
+          "INVALID_REQUEST",
+          "RATE_LIMITED",
+          "INTERNAL_ERROR",
+          "AUTH_REQUIRED",
+          "CLIENT_ORIGIN_INVALID",
+          "SCHOOL_AUTH_REQUIRED",
+          "SCHOOL_SESSION_CHANGED",
+          "PLAYBACK_START_CONSENT_UNAVAILABLE",
+          "PLAYBACK_START_CONSENT_UNCONFIRMED",
+          "PLAYBACK_START_CONSENT_INVALID",
+          "PLAYBACK_START_CONSENT_EXPIRED",
+          "PLAYBACK_START_CONSENT_REVOKED",
+          "PLAYBACK_START_CONSENT_USED",
+          "PLAYBACK_UNAVAILABLE",
+          "SCHOOL_AUTH_REQUIRED",
+          "IDEMPOTENCY_CONFLICT",
+          "CLIENT_UPDATE_REQUIRED"
+        ],
+        "x-alms-bearer-required-headers": [
+          "Authorization",
+          "X-ALMS-Client-Id",
+          "Origin"
+        ]
+      }
+    },
+    "/v1/playback-start-consents/{id}": {
+      "delete": {
+        "operationId": "delete_v1_playback_start_consents_id",
+        "summary": "Revoke unused start permission",
+        "description": "Authenticated exact owner/client, Origin and CSRF. Does not cancel jobs or reports after acknowledged start; use existing job cancellation. Revocation is immutable and idempotent.",
+        "security": [
+          {
+            "cookieSession": []
+          },
+          {
+            "bearerSession": [],
+            "clientHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "X-ALMS-Client-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+            },
+            "description": "Required with bearer authentication. If provided with cookie, must equal the session-bound registered client."
+          },
+          {
+            "name": "Origin",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uri"
+            },
+            "description": "Exact registered origin; required on writes and on every bearer request."
+          },
+          {
+            "name": "X-CSRF-Token",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Session CSRF token returned by /v1/me or bearer token exchange. All authenticated writes require it."
+          },
+          {
+            "name": "Accept",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "const": "application/json; alms-playback=2"
+            },
+            "description": "Required when playback is enabled or the job was admitted with school authority."
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Success; no response body."
+          },
+          "400": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "x-alms-error-codes": [
+          "INVALID_REQUEST",
+          "RATE_LIMITED",
+          "INTERNAL_ERROR",
+          "AUTH_REQUIRED",
+          "CLIENT_ORIGIN_INVALID",
+          "SCHOOL_AUTH_REQUIRED",
+          "SCHOOL_SESSION_CHANGED",
+          "CSRF_INVALID",
+          "PLAYBACK_START_CONSENT_UNAVAILABLE",
+          "PLAYBACK_START_CONSENT_UNCONFIRMED",
+          "PLAYBACK_START_CONSENT_INVALID",
+          "PLAYBACK_START_CONSENT_EXPIRED",
+          "PLAYBACK_START_CONSENT_REVOKED",
+          "PLAYBACK_START_CONSENT_USED",
+          "PLAYBACK_UNAVAILABLE",
+          "SCHOOL_AUTH_REQUIRED",
+          "IDEMPOTENCY_CONFLICT",
+          "CLIENT_UPDATE_REQUIRED"
+        ],
+        "x-alms-bearer-required-headers": [
+          "Authorization",
+          "X-ALMS-Client-Id",
+          "Origin"
+        ]
+      }
+    },
+    "/v1/jobs/requests/{key}": {
+      "get": {
+        "operationId": "get_v1_jobs_requests_key",
+        "summary": "Read exact owned admission key",
+        "description": "Read-only, no school refresh. Consent-backed requests retain exact original client; legacy owner reads retain their old policy.404 during in-flight admission is not negative proof. Compare exact target and startConsent.id before acknowledging response loss.",
+        "security": [
+          {
+            "cookieSession": []
+          },
+          {
+            "bearerSession": [],
+            "clientHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "X-ALMS-Client-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+            },
+            "description": "Required with bearer authentication. If provided with cookie, must equal the session-bound registered client."
+          },
+          {
+            "name": "Origin",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uri"
+            },
+            "description": "Exact registered origin; required on writes and on every bearer request."
+          },
+          {
+            "name": "Accept",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "const": "application/json; alms-playback=2"
+            },
+            "description": "Required when playback is enabled or the job was admitted with school authority."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "x-alms-error-codes": [
+          "INVALID_REQUEST",
+          "RATE_LIMITED",
+          "INTERNAL_ERROR",
+          "AUTH_REQUIRED",
+          "CLIENT_ORIGIN_INVALID",
+          "SCHOOL_AUTH_REQUIRED",
+          "SCHOOL_SESSION_CHANGED",
+          "CLIENT_UPDATE_REQUIRED",
+          "PLAYBACK_START_CONSENT_INVALID"
+        ],
+        "x-alms-bearer-required-headers": [
+          "Authorization",
+          "X-ALMS-Client-Id",
+          "Origin"
+        ]
+      },
+      "head": {
+        "operationId": "head_v1_jobs_requests_key",
+        "summary": "Headers only: Read exact owned admission key",
+        "description": "Read-only, no school refresh. Consent-backed requests retain exact original client; legacy owner reads retain their old policy.404 during in-flight admission is not negative proof. Compare exact target and startConsent.id before acknowledging response loss.",
+        "security": [
+          {
+            "cookieSession": []
+          },
+          {
+            "bearerSession": [],
+            "clientHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "X-ALMS-Client-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+            },
+            "description": "Required with bearer authentication. If provided with cookie, must equal the session-bound registered client."
+          },
+          {
+            "name": "Origin",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uri"
+            },
+            "description": "Exact registered origin; required on writes and on every bearer request."
+          },
+          {
+            "name": "Accept",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "const": "application/json; alms-playback=2"
+            },
+            "description": "Required when playback is enabled or the job was admitted with school authority."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Normalized failure. Do not use message text as a state code."
+          },
+          "401": {
+            "description": "Normalized failure. Do not use message text as a state code."
+          },
+          "403": {
+            "description": "Normalized failure. Do not use message text as a state code."
+          },
+          "404": {
+            "description": "Normalized failure. Do not use message text as a state code."
+          },
+          "409": {
+            "description": "Normalized failure. Do not use message text as a state code."
+          },
+          "413": {
+            "description": "Normalized failure. Do not use message text as a state code."
+          },
+          "415": {
+            "description": "Normalized failure. Do not use message text as a state code."
+          },
+          "429": {
+            "description": "Normalized failure. Do not use message text as a state code."
+          },
+          "500": {
+            "description": "Normalized failure. Do not use message text as a state code."
+          },
+          "502": {
+            "description": "Normalized failure. Do not use message text as a state code."
+          },
+          "503": {
+            "description": "Normalized failure. Do not use message text as a state code."
+          }
+        },
+        "x-alms-error-codes": [
+          "INVALID_REQUEST",
+          "RATE_LIMITED",
+          "INTERNAL_ERROR",
+          "AUTH_REQUIRED",
+          "CLIENT_ORIGIN_INVALID",
+          "SCHOOL_AUTH_REQUIRED",
+          "SCHOOL_SESSION_CHANGED",
+          "CLIENT_UPDATE_REQUIRED",
+          "PLAYBACK_START_CONSENT_INVALID"
+        ],
+        "x-alms-bearer-required-headers": [
+          "Authorization",
+          "X-ALMS-Client-Id",
+          "Origin"
+        ]
+      }
+    },
     "/v1/jobs": {
       "get": {
         "operationId": "get_v1_jobs",
@@ -16491,6 +17564,10 @@
                   "scheduledFor": {
                     "type": "string",
                     "format": "date-time"
+                  },
+                  "startConsentId": {
+                    "type": "string",
+                    "format": "uuid"
                   }
                 },
                 "required": [
@@ -17480,7 +18557,12 @@
             "application/json": {
               "schema": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                  "startConsentId": {
+                    "type": "string",
+                    "format": "uuid"
+                  }
+                },
                 "required": [],
                 "additionalProperties": false
               }
@@ -22059,6 +23141,66 @@
         "additionalProperties": false,
         "description": "Durable proven-before-play authentication wait. canContinue requires a newer verified school SSO generation with LMS ready; POST still performs fresh native admission. queued/scheduled intent remains waiting without school attempts. continuedAsJobId durably identifies the sole replacement, including after response loss. No automatic continuation or unknown/interrupted retry."
       },
+      "PlaybackStartConsent": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "expiresAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "courseId": {
+            "type": "string",
+            "pattern": "^[1-9]\\d{0,15}$"
+          },
+          "lectureIds": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[1-9]\\d{0,15}$"
+            },
+            "maxItems": 100
+          }
+        },
+        "required": [
+          "id",
+          "expiresAt",
+          "courseId",
+          "lectureIds"
+        ],
+        "additionalProperties": false
+      },
+      "JobStartConsent": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "expiresAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "attempt": {
+            "type": "string",
+            "enum": [
+              "not_attempted",
+              "reserved",
+              "acknowledged",
+              "unknown"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "expiresAt",
+          "attempt"
+        ],
+        "additionalProperties": false
+      },
       "Job": {
         "type": "object",
         "properties": {
@@ -22137,6 +23279,16 @@
                   "ended",
                   "interrupted"
                 ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "startConsent": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobStartConsent"
               },
               {
                 "type": "null"

@@ -190,7 +190,7 @@ export async function executeJob(id: string, store: Store, provider: SchoolProvi
           ? expired ? 'school_auth_required' as const : 'school_session_changed' as const : undefined;
         const status = expired && current.status !== 'pause_requested' ? 'needs_reauthentication' : 'needs_verification';
         const code = reportUnconfirmed ? 'PLAYBACK_REPORT_UNKNOWN' : expired ? 'AUTH_REQUIRED'
-          : authenticationWaitReason === 'school_session_changed' && failure instanceof AppError ? failure.code : interrupted ? 'WORKER_INTERRUPTED' : 'SCHOOL_RESULT_UNKNOWN';
+          : (authenticationWaitReason === 'school_session_changed' || knownUnstarted && failure instanceof AppError && failure.code.startsWith('PLAYBACK_START_')) && failure instanceof AppError ? failure.code : interrupted ? 'WORKER_INTERRUPTED' : 'SCHOOL_RESULT_UNKNOWN';
         if (!await transition([current.status], status, null, code, false, authenticationWaitReason)) await finishCancellation();
         return;
       }

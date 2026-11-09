@@ -1,3 +1,5 @@
+import { PgPlaybackStartConsentRepository, bindPlaybackStartConsent } from './playback-start-consent-store.js';
+import type { PlaybackStartConsentInput, PlaybackStartConsentReceipt, PlaybackStartAttempt, ConsentAuthorization, ConsentSchoolAuthorization } from './playback-start-consent.js';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { Pool, type PoolClient, type QueryResultRow } from 'pg';
 import { AppError, notFound } from './errors.js';
@@ -22,16 +24,17 @@ const completionFrom = (r: Row): PersonalCompletion => ({ courseId: r.course_id,
 const jobFrom = (r: Row): Job => ({ id: r.id, userId: r.user_id, courseId: r.course_id, lectureId: r.lecture_id, status: r.status, scheduledFor: iso(r.scheduled_for), createdAt: iso(r.created_at), updatedAt: iso(r.updated_at), schoolResult: r.school_result, errorCode: r.error_code, idempotencyKey: r.idempotency_key, requestHash: r.request_hash, acceptedGeneration: r.accepted_generation ?? null, executionTokenHash: r.execution_token_hash ?? null, executionOutcome: r.execution_outcome ?? null,
   playbackProgress: publicPlaybackProgress(r.playback_observation, r.playback_report_ack),
   authenticationContinuationEligible: r.auth_wait_eligible === true,
+  startConsent: r.start_consent_id ? { id:r.start_consent_id,expiresAt:iso(r.start_consent_expires),attempt:r.start_attempt_state??'not_attempted' } : null,
   authWait: r.auth_wait_since && (r.auth_wait_eligible === true || r.continued_as_job_id) ? { waitingSince: iso(r.auth_wait_since), reason: r.auth_wait_reason, canContinue: false, continuedAsJobId: r.continued_as_job_id ?? null } : null,
   lastExecutionTokenHash: r.last_execution_token_hash ?? null, settledAt: r.settled_at ? iso(r.settled_at) : null,
   ...(r.recovery_reason ? { settlement: r.settlement_result ? { settledAt: iso(r.settled_at), schoolResult: r.settlement_result } : null,
     recovery: { eligible: r.recovery_reason === 'eligible', reason: r.recovery_reason, version: r.recovery_version ?? iso(r.updated_at) } } : {}) });
 export const hashToken = (value: string) => createHash('sha256').update(value).digest('hex');
 
-export interface NewJobInput { courseId: string; lectureId: string; scheduledFor: string; idempotencyKey: string; requestHash: string }
-export interface JobAdmissionAuthorization { admission: PlaybackAdmission; almsTokenHash: string }
+export interface NewJobInput { startConsentId?: string; courseId: string; lectureId: string; scheduledFor: string; idempotencyKey: string; requestHash: string }
+export interface JobAdmissionAuthorization { admission: PlaybackAdmission; almsTokenHash: string; csrfToken?: string; clientId?: string | null }
 export interface JobTransitionOptions { outcome?: ExecutionOutcome | null; authority?: PlaybackFinalProof; terminationProof?: PlaybackTerminationProof; authenticationWaitReason?: AuthenticationWaitReason }
-export interface JobContinuationAuthorization extends JobAdmissionAuthorization { csrfToken: string; clientId: string | null }
+export interface JobContinuationAuthorization extends JobAdmissionAuthorization { csrfToken: string; clientId: string | null; startConsentId?:string }
 export interface JobContinuationResult { originalJob: Job; job: Job; continued: true }
 export interface JobSettlementAuthorization { admission: PlaybackAdmission; tokenHash: string; csrfToken: string; schoolResult: SchoolResult }
 export interface CompletionAuthorization { tokenHash: string; csrfToken: string }
@@ -51,6 +54,7 @@ const continuationEligible = `auth_wait.job_id IS NOT NULL AND auth_wait.continu
       OR (job.id=auth_wait.blocked_by_job_id AND job.status IN ('needs_reauthentication','needs_verification')
         AND job.execution_outcome='not_started' AND job.last_execution_token_hash IS NOT NULL))`;
 const jobRecoverySelect = `SELECT job.*, settlement.school_result AS settlement_result,
+  consent.id AS start_consent_id,consent.expires_at AS start_consent_expires,start_attempt.state AS start_attempt_state,
   auth_wait.waiting_since AS auth_wait_since, auth_wait.reason AS auth_wait_reason, auth_wait.continued_job_id AS continued_as_job_id,
   (${continuationEligible}) AS auth_wait_eligible,
   progress.observation AS playback_observation, progress.report_ack AS playback_report_ack,
@@ -67,6 +71,9 @@ const jobRecoverySelect = `SELECT job.*, settlement.school_result AS settlement_
       AND lease.expires_at>clock_timestamp()) THEN 'lease_active'
     ELSE 'eligible' END AS recovery_reason
   FROM playback_jobs job LEFT JOIN playback_job_settlements settlement ON settlement.job_id=job.id
+  LEFT JOIN playback_job_start_consents start_binding ON start_binding.job_id=job.id
+  LEFT JOIN playback_start_consents consent ON consent.id=start_binding.consent_id
+  LEFT JOIN playback_start_attempts start_attempt ON start_attempt.job_id=job.id
   LEFT JOIN playback_auth_waits auth_wait ON auth_wait.job_id=job.id
   LEFT JOIN playback_job_progress progress ON progress.job_id=job.id
     AND progress.execution_token_hash=COALESCE(job.execution_token_hash,job.last_execution_token_hash)`;
@@ -96,6 +103,11 @@ export interface Store {
   deleteTodo(userId: string, id: string): Promise<void>;
   listJobs(userId: string,courseId?: string,limit?: number): Promise<Job[]>;
   getJob(userId: string, id: string): Promise<Job | null>;
+  getJobRequest?(owner:string,key:string,auth:ConsentAuthorization,operation?:WorkerOperation):Promise<Job|null>;
+  findPlaybackStartConsent?(owner:string,requestKey:string,auth:ConsentAuthorization,operation:WorkerOperation,requestHash?:string):Promise<PlaybackStartConsentReceipt|null>;
+  createPlaybackStartConsent?(owner:string,input:PlaybackStartConsentInput,requestKey:string,requestHash:string,auth:ConsentSchoolAuthorization,operation:WorkerOperation):Promise<PlaybackStartConsentReceipt>;
+  revokePlaybackStartConsent?(owner:string,id:string,auth:ConsentAuthorization,operation:WorkerOperation):Promise<void>;
+
   findJobRequest(userId: string, idempotencyKey: string, requestHash: string, operation?: WorkerOperation): Promise<Job | null>;
   createJob(userId: string, input: NewJobInput, authorization: JobAdmissionAuthorization, operation?: WorkerOperation): Promise<Job>;
   findJobContinuation?(userId: string, id: string, idempotencyKey: string, requestHash: string, authorization: Pick<JobContinuationAuthorization, 'almsTokenHash' | 'csrfToken' | 'clientId'>, operation?: WorkerOperation): Promise<JobContinuationResult | null>;
@@ -112,8 +124,10 @@ export interface Store {
 
 export class PgStore implements Store {
   readonly analytics: PgAnalyticsStore;
+  readonly playbackStartConsents: PgPlaybackStartConsentRepository;
   readonly runWithSchoolSessionLock?: SchoolSessionLockRunner;
   constructor(public pool: Pool, options: { runWithSchoolSessionLock?: SchoolSessionLockRunner } = {}) {
+    this.playbackStartConsents = new PgPlaybackStartConsentRepository(pool);
     this.analytics = new PgAnalyticsStore(pool); this.runWithSchoolSessionLock = options.runWithSchoolSessionLock;
   }
   async query<T extends QueryResultRow = Row>(sql: string, params: unknown[] = []) { return this.pool.query<T>(sql, params); }
@@ -124,8 +138,8 @@ export class PgStore implements Store {
     finally { c.release(); }
   }
   async health() {
-    const result = await this.query("SELECT 1 FROM schema_migrations WHERE name IN ('011-playback-job-settlement.sql','012-frontend-clients.sql','013-analytics-frontend-client.sql','014-assignment-operation-recovery.sql','016-playback-job-progress.sql','017-playback-auth-wait.sql')");
-    if (result.rowCount !== 6) throw new Error('Database migrations are pending');
+    const result = await this.query("SELECT 1 FROM schema_migrations WHERE name IN ('011-playback-job-settlement.sql','012-frontend-clients.sql','013-analytics-frontend-client.sql','014-assignment-operation-recovery.sql','016-playback-job-progress.sql','017-playback-auth-wait.sql','018-playback-start-consent.sql')");
+    if (result.rowCount !== 7) throw new Error('Database migrations are pending');
   }
   async getSession(tokenHash: string): Promise<Session | null> {
     const { rows: [r] } = await this.query(`SELECT s.*,u.display_name,u.analytics_id,u.analytics_enabled FROM sessions s JOIN users u ON u.id=s.user_id WHERE token_hash=$1 AND expires_at>now()`, [tokenHash]);
@@ -270,8 +284,25 @@ export class PgStore implements Store {
     const { rows } = await this.query(`${jobRecoverySelect} WHERE job.user_id=$1 AND ($2::text IS NULL OR job.course_id=$2) ORDER BY job.created_at DESC,job.id DESC LIMIT $3`,[userId,courseId ?? null,limit]); return rows.map(jobFrom);
   }
   async getJob(userId: string,id: string) { const { rows: [r] } = await this.query(`${jobRecoverySelect} WHERE job.user_id=$1 AND job.id=$2`,[userId,id]); return r ? jobFrom(r) : null; }
+  findPlaybackStartConsent(owner:string,requestKey:string,auth:ConsentAuthorization,operation:WorkerOperation,requestHash?:string){return this.playbackStartConsents.find(owner,requestKey,auth,operation,requestHash);}
+  createPlaybackStartConsent(owner:string,input:PlaybackStartConsentInput,requestKey:string,requestHash:string,auth:ConsentSchoolAuthorization,operation:WorkerOperation){return this.playbackStartConsents.create(owner,input,requestKey,requestHash,auth,operation);}
+  revokePlaybackStartConsent(owner:string,id:string,auth:ConsentAuthorization,operation:WorkerOperation){return this.playbackStartConsents.revoke(owner,id,auth,operation);}
+  validatePlaybackStartConsent(claim:WorkerClaim,key:Buffer,operation:WorkerOperation){return this.playbackStartConsents.validate(claim,key,operation);}
+  reservePlaybackStart(claim:WorkerClaim,key:Buffer,operation:WorkerOperation):Promise<PlaybackStartAttempt|null>{return this.playbackStartConsents.reserve(claim,key,operation);}
+  recordPlaybackStartTransportAck(claim:WorkerClaim,id:string,operation:WorkerOperation){return this.playbackStartConsents.recordTransportAck(claim,id,operation);}
+  finishPlaybackStart(claim:WorkerClaim,id:string,outcome:'acknowledged'|'unknown',key:Buffer,operation:WorkerOperation){return this.playbackStartConsents.finish(claim,id,outcome,key,operation);}
+  async getJobRequest(owner:string,key:string,auth:ConsentAuthorization,operation:WorkerOperation={timeoutMs:5000}){
+   return this.workerTransaction(async query=>{
+    const session=await query(`SELECT 1 FROM sessions WHERE user_id=$1 AND token_hash=$2 AND csrf_token=$3 AND client_id IS NOT DISTINCT FROM $4::text AND expires_at>clock_timestamp() FOR SHARE`,[owner,auth.almsTokenHash,auth.csrfToken,auth.clientId]);
+    if(!session.rowCount)throw new AppError(401,'AUTH_REQUIRED','다시 로그인해 주세요.');
+    const {rows:[r]}=await query<Row>(`${jobRecoverySelect} WHERE job.user_id=$1 AND job.idempotency_key=$2`,[owner,key]);
+    if(!r)return null;
+    if(r.start_consent_id){const c=await query('SELECT 1 FROM playback_start_consents WHERE id=$1 AND client_id IS NOT DISTINCT FROM $2::text',[r.start_consent_id,auth.clientId]);if(!c.rowCount)throw new AppError(409,'PLAYBACK_START_CONSENT_INVALID','동의를 확인해 주세요.');}
+    return jobFrom(r);
+   },operation);
+  }
   async findJobRequest(userId: string, idempotencyKey: string, requestHash: string, operation?: WorkerOperation) {
-    const { rows: [row] } = await this.workerQuery('SELECT * FROM playback_jobs WHERE user_id=$1 AND idempotency_key=$2', [userId, idempotencyKey], operation);
+    const { rows: [row] } = await this.workerQuery(`${jobRecoverySelect} WHERE job.user_id=$1 AND job.idempotency_key=$2`, [userId, idempotencyKey], operation);
     if (!row) return null;
     if (row.request_hash !== requestHash) throw new AppError(409, 'IDEMPOTENCY_CONFLICT', '같은 요청 키에 다른 작업이 있습니다.');
     return jobFrom(row);
@@ -285,8 +316,11 @@ export class PgStore implements Store {
         if (!session.rowCount) throw new AppError(401, 'AUTH_REQUIRED', '다시 로그인해 주세요.');
         const { rows: [existing] } = await query<Row>('SELECT * FROM playback_jobs WHERE user_id=$1 AND idempotency_key=$2', [userId,input.idempotencyKey]);
         if (existing) {
+          const bound=await query<Row>('SELECT c.client_id FROM playback_job_start_consents b JOIN playback_start_consents c ON c.id=b.consent_id WHERE b.job_id=$1',[existing.id]);
+          if(bound.rowCount){if(bound.rows[0]!.client_id!==(authorization.clientId??null))throw new AppError(409,'PLAYBACK_START_CONSENT_INVALID','동의를 확인해 주세요.');await this.continuationSession(query,userId,{almsTokenHash:authorization.almsTokenHash,csrfToken:authorization.csrfToken??'',clientId:authorization.clientId??null});}
           if (existing.request_hash !== input.requestHash) throw new AppError(409,'IDEMPOTENCY_CONFLICT','같은 요청 키에 다른 작업이 있습니다.');
-          return jobFrom(existing);
+          const {rows:[complete]}=await query<Row>(`${jobRecoverySelect} WHERE job.id=$1`,[existing.id]);
+          return jobFrom(complete!);
         }
         const proof = inspectPlaybackAdmission(authorization.admission, { userId, courseId: input.courseId, lectureId: input.lectureId });
         const school = await query("SELECT user_id FROM school_sessions WHERE user_id=$1 AND provider='ssu' AND encrypted_state=$2 FOR SHARE", [userId, proof.encryptedSession]);
@@ -298,8 +332,14 @@ export class PgStore implements Store {
             AND EXISTS(SELECT 1 FROM sessions WHERE user_id=$2 AND token_hash=$11 AND expires_at>clock_timestamp()) RETURNING *`,
           [id,userId,input.courseId,input.lectureId,status,input.scheduledFor,input.idempotencyKey,input.requestHash,proof.generation,proof.expiresAt,authorization.almsTokenHash]);
         if (!r) throw authorityChanged();
+        if(input.startConsentId)await bindPlaybackStartConsent(query,userId,id,input,input.startConsentId,proof.generation,{almsTokenHash:authorization.almsTokenHash,csrfToken:authorization.csrfToken??'',clientId:authorization.clientId??null});
         await query('INSERT INTO job_outbox(job_id) VALUES($1)', [id]);
-        return jobFrom(r);
+        if(input.startConsentId){
+          await this.continuationSession(query,userId,{almsTokenHash:authorization.almsTokenHash,csrfToken:authorization.csrfToken??'',clientId:authorization.clientId??null});
+          const final=await query('SELECT clock_timestamp()<to_timestamp($1::double precision/1000) AS valid',[proof.expiresAt]);if(final.rows[0]?.valid!==true)throw authorityChanged();
+        }
+        const {rows:[complete]}=await query<Row>(`${jobRecoverySelect} WHERE job.id=$1`,[id]);
+        return jobFrom(complete!);
       }, operation);
     } catch (error) {
       if ((error as { code?: string }).code === '23505') throw new AppError(409,'JOB_ALREADY_ACTIVE','이 강의의 진행 중인 작업을 먼저 확인해 주세요.');
@@ -312,11 +352,12 @@ export class PgStore implements Store {
       [userId, authorization.almsTokenHash, authorization.csrfToken, authorization.clientId]);
     if (!result.rowCount) throw new AppError(401, 'AUTH_REQUIRED', '다시 로그인해 주세요.');
   }
-  private async continuationResult(query: WorkerQuery, userId: string, id: string, childId: string): Promise<JobContinuationResult> {
+  private async continuationResult(query: WorkerQuery, userId: string, id: string, childId: string, clientId:string|null): Promise<JobContinuationResult> {
     const { rows } = await query<Row>(`${jobRecoverySelect} WHERE job.user_id=$1 AND job.id=ANY($2::uuid[])`, [userId, [id, childId]]);
     const original = rows.find(row => row.id === id), child = rows.find(row => row.id === childId);
     if (!original || !child || original.continued_as_job_id !== child.id || original.course_id !== child.course_id || original.lecture_id !== child.lecture_id)
       throw authorityChanged();
+    if(child.start_consent_id){const c=await query('SELECT 1 FROM playback_start_consents WHERE id=$1 AND client_id IS NOT DISTINCT FROM $2::text',[child.start_consent_id,clientId]);if(!c.rowCount)throw new AppError(409,'PLAYBACK_START_CONSENT_INVALID','동의를 확인해 주세요.');}
     return { originalJob: jobFrom(original), job: jobFrom(child), continued: true };
   }
   /** Exact-key readback remains authenticated after the child has run or completed. */
@@ -329,12 +370,12 @@ export class PgStore implements Store {
       if (existing.request_hash !== requestHash) throw new AppError(409, 'IDEMPOTENCY_CONFLICT', '같은 요청 키에 다른 작업이 있습니다.');
       const relation = await query('SELECT job_id FROM playback_auth_waits WHERE job_id=$1 AND continued_job_id=$2', [id, existing.id]);
       if (!relation.rowCount) throw new AppError(409, 'IDEMPOTENCY_CONFLICT', '같은 요청 키의 작업 관계를 확인할 수 없습니다.');
-      return this.continuationResult(query, userId, id, existing.id);
+      return this.continuationResult(query, userId, id, existing.id,authorization.clientId);
     }, operation);
   }
   /** Fresh admission and retirement commit together. The old generation is never rebound. */
   async continueJob(userId: string, id: string, idempotencyKey: string, requestHash: string,
-    authorization: JobContinuationAuthorization, operation: WorkerOperation = { timeoutMs: 5000 }): Promise<JobContinuationResult> {
+    authorization: JobContinuationAuthorization & {startConsentId?:string}, operation: WorkerOperation = { timeoutMs: 5000 }): Promise<JobContinuationResult> {
     try {
       return await this.workerTransaction(async query => {
         await query(playbackAccountLock, [playbackAccountLockKey(userId)]);
@@ -345,7 +386,7 @@ export class PgStore implements Store {
           if (existing.request_hash !== requestHash) throw new AppError(409, 'IDEMPOTENCY_CONFLICT', '같은 요청 키에 다른 작업이 있습니다.');
           const relation = await query('SELECT job_id FROM playback_auth_waits WHERE job_id=$1 AND continued_job_id=$2', [id, existing.id]);
           if (!relation.rowCount) throw new AppError(409, 'IDEMPOTENCY_CONFLICT', '같은 요청 키의 작업 관계를 확인할 수 없습니다.');
-          return this.continuationResult(query, userId, id, existing.id);
+          return this.continuationResult(query, userId, id, existing.id,authorization.clientId);
         }
         const owned = await query('SELECT id FROM playback_jobs WHERE user_id=$1 AND id=$2 FOR UPDATE', [userId, id]);
         if (owned.rowCount !== 1) throw notFound();
@@ -378,6 +419,7 @@ export class PgStore implements Store {
           [childId, userId, old.course_id, old.lecture_id, status, scheduledFor, idempotencyKey, requestHash, proof.generation, proof.expiresAt,
             authorization.almsTokenHash, authorization.csrfToken, authorization.clientId]);
         if (created.rowCount !== 1) throw authorityChanged();
+        if(authorization.startConsentId)await bindPlaybackStartConsent(query,userId,childId,{courseId:old.course_id,lectureId:old.lecture_id},authorization.startConsentId,proof.generation,authorization);
         await query('INSERT INTO job_outbox(job_id) VALUES($1)', [childId]);
         const related = await query(`UPDATE playback_auth_waits SET continued_job_id=$2,continued_at=clock_timestamp()
           WHERE job_id=$1 AND continued_job_id IS NULL RETURNING job_id`, [id, childId]);
@@ -385,7 +427,7 @@ export class PgStore implements Store {
         await this.continuationSession(query, userId, authorization);
         const deadline = await query('SELECT clock_timestamp()<to_timestamp($1::double precision/1000) AS valid', [proof.expiresAt]);
         if (deadline.rows[0]?.valid !== true) throw authorityChanged();
-        return this.continuationResult(query, userId, id, childId);
+        return this.continuationResult(query, userId, id, childId,authorization.clientId);
       }, operation);
     } catch (error) {
       if ((error as { code?: string }).code === '23505') throw new AppError(409, 'JOB_ALREADY_ACTIVE', '이 강의의 진행 중인 작업을 먼저 확인해 주세요.');

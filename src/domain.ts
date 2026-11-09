@@ -1,3 +1,4 @@
+import { publicStartConsent, type JobStartConsent } from './playback-start-consent.js';
 import { publicJobPlaybackProgress, type PlaybackProgress } from './playback-progress.js';
 import { publicPlaybackAuthWait, type PlaybackAuthWait } from './playback-auth-wait.js';
 export type JobStatus = 'queued' | 'scheduled' | 'running' | 'pause_requested' | 'paused' |
@@ -19,6 +20,7 @@ export interface Job {
   /** Server-observed playback, independent of school completion or attendance. */
   playbackProgress?: PlaybackProgress | null;
   authWait?: PlaybackAuthWait | null;
+  startConsent?: JobStartConsent | null;
   /** Internal proven-before-play eligibility; fresh school authentication is checked separately. */
   authenticationContinuationEligible?: boolean;
   idempotencyKey: string; requestHash: string;
@@ -70,6 +72,7 @@ export function publicJob(job: Job) {
   return { id: job.id, courseId: job.courseId, lectureId: job.lectureId, status: job.status,
     scheduledFor: job.scheduledFor, createdAt: job.createdAt, updatedAt: job.updatedAt,
     schoolResult: job.schoolResult, errorCode: job.errorCode, executionOutcome: job.executionOutcome ?? null,
+    ...(job.startConsent !== undefined ? { startConsent: publicStartConsent(job.startConsent) } : {}),
     ...(job.authWait !== undefined ? { authWait: publicPlaybackAuthWait(job.authWait) } : {}),
     ...(job.playbackProgress !== undefined ? { playbackProgress: publicJobPlaybackProgress(job.playbackProgress) } : {}),
     ...(job.recovery ? { settledAt: job.settledAt ?? null, settlement: job.settlement ?? null, recovery: job.recovery } : {}) };

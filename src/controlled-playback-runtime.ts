@@ -14,6 +14,7 @@ const codes = [
   'STALLED',
   'GUARD_FAILED',
   'REPORT_FAILED',
+  'BEFORE_PLAY_FAILED',
   'EXECUTION_TIMEOUT',
   'CLEANUP_FAILED',
 ] as const;
@@ -42,6 +43,8 @@ export interface ControlledPlaybackInput {
   stream(request: VideoRequest): Promise<VideoResponse>;
   /** Synchronous observation only; reporting and DB checks must not block the sampler. */
   observe(value: ControlledPlaybackObservation): void;
+  /** Trusted single-use pre-play work with the actual validated, paused media observation. */
+  beforePlay?(value: ControlledPlaybackObservation, signal: AbortSignal): Promise<void>;
   /** One school attempt; the hook must honor signal and must never retry a write. */
   report(event: 'playing' | 'update' | 'ended', signal: AbortSignal): Promise<void>;
   timeouts?: { startMs?: number; stallMs?: number; totalMs?: number };
@@ -59,14 +62,14 @@ export function createControlledPlaybackSource(input: ControlledPlaybackInput): 
   if (
     !input ||
     Object.keys(input).some(
-      (key) => !['expectedDurationSeconds', 'validate', 'stream', 'observe', 'report', 'timeouts'].includes(key),
+      (key) => !['expectedDurationSeconds', 'validate', 'stream', 'observe', 'beforePlay', 'report', 'timeouts'].includes(key),
     ) ||
     !Number.isFinite(input.expectedDurationSeconds) ||
     input.expectedDurationSeconds <= 0 ||
     input.expectedDurationSeconds > 14400 ||
     ['validate', 'stream', 'observe', 'report'].some(
       (key) => typeof input[key as keyof ControlledPlaybackInput] !== 'function',
-    )
+    ) || (input.beforePlay !== undefined && typeof input.beforePlay !== 'function')
   )
     return fail('SOURCE_INVALID');
   if (input.timeouts && Object.keys(input.timeouts).some((key) => !['startMs', 'stallMs', 'totalMs'].includes(key)))
@@ -498,8 +501,7 @@ export function createControlledPlaybackRuntime(dependencies: { launch?: Launch 
           )
             return fail('MEDIA_INVALID');
         };
-        const observe = (value: Snapshot) =>
-          data.observe(
+        const observation = (value: Snapshot): ControlledPlaybackObservation =>
             Object.freeze({
               positionSeconds: value.positionSeconds,
               durationSeconds: value.durationSeconds,
@@ -508,14 +510,31 @@ export function createControlledPlaybackRuntime(dependencies: { launch?: Launch 
               ended: value.ended,
               seeking: value.seeking,
               visible: value.visible,
-            }),
-          );
-        const initial = await capture();
+            });
+        const observe = (value: Snapshot) => data.observe(observation(value));
+        let initial = await capture();
         guard();
         verify(initial);
         if (!initial.paused || initial.ended || initial.positionSeconds !== 0) return fail('MEDIA_INVALID');
-        observe(initial);
+        // A long explicit-start handshake must not seed the ordinary report controller's
+        // observation clock. Its first observation is a fresh DOM capture after the ACK.
+        if (!data.beforePlay) observe(initial);
         await check();
+        if (data.beforePlay) {
+          // No playback, timer-derived observation or report can precede this callback.
+          // A late callback cannot pass the cancellation fence or replace a fresh capture.
+          try {
+            await bounded(Promise.resolve().then(() => {
+              guard(); return data.beforePlay!(observation(initial), signal);
+            }), 90_000, 'BEFORE_PLAY_FAILED', signal);
+          } catch { guard(); return fail('BEFORE_PLAY_FAILED'); }
+          await check();
+          initial = await capture(); guard(); verify(initial);
+          if (!initial.paused || initial.ended || initial.positionSeconds !== 0 || initial.playingCount !== 0)
+            return fail('MEDIA_INVALID');
+          observe(initial);
+          await check();
+        }
         await page.locator('#start').click({ timeout: data.timeouts.startMs });
         guard();
         let previous = initial,

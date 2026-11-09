@@ -12,7 +12,7 @@ import { currentContinuationGeneration } from './playback-auth-wait.js';
 import { publicVerifiedSchoolResult } from './job-verification.js';
 
 const unconfirmed = () => new AppError(503, 'PLAYBACK_CONTINUATION_UNCONFIRMED', '대기열에서 계속 수강 접수 결과를 확인해 주세요.');
-export const playbackContinuationHash = (id: string) => hashToken(JSON.stringify({ operation: 'continue_playback', originalJobId: id }));
+export const playbackContinuationHash = (id: string,startConsentId?:string) => hashToken(JSON.stringify({ operation: 'continue_playback', originalJobId: id,...(startConsentId?{startConsentId}:{}) }));
 /** Explicit new admission only. Never a retry of an interrupted/unknown school execution. */
 export function registerPlaybackContinuation(app: FastifyInstance, store: Store, provider: SchoolProvider,
   authenticate: (request: FastifyRequest) => Promise<void>, key: Buffer | undefined, readiness?: PlaybackReadinessReader) {
@@ -36,11 +36,11 @@ export function registerPlaybackContinuation(app: FastifyInstance, store: Store,
     onResponse: async request => clean(request), onError: async request => clean(request),
   }, async (request, reply) => {
     const { id } = z.object({ id: z.uuid() }).strict().parse(request.params);
-    z.object({}).strict().parse(request.query); z.object({}).strict().parse(request.body);
+    z.object({}).strict().parse(request.query); const input=z.object({startConsentId:z.uuid().optional()}).strict().parse(request.body);
     const idempotencyKey = z.uuid().parse(request.headers['idempotency-key']);
     requirePlaybackClient(request, true);
     const owner = request.session!.user.id, tokenHash = request.session!.tokenHash, csrfToken = request.session!.csrfToken;
-    const clientId = request.session!.clientId ?? null, requestHash = playbackContinuationHash(id), signal = requests.get(request)!.signal;
+    const clientId = request.session!.clientId ?? null, requestHash = playbackContinuationHash(id,input.startConsentId), signal = requests.get(request)!.signal;
     let writeStarted = false, activeFlight: { key: string; token: symbol } | undefined;
     const releaseFlight = () => { if (activeFlight && active.get(activeFlight.key) === activeFlight.token) active.delete(activeFlight.key); };
     try {
@@ -86,7 +86,7 @@ export function registerPlaybackContinuation(app: FastifyInstance, store: Store,
             throw new AppError(409, 'PLAYBACK_AUTHORITY_CHANGED', '학교 인증이 변경됐습니다. 대기열을 다시 확인해 주세요.');
           await validate(); if (!await playbackIsReady(readiness, current)) throw unavailable('PLAYBACK_UNAVAILABLE');
           current.throwIfAborted(); writeStarted = true;
-          return await store.continueJob(owner, id, idempotencyKey, requestHash, { ...authorization, admission }, operation);
+          return await store.continueJob(owner, id, idempotencyKey, requestHash, { ...authorization, admission,...input }, operation);
         } finally { releaseFlight(); }
       }, { signal, timeoutMs: 90_000 });
       return reply.code(202).send({ originalJob: publicJob(result.originalJob), job: publicJob(result.job), continued: true });

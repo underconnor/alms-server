@@ -1,3 +1,4 @@
+import { registerPlaybackStartConsents } from './playback-start-consent-routes.js';
 import { registerPlaybackContinuation } from './playback-continuation-routes.js';
 import { withPlaybackContinuationState } from './playback-auth-wait.js';
 import { registerJobSettlement } from './job-settlement.js';
@@ -51,7 +52,7 @@ const dateTime = z.iso.datetime({ offset: true });
 const identifier = z.string().min(1).max(200).regex(/^[A-Za-z0-9:_-]+$/);
 const createTodo = z.object({ title, dueAt: dateTime.nullable().optional() }).strict();
 const patchTodo = z.object({ title: title.optional(), dueAt: dateTime.nullable().optional(), completed: z.boolean().optional() }).strict().refine(v => Object.keys(v).length > 0);
-const createJob = z.object({ courseId: identifier, lectureId: identifier, scheduledFor: dateTime.optional() }).strict();
+const createJob = z.object({ courseId: identifier, lectureId: identifier, scheduledFor: dateTime.optional(), startConsentId: z.uuid().optional() }).strict();
 const materialView = z.object({ event: z.enum(['opened', 'page_changed']), page: z.number().int().min(1).max(10_000), totalPages: z.number().int().min(1).max(10_000),
   viewedPages: z.array(z.number().int().min(1).max(10_000)).min(1).max(10_000) }).strict()
   .refine(value => value.page <= value.totalPages && value.viewedPages.includes(value.page)
@@ -167,6 +168,7 @@ export async function buildApp(config: Config, store: Store, provider: SchoolPro
   registerPlaybackStart(app,store,authenticate,playbackStart);
   registerJobVerification(app, store, provider, authenticate);
   registerPlaybackContinuation(app, store, provider, authenticate, config.sessionEncryptionKey, playbackReadiness);
+  registerPlaybackStartConsents(app, store, provider, authenticate, config.sessionEncryptionKey, playbackReadiness);
   registerActivityLearningStatus(app, store, provider, authenticate);
   registerPersonalCompletion(app, store, provider, authenticate);
   const owner = (request: FastifyRequest) => request.session!.user.id;
@@ -523,7 +525,10 @@ export async function buildApp(config: Config, store: Store, provider: SchoolPro
         await validate();
         const existing = await store.findJobRequest(userId, idempotencyKey, requestHash, operation);
         await validate();
-        if (existing) return existing;
+        if (existing) {
+          if(existing.startConsent){if(!store.getJobRequest)throw unavailable('PLAYBACK_START_CONSENT_UNAVAILABLE');return (await store.getJobRequest(userId,idempotencyKey,{almsTokenHash:tokenHash,csrfToken:request.session!.csrfToken,clientId:request.session!.clientId??null},operation))!;}
+          return existing;
+        }
         if (!await playbackIsReady(playbackReadiness, signal)) throw unavailable('PLAYBACK_UNAVAILABLE');
         signal.throwIfAborted();
         const admission = await provider.authorizePlayback!({ userId }, { courseId: input.courseId, lectureId: input.lectureId }, { signal, validate });
@@ -531,7 +536,7 @@ export async function buildApp(config: Config, store: Store, provider: SchoolPro
         if (!await playbackIsReady(playbackReadiness, signal)) throw unavailable('PLAYBACK_UNAVAILABLE');
         signal.throwIfAborted();
         return store.createJob(userId, { ...input, scheduledFor: input.scheduledFor ?? new Date().toISOString(), idempotencyKey, requestHash },
-          { admission, almsTokenHash: tokenHash }, operation);
+          { admission, almsTokenHash: tokenHash,csrfToken:request.session!.csrfToken,clientId:request.session!.clientId??null }, operation);
       }, { signal: requestSignal, timeoutMs: 90_000 });
       return reply.code(202).send(publicJob(job));
     } catch (error) { throw admissionError(error, requestSignal); }

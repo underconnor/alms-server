@@ -10,12 +10,14 @@ import type { PlaybackLeaseRepository, PlaybackLeaseScope } from './manual-video
 import type { ManualVideoObservation } from './manual-video-types.js';
 import type { PreparedSchoolVideo, SchoolVideoSessions } from './school-video-session.js';
 import { rememberVideoReportDiagnostic, rememberVideoReportPreparation, rememberVideoReportOutcomeFailure, workerVideoReportDiagnostic } from './video-report-diagnostics.js';
+import { copyPlaybackStartDiagnostic } from './playback-start-diagnostics.js';
 
 const id = z.string().min(1).max(200).regex(/^[A-Za-z0-9:_-]+$/);
 const claimSchema = z.object({ jobId: id, userId: id, courseId: id, lectureId: id,
   acceptedGeneration: z.uuid(), executionTokenHash: z.string().regex(/^[a-f0-9]{64}$/) }).strict();
 /** Structurally identical to A's private WorkerClaim; never accepted from HTTP or queue payloads. */
 export type SchoolPlaybackClaim = Readonly<z.infer<typeof claimSchema>>;
+export type PlaybackStartReservation = Readonly<{ attemptId: string; consentId: string; expiresAt: string }>;
 type SessionProof = { generation: string; encryptedSession: string };
 type Target = { courseId: string; lectureId: string };
 export interface SchoolPlaybackInput {
@@ -23,6 +25,7 @@ export interface SchoolPlaybackInput {
   validate(signal: AbortSignal): Promise<void>;
   stream(request: VideoRequest): Promise<VideoResponse>;
   observe(value: ManualVideoObservation): void;
+  beforePlay?(value: ManualVideoObservation, signal: AbortSignal): Promise<void>;
   report(event: 'playing' | 'update' | 'ended', signal: AbortSignal): Promise<void>;
 }
 export interface SchoolPlaybackRuntime<Source> {
@@ -48,6 +51,10 @@ export interface SchoolPlaybackDependencies<Source, Admission, FinalProof> {
   validateFinalClaim(claim: SchoolPlaybackClaim, signal: AbortSignal): Promise<void>;
   createAdmission(scope: { userId: string } & Target, value: SessionProof): Admission;
   createFinalProof(claim: SchoolPlaybackClaim, value: SessionProof): FinalProof;
+  /** Atomic exact-claim reservation. Null means a legacy job with no start consent. */
+  reservePlaybackStart?(claim: SchoolPlaybackClaim, signal: AbortSignal): Promise<PlaybackStartReservation | null>;
+  observePlaybackStartTransportAck?(claim: SchoolPlaybackClaim, attemptId: string, signal: AbortSignal): Promise<void>;
+  finishPlaybackStart?(claim: SchoolPlaybackClaim, attemptId: string, outcome: 'acknowledged' | 'unknown', signal: AbortSignal): Promise<void>;
   stream?: ReturnType<typeof createVideoStreamer>;
   reportFailure?(diagnostic: ReturnType<typeof workerVideoReportDiagnostic>): void;
   reportAcknowledged?(diagnostic: WorkerVideoReportAcknowledgement): void;
@@ -75,9 +82,12 @@ const cleanup = () => new AppError(503, 'PLAYBACK_CLEANUP_FAILED', '영상 실�
 /** School integration only. Runtime/proof factories are supplied by the trusted worker bootstrap. */
 export function createSchoolPlayback<Source, Admission, FinalProof>(dependencies: SchoolPlaybackDependencies<Source, Admission, FinalProof>) {
   const { school, leases, runtime } = dependencies, stream = dependencies.stream ?? createVideoStreamer();
+  if (Boolean(dependencies.reservePlaybackStart) !== Boolean(dependencies.finishPlaybackStart)
+    || Boolean(dependencies.reservePlaybackStart) !== Boolean(dependencies.observePlaybackStartTransportAck)) throw changed();
   type State = { claim: SchoolPlaybackClaim; driver: PreparedSchoolVideo; lease: PlaybackLeaseScope; source: Source;
     lifetime: AbortController; played: boolean; disposed: boolean; cleanupConfirmed: boolean; uncertain: boolean; reporting: boolean;
     callbacks: Set<Promise<unknown>>; runtimePending: boolean; runtimeStopped: boolean; closeSucceeded: boolean; termination?: PlaybackTerminationProof;
+    startInvoked: boolean; startReady: boolean; starting: boolean; startPending?: Promise<void>;
     disposePromise?: Promise<void>; reportPending?: Promise<void>; failure?: unknown; reportFailure?: unknown; ended: boolean; endedReport: boolean };
   const states = new WeakMap<PreparedPlayback, State>();
   const read = (prepared: PreparedPlayback) => { const state = states.get(prepared); if (!state) throw changed(); return state; };
@@ -101,7 +111,7 @@ export function createSchoolPlayback<Source, Admission, FinalProof>(dependencies
     } catch (error) { state.failure ??= error; throw error; }
   };
   const dispose = (state: State): Promise<void> => state.disposePromise ??= (async () => {
-    state.disposed = true; state.uncertain ||= state.reporting; state.lifetime.abort();
+    state.disposed = true; state.uncertain ||= state.reporting || state.starting; state.lifetime.abort();
     let closeFailed = false;
     try { state.driver.close(); state.closeSucceeded = true; } catch { state.uncertain = true; closeFailed = true; }
     // Runtime cleanup and report settlement run concurrently. B has a 7s hard cleanup
@@ -112,7 +122,10 @@ export function createSchoolPlayback<Source, Admission, FinalProof>(dependencies
     const settledProgress = dependencies.flushProgress
       ? boundedWorkerOperation(() => dependencies.flushProgress!(state.claim), { timeoutMs: 500 }).catch(() => {})
       : Promise.resolve();
-    try { await Promise.all([boundedWorkerOperation(() => runtime.dispose(state.source), { timeoutMs: 7_500 }), settledReport, settledProgress]); }
+    const settledStart = state.startPending
+      ? boundedWorkerOperation(() => state.startPending!.catch(() => {}), { timeoutMs: 1_000 }).catch(() => { state.uncertain = true; })
+      : Promise.resolve();
+    try { await Promise.all([boundedWorkerOperation(() => runtime.dispose(state.source), { timeoutMs: 7_500 }), settledReport, settledProgress, settledStart]); }
     catch { state.uncertain = true; throw cleanup(); }
     if (closeFailed) throw cleanup();
     state.runtimeStopped = true;
@@ -120,6 +133,61 @@ export function createSchoolPlayback<Source, Admission, FinalProof>(dependencies
     if (!state.uncertain) await boundedWorkerOperation(signal => leases.release(state.lease, signal), { timeoutMs: 2_000 });
     state.cleanupConfirmed = true;
   })();
+  const beforePlay = (state: State, observation: ManualVideoObservation, signal: AbortSignal): Promise<void> => {
+    if (state.disposed || state.startInvoked || state.reporting || state.lifetime.signal.aborted) return Promise.reject(changed());
+    state.startInvoked = true; state.starting = true;
+    let reservation: PlaybackStartReservation | null = null, reserveEntered = false, acknowledged = false, transportAckObserved = false;
+    const pending = boundedWorkerOperation(current => {
+      const callback = (async () => {
+        const actualPaused = z.object({ positionSeconds: z.literal(0), durationSeconds: z.number().finite().positive().max(14400),
+          playbackRate: z.literal(1), paused: z.literal(true), ended: z.literal(false), seeking: z.literal(false), visible: z.literal(true) }).strict();
+        if (!actualPaused.safeParse(observation).success || Math.abs(observation.durationSeconds - state.driver.durationSeconds) > 1) throw changed();
+        await guard(state, current);
+        reserveEntered = true;
+        reservation = await dependencies.reservePlaybackStart!(state.claim, current);
+        if (reservation === null) { await guard(state, current); state.startReady = true; return; }
+        if (!z.object({ attemptId: z.uuid(), consentId: z.uuid(), expiresAt: z.iso.datetime({ offset: true }) }).strict().safeParse(reservation).success
+          || Date.parse(reservation.expiresAt) <= Date.now() || !state.driver.confirmStart) throw changed();
+        const validate = async () => {
+          // Grant expiry governs the one start transition, not an already acknowledged execution.
+          if (!acknowledged && Date.parse(reservation!.expiresAt) <= Date.now()) throw changed();
+          await guard(state, current);
+        };
+        await validate();
+        const result = await state.driver.confirmStart(Object.freeze({ ...observation }), validate, current, async () => {
+          if (transportAckObserved) throw changed(); transportAckObserved = true;
+          await boundedWorkerOperation(persist => dependencies.observePlaybackStartTransportAck!(state.claim, reservation!.attemptId, persist), { timeoutMs: 5000 });
+        });
+        if (result.transport !== 'acknowledged' || !transportAckObserved) { const error = unknown(); copyPlaybackStartDiagnostic(error, result); throw error; }
+        acknowledged = true;
+        // Preserve the received fact even when cancellation/expiry races its receipt.
+        // Eligibility is checked afterwards; failure never downgrades or resends that ACK.
+        await boundedWorkerOperation(persist => dependencies.finishPlaybackStart!(state.claim, reservation!.attemptId, 'acknowledged', persist), { timeoutMs: 5000 });
+        await validate(); state.startReady = true;
+      })();
+      state.callbacks.add(callback);
+      void callback.then(() => state.callbacks.delete(callback), () => state.callbacks.delete(callback));
+      return callback;
+    }, { signal: AbortSignal.any([signal, state.lifetime.signal]), timeoutMs: 90_000 }).catch(async error => {
+      const knownRefusal = error instanceof AppError && ['PLAYBACK_START_CONSENT_INVALID','PLAYBACK_START_CONSENT_EXPIRED',
+        'PLAYBACK_START_CONSENT_REVOKED','PLAYBACK_AUTHORITY_CHANGED','SCHOOL_SESSION_CHANGED','AUTH_REQUIRED','SCHOOL_AUTH_REQUIRED','PLAYBACK_BUSY'].includes(error.code);
+      // A reservation may have committed despite timeout/connection loss. Never infer permission to send again.
+      state.uncertain ||= reservation !== null || reserveEntered && !knownRefusal;
+      state.failure ??= error;
+      if (reservation && !acknowledged) {
+        try { await boundedWorkerOperation(current => dependencies.finishPlaybackStart!(state.claim, reservation!.attemptId, 'unknown', current), { timeoutMs: 5000 }); }
+        catch { state.uncertain = true; }
+      }
+      if (state.uncertain) {
+        const uncertain = unknown(error); copyPlaybackStartDiagnostic(uncertain, error); state.reportFailure ??= uncertain; throw uncertain;
+      }
+      throw error;
+    }).finally(() => { state.starting = false; });
+    // Include terminal persistence in the drain proof, not just the school callback.
+    state.callbacks.add(pending);
+    void pending.then(() => state.callbacks.delete(pending), () => state.callbacks.delete(pending));
+    state.startPending = pending; return pending;
+  };
   const adapter = {
     async authorizePlayback(context: { userId: string }, target: Target, options: { signal: AbortSignal; validate: () => Promise<void> }): Promise<Admission> {
       return boundedWorkerOperation(async signal => {
@@ -163,8 +231,9 @@ export function createSchoolPlayback<Source, Admission, FinalProof>(dependencies
               // Sampling never waits for persistence, and a display observer cannot change playback.
               try { dependencies.observeProgress?.(claim, Object.freeze({ ...observation })); } catch {}
             },
+            ...(dependencies.reservePlaybackStart ? { beforePlay: (observation: ManualVideoObservation, current: AbortSignal) => beforePlay(state!, observation, current) } : {}),
             report: (event, reportSignal) => {
-              if (!state || state.disposed || state.reporting || lifetime.signal.aborted) return Promise.reject(changed());
+              if (!state || state.disposed || !state.startReady || state.starting || state.reporting || lifetime.signal.aborted) return Promise.reject(changed());
               const owned = state; owned.reporting = true; let enteredSchoolReport = false;
               const pending = boundedWorkerOperation(current => {
                 const callback = (async () => {
@@ -202,14 +271,15 @@ export function createSchoolPlayback<Source, Admission, FinalProof>(dependencies
               owned.reportPending = pending; return pending;
             },
           });
-          state = { claim, driver, lease, source, lifetime, played: false, disposed: false, cleanupConfirmed: false, uncertain: false, reporting: false, ended: false, endedReport: false, callbacks: new Set(), runtimePending: false, runtimeStopped: false, closeSucceeded: false };
+          state = { claim, driver, lease, source, lifetime, played: false, disposed: false, cleanupConfirmed: false, uncertain: false, reporting: false, ended: false, endedReport: false, callbacks: new Set(), runtimePending: false, runtimeStopped: false, closeSucceeded: false,
+            startInvoked: false, startReady: !dependencies.reservePlaybackStart, starting: false };
           await guard(state, bounded); bounded.throwIfAborted();
           const owned = state;
           const prepared = Object.freeze({ alreadyRecognized: false, handle: Object.freeze({
             toJSON: () => ({ kind: 'private-school-playback' }), [inspect.custom]: () => 'SchoolPlayback { private }' }), dispose: () => dispose(owned),
             terminationProof: () => {
               if (!owned.disposed || !owned.lifetime.signal.aborted || !owned.closeSucceeded || !owned.runtimeStopped
-                || owned.runtimePending || owned.callbacks.size > 0) return null;
+                || owned.runtimePending || owned.starting || owned.callbacks.size > 0) return null;
               return owned.termination ??= createPlaybackTerminationProof(owned.claim, { runtimeStopped: true, dispatchFenced: true, callbacksDrained: true });
             } });
           states.set(prepared, owned); return prepared;

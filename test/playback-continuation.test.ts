@@ -177,3 +177,8 @@ test('an unavailable school-auth readiness hint preserves readable queue data wi
   assert.equal(values[0]!.id, f.original.id); assert.equal(values[0]!.status, 'queued'); assert.equal(values[0]!.authWait!.canContinue, false);
   assert.equal(f.original.status, 'queued'); assert.equal(f.counts().writes, 0);
 });
+test('explicit continuation carries exact new consent and hashes its body without changing legacy identity',async()=>{
+ const f=fixture(),consentId=randomUUID(),original=f.store.continueJob!;let received=0;
+ f.store.continueJob=async(owner,id,key,hash,authorization,operation)=>{assert.equal(authorization.startConsentId,consentId);assert.equal(hash,hashToken(JSON.stringify({operation:'continue_playback',originalJobId:id,startConsentId:consentId})));received++;return original(owner,id,key,hash,authorization,operation);};
+ const app=await f.app();try{const r=await app.inject({method:'POST',url:f.url,headers:f.headers(),payload:{startConsentId:consentId}});assert.equal(r.statusCode,202,r.body);assert.equal(received,1);}finally{await app.close();}
+});
