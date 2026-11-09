@@ -48,14 +48,23 @@ export function openSchoolRead(encrypted: string, key: Buffer, scope: SchoolCach
 export class PgSchoolReadCache implements SchoolReadCache {
   constructor(private readonly pool: Pool, private readonly key: Buffer) {}
   async get<T>(scope: SchoolCacheScope): Promise<SchoolCacheEntry<T> | null> {
+    const readScope = { ...scope };
     const { rows: [row] } = await this.pool.query(`UPDATE school_read_cache c SET accessed_at=now()
       FROM school_sessions s WHERE c.user_id=$1 AND c.provider=$2 AND c.generation=$3 AND c.resource_key=$4
       AND c.expires_at>now() AND s.user_id=c.user_id AND s.provider=c.provider AND s.encrypted_state=$5
       AND EXISTS(SELECT 1 FROM sessions a WHERE a.user_id=c.user_id AND a.expires_at>now())
-      RETURNING c.encrypted_payload,c.expires_at`, [scope.owner, scope.provider, scope.generation, scope.resource, scope.encryptedSession]);
+      RETURNING c.encrypted_payload,c.expires_at`, [readScope.owner, readScope.provider, readScope.generation, readScope.resource, readScope.encryptedSession]);
     if (!row) return null;
-    try { return { value: openSchoolRead(row.encrypted_payload, this.key, scope) as T, expiresAt: new Date(row.expires_at).getTime() }; }
-    catch { await this.delete(scope.owner, scope.provider, scope.resource); return null; }
+    try { return { value: openSchoolRead(row.encrypted_payload, this.key, readScope) as T, expiresAt: new Date(row.expires_at).getTime() }; }
+    catch {
+      // A failed read may finish after a new login or a replacement of this same row.
+      // Unlike explicit invalidation, repair only removes the exact ciphertext read.
+      await this.pool.query(`DELETE FROM school_read_cache c USING school_sessions s
+        WHERE c.user_id=$1 AND c.provider=$2 AND c.generation=$3 AND c.resource_key=$4 AND c.encrypted_payload=$6
+        AND s.user_id=c.user_id AND s.provider=c.provider AND s.encrypted_state=$5`,
+      [readScope.owner, readScope.provider, readScope.generation, readScope.resource, readScope.encryptedSession, row.encrypted_payload]);
+      return null;
+    }
   }
   async put(scope: SchoolCacheScope, value: unknown, ttlMs: number): Promise<boolean> {
     if (!Number.isFinite(ttlMs) || ttlMs <= 0 || ttlMs > MAX_TTL || !scope.resource || scope.resource.length > 512) return false;

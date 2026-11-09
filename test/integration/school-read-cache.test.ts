@@ -18,6 +18,27 @@ describe('encrypted school JSON cache in real PostgreSQL', { skip: !databaseUrl 
     const scope: SchoolCacheScope = { owner: session.user.id, provider: 'ssu', generation: randomUUID(), resource: 'course:synthetic', encryptedSession };
     return { session, scope, subject };
   }
+  async function pauseCorruptRead(scope: SchoolCacheScope) {
+    await cache.put(scope, { stale: true }, 60_000);
+    await pool.query('UPDATE school_read_cache SET encrypted_payload=$5 WHERE user_id=$1 AND provider=$2 AND generation=$3 AND resource_key=$4',
+      [scope.owner, scope.provider, scope.generation, scope.resource, 'synthetic-corrupt-ciphertext']);
+    let observed!: () => void, resume!: () => void;
+    const selected = new Promise<void>(resolve => { observed = resolve; });
+    const resumed = new Promise<void>(resolve => { resume = resolve; });
+    const pausedPool = { query: async (sql: string, values: unknown[]) => {
+      const result = await pool.query(sql, values);
+      if (sql.startsWith('UPDATE school_read_cache c SET accessed_at=now()')) {
+        // The real SELECT/UPDATE has committed and returned its old ciphertext.
+        // Hold only delivery to the caller; other real connections can now commit.
+        assert.equal(result.rows.length, 1); observed(); await resumed;
+      }
+      return result;
+    } } as unknown as Pool;
+    const reading = new PgSchoolReadCache(pausedPool, key).get(scope);
+    void reading.catch(() => {});
+    await Promise.race([selected, reading.then(() => assert.fail('corrupt read must reach the controlled handoff'))]);
+    return { reading, resume };
+  }
   before(async () => { pool = new Pool({ connectionString: databaseUrl, max: 5 }); await migrate(pool); await migrate(pool); store = new PgStore(pool); cache = new PgSchoolReadCache(pool, key); });
   after(async () => { if (pool) { await pool.query('DELETE FROM users WHERE id=ANY($1::uuid[])', [owners]); await pool.end(); } });
   it('persists ciphertext across instances and isolates owner, generation, resource and current session', async () => {
@@ -41,6 +62,56 @@ describe('encrypted school JSON cache in real PostgreSQL', { skip: !databaseUrl 
     await pool.query("UPDATE school_read_cache SET resource_key='copied' WHERE user_id=$1", [a.scope.owner]);
     assert.equal(await cache.get({ ...a.scope, resource: 'copied' }), null);
     assert.equal((await pool.query('SELECT 1 FROM school_read_cache WHERE user_id=$1', [a.scope.owner])).rowCount, 0);
+  });
+  it('unchanged corrupt-row cleanup removes only the exact owned resource', async () => {
+    const a = await user(), b = await user(), other = { ...a.scope, resource: 'course:other' };
+    await cache.put(other, { kept: 'resource' }, 60_000);
+    await cache.put(b.scope, { kept: 'owner' }, 60_000);
+    const paused = await pauseCorruptRead(a.scope);
+    try {
+      paused.resume(); assert.equal(await paused.reading, null);
+      assert.equal((await pool.query('SELECT 1 FROM school_read_cache WHERE user_id=$1 AND provider=$2 AND generation=$3 AND resource_key=$4',
+        [a.scope.owner, a.scope.provider, a.scope.generation, a.scope.resource])).rowCount, 0);
+      assert.deepEqual((await cache.get(other))?.value, { kept: 'resource' });
+      assert.deepEqual((await cache.get(b.scope))?.value, { kept: 'owner' });
+    } finally { paused.resume(); await paused.reading.catch(() => {}); }
+  });
+  it('late corrupt-row cleanup preserves a new generation committed by another connection', async () => {
+    const a = await user(), paused = await pauseCorruptRead(a.scope);
+    try {
+      const encryptedSession = `synthetic-new-generation-${randomUUID()}`;
+      await store.issueVerifiedSession({ provider: 'cache-integration', subject: a.subject }, 3600,
+        { provider: 'ssu', seal: () => encryptedSession });
+      const current = { ...a.scope, generation: randomUUID(), encryptedSession };
+      assert.equal(await cache.put(current, { current: 'generation' }, 60_000), true);
+      const before = (await pool.query('SELECT * FROM school_read_cache WHERE user_id=$1', [a.scope.owner])).rows;
+      paused.resume(); assert.equal(await paused.reading, null);
+      assert.deepEqual((await pool.query('SELECT * FROM school_read_cache WHERE user_id=$1', [a.scope.owner])).rows, before);
+      assert.deepEqual((await cache.get(current))?.value, { current: 'generation' });
+    } finally { paused.resume(); await paused.reading.catch(() => {}); }
+  });
+  it('late corrupt-row cleanup preserves replacement ciphertext in the same generation and school session', async () => {
+    const a = await user(), paused = await pauseCorruptRead(a.scope);
+    try {
+      assert.equal(await cache.put(a.scope, { current: 'same-generation' }, 60_000), true);
+      const before = (await pool.query('SELECT * FROM school_read_cache WHERE user_id=$1', [a.scope.owner])).rows;
+      paused.resume(); assert.equal(await paused.reading, null);
+      assert.deepEqual((await pool.query('SELECT * FROM school_read_cache WHERE user_id=$1', [a.scope.owner])).rows, before);
+      assert.deepEqual((await cache.get(a.scope))?.value, { current: 'same-generation' });
+    } finally { paused.resume(); await paused.reading.catch(() => {}); }
+  });
+  it('late corrupt-row cleanup does not remove even its old ciphertext after the current school seal changes', async () => {
+    const a = await user(), paused = await pauseCorruptRead(a.scope);
+    try {
+      await pool.query('UPDATE school_sessions SET encrypted_state=$3 WHERE user_id=$1 AND provider=$2',
+        [a.scope.owner, a.scope.provider, `synthetic-new-seal-${randomUUID()}`]);
+      const before = (await pool.query('SELECT * FROM school_read_cache WHERE user_id=$1', [a.scope.owner])).rows;
+      paused.resume(); assert.equal(await paused.reading, null);
+      assert.deepEqual((await pool.query('SELECT * FROM school_read_cache WHERE user_id=$1', [a.scope.owner])).rows, before);
+      // Explicit owner invalidation remains intentionally broader than repair.
+      await cache.delete(a.scope.owner, a.scope.provider, a.scope.resource);
+      assert.equal((await pool.query('SELECT 1 FROM school_read_cache WHERE user_id=$1', [a.scope.owner])).rowCount, 0);
+    } finally { paused.resume(); await paused.reading.catch(() => {}); }
   });
   it('new login and logout delete cached rows while late old writes are rejected', async () => {
     const a = await user(); await cache.put(a.scope, { private: true }, 60_000);
