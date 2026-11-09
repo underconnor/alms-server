@@ -191,3 +191,19 @@ test('real authenticated discovery and me responses validate; custom UI version 
     assert.equal(validators.get('UxEvent')!({ ...value, client_id: 'untrusted' }), false);
   } finally { await app.close(); }
 });
+
+test('job progress is additive, nullable and separates real media observation from report ACK', () => {
+  const progress = { observedAt: '2026-11-09T00:00:00.000Z', positionSeconds: 25, durationSeconds: 100,
+    percent: 25, paused: false, ended: false, lastReport: null };
+  matches('PlaybackProgress', progress);
+  matches('PlaybackProgress', { ...progress, lastReport: { event: 'update', acknowledgedAt: '2026-11-09T00:00:01.000Z' } });
+  const job = { id: '00000000-0000-4000-8000-000000000001', courseId: '10', lectureId: '20', status: 'running',
+    scheduledFor: progress.observedAt, createdAt: progress.observedAt, updatedAt: progress.observedAt,
+    schoolResult: null, errorCode: null, executionOutcome: null };
+  for (const item of [job, { ...job, playbackProgress: null }, { ...job, playbackProgress: progress }]) matches('Job', item);
+  const validate = validators.get('PlaybackProgress')!;
+  for (const invalid of [{ ...progress, percent: 101 }, { ...progress, positionSeconds: -1 }, { ...progress, durationSeconds: 0 },
+    { ...progress, lastReport: { event: 'unknown', acknowledgedAt: progress.observedAt } },
+    { ...progress, executionTokenHash: 'private' }, { ...progress, lastReport: { event: 'ended', acknowledgedAt: progress.observedAt, userId: 'private' } }])
+    assert.equal(validate(invalid), false);
+});

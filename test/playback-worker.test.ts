@@ -532,3 +532,27 @@ test('an invalid prepared proof cannot pass periodic validation and start playba
   }));
   assert.equal(plays,0);assert.equal(f.current()?.status,'needs_verification');assert.equal(f.current()?.schoolResult,null);
 });
+
+test('only proven preparation authentication/generation failures preserve untouched queue intents', async () => {
+  for (const code of ['SCHOOL_AUTH_REQUIRED','SCHOOL_SESSION_CHANGED','PLAYBACK_AUTHORITY_CHANGED'] as const) {
+    const f = fixture(), transition = f.store.transitionJob.bind(f.store), flags: JobTransitionOptions[] = [];
+    f.store.transitionJob = async (...args) => { flags.push(args[5] ?? {}); return transition(...args); };
+    await executeJob('synthetic-job', f.store, provider({ preparePlayback: async () => { throw new AppError(code === 'SCHOOL_AUTH_REQUIRED' ? 401 : 409, code, 'fixed'); } }));
+    const expected = code === 'SCHOOL_AUTH_REQUIRED' ? 'school_auth_required' : 'school_session_changed';
+    assert.equal(flags.length, 1); assert.equal(flags[0]!.authenticationWaitReason, expected); assert.equal(flags[0]!.outcome, 'not_started');
+    assert.equal(f.current()?.executionOutcome, 'not_started');
+    assert.equal(f.current()?.errorCode, code === 'SCHOOL_AUTH_REQUIRED' ? 'AUTH_REQUIRED' : code);
+  }
+});
+test('a report/cleanup uncertainty never marks the current execution or its queue as proven-unstarted', async () => {
+  for (const mode of ['report','started-auth','cleanup'] as const) {
+    const f = fixture(), transition = f.store.transitionJob.bind(f.store), flags: JobTransitionOptions[] = [];
+    f.store.transitionJob = async (...args) => { flags.push(args[5] ?? {}); return transition(...args); };
+    await executeJob('synthetic-job', f.store, provider({
+      preparePlayback: async () => prepared(mode === 'cleanup' ? { dispose: async () => { throw new Error('synthetic uncertainty'); } } : {}),
+      play: async () => { throw new AppError(mode === 'started-auth' ? 401 : 503, mode === 'started-auth' ? 'SCHOOL_AUTH_REQUIRED' : 'PLAYBACK_REPORT_UNKNOWN', 'fixed'); },
+    }));
+    assert.ok(flags.length > 0); assert.ok(flags.every(options => options.authenticationWaitReason === undefined));
+    assert.equal(f.current()?.executionOutcome, 'interrupted');
+  }
+});

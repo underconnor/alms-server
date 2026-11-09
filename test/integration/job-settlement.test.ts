@@ -42,10 +42,13 @@ describe('explicit interrupted job settlement in isolated PostgreSQL', { skip: !
   async function counts(jobId: string) { return (await pool.query(`SELECT
     (SELECT count(*)::int FROM playback_execution_terminations WHERE job_id=$1) AS terminations,
     (SELECT count(*)::int FROM playback_job_settlements WHERE job_id=$1) AS settlements`, [jobId])).rows[0]; }
-  async function waitForLock(contains: string) {
+  async function waitForLock(expected: string | { blockerPid: number }) {
     const until = Date.now() + 2000;
     while (Date.now() < until) {
-      if ((await pool.query("SELECT 1 FROM pg_stat_activity WHERE application_name='alms-qa-v41-settlement' AND wait_event_type='Lock' AND query LIKE $1", ['%' + contains + '%'])).rowCount) return;
+      const waiting = typeof expected === 'string'
+        ? await pool.query("SELECT 1 FROM pg_stat_activity WHERE application_name='alms-qa-v41-settlement' AND wait_event_type='Lock' AND query LIKE $1", ['%' + expected + '%'])
+        : await pool.query("SELECT 1 FROM pg_stat_activity WHERE application_name='alms-qa-v41-settlement' AND wait_event_type='Lock' AND $1::int=ANY(pg_blocking_pids(pid))", [expected.blockerPid]);
+      if (waiting.rowCount) return;
       await delay(5);
     }
     assert.fail('Expected isolated settlement lock wait');
@@ -162,8 +165,17 @@ describe('explicit interrupted job settlement in isolated PostgreSQL', { skip: !
     const locker = await pool.connect(); let pending: Promise<unknown> | undefined;
     try {
       await locker.query('BEGIN'); await locker.query('SELECT id FROM playback_jobs WHERE id=$1 FOR UPDATE', [f.job.id]);
-      pending = f.settle().then(() => null, error => error); await waitForLock('AS recovery_version');
-      await delay(1050); await locker.query('COMMIT'); assert.equal((await pending as any)?.code, 'AUTH_REQUIRED');
+      const blockerPid = (await locker.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+      // Query text in pg_stat_activity is truncated; bind the observed wait to
+      // this exact locker instead of a projection alias beyond that limit.
+      pending = f.settle().then(() => null, error => error); await waitForLock({ blockerPid });
+      const until = Date.now() + 2000; let expired = false;
+      while (!expired && Date.now() < until) {
+        expired = (await pool.query('SELECT expires_at<=clock_timestamp() AS expired FROM sessions WHERE token_hash=$1', [f.authorization.tokenHash])).rows[0]?.expired === true;
+        if (!expired) await delay(5);
+      }
+      assert.equal(expired, true, 'Database clock must pass session expiry while settlement is blocked');
+      await locker.query('COMMIT'); assert.equal((await pending as any)?.code, 'AUTH_REQUIRED');
       assert.deepEqual(await counts(f.job.id), { terminations: 1, settlements: 0 });
     } finally { await locker.query('ROLLBACK'); locker.release(); await pending; }
   });

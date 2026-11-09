@@ -1,3 +1,4 @@
+import { createPgSchoolSessionLockRunner } from './pg-school-session-lock.js';
 import { PlaybackStartService } from './playback-start-service.js';
 import { createPlaybackStartSchool } from './playback-start-school.js';
 import { createJobResultCache } from './job-result-cache.js';
@@ -24,7 +25,9 @@ import { createMcpReadTools } from './mcp-tools/index.js';
 import { registerMcpRoutes } from './mcp-routes.js';
 const config = loadConfig();
 const pool = new Pool({ connectionString: config.databaseUrl,max: 10,connectionTimeoutMillis: 5000,statement_timeout:5000,query_timeout:5000 });
-const store = new PgStore(pool);
+const schoolSessionPool = new Pool({ connectionString: config.databaseUrl, max: 2, connectionTimeoutMillis: 5000, statement_timeout: 5000, query_timeout: 5000, application_name: 'alms-school-session-coordinator' });
+schoolSessionPool.on('error', () => process.stderr.write('{"code":"SCHOOL_SESSION_POOL_ERROR"}\n'));
+const store = new PgStore(pool, { runWithSchoolSessionLock: createPgSchoolSessionLockRunner(schoolSessionPool) });
 const schoolCache = config.sessionEncryptionKey ? new PgSchoolReadCache(pool, config.sessionEncryptionKey) : undefined;
 const reader = process.env.SSU_READ_ENABLED === 'true' && config.sessionEncryptionKey
   ? createLearningxReader(store, config.sessionEncryptionKey, undefined, undefined, schoolCache, undefined, undefined, createSyllabusRuntime()) : undefined;
@@ -60,7 +63,10 @@ const closeResources = createApiResourceCloser([
   () => submissions?.close() ?? Promise.resolve(),
   () => manualVideo?.close() ?? Promise.resolve(),
   () => playbackStart?.close() ?? Promise.resolve(),
-], () => pool.end());
+], async () => {
+  const results = await Promise.allSettled([pool.end(), schoolSessionPool.end()]);
+  if (results.some(result => result.status === 'rejected')) throw new Error('API_POOL_CLOSE_FAILED');
+});
 app.addHook('onClose',async () => { if(cleanupTimer)clearInterval(cleanupTimer);await closeResources(); });
 for (const signal of ['SIGINT','SIGTERM'] as const) process.once(signal,() => { submissions?.stop();manualVideo?.beginShutdown();playbackStart?.beginShutdown();setTimeout(()=>process.exit(1),apiShutdownHardLimitMs).unref();void app.close().catch(()=>process.exit(1)); });
 await app.listen({ host: config.host,port: config.port });

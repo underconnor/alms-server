@@ -16,6 +16,28 @@ test('worker accepted generation is checked before any school request', async ()
   await assert.rejects(f.sessions.prepare(context, noop, signal(), randomUUID()), { code: 'SCHOOL_SESSION_CHANGED' });
   assert.equal(f.counts().requests, 0); assert.equal(f.counts().reports, 0);
 });
+test('school reads and jar CAS share the injected cross-process owner lock', async () => {
+  const f = await fixture(); let held = false, calls = 0, writes = 0;
+  const replace = f.store.replaceEncryptedSchoolSession;
+  f.store.replaceEncryptedSchoolSession = async (...args) => { assert.equal(held, true); writes++; return replace(...args); };
+  Object.assign(f.store, { runWithSchoolSessionLock: async <T>(owner: string, run: (signal: AbortSignal) => Promise<T>, supplied?: AbortSignal) => {
+    assert.equal(owner, context.owner); assert.equal(held, false); held = true; calls++;
+    try { return await run(supplied ?? signal()); } finally { held = false; }
+  } });
+  f.onReturn(async () => { const path = f.paths.at(-1)!; if (!path.startsWith('/em/') && !path.endsWith('/content.php')) assert.equal(held, true); });
+  const driver = await f.sessions.prepare(context, noop, signal()); driver.observe(observation);
+  await driver.report('playing', noop, signal()); driver.close();
+  assert.equal(calls, 2); assert.equal(writes, 2); assert.equal(f.counts().reports, 1); assert.equal(held, false);
+});
+test('losing the cross-process owner lock aborts school preparation before jar persistence or a report', async () => {
+  const f = await fixture(), lost = new AbortController(); let writes = 0;
+  const replace = f.store.replaceEncryptedSchoolSession;
+  f.store.replaceEncryptedSchoolSession = async (...args) => { writes++; return replace(...args); };
+  Object.assign(f.store, { runWithSchoolSessionLock: async <T>(_owner: string, run: (signal: AbortSignal) => Promise<T>) => run(lost.signal) });
+  f.onReturn(async () => { lost.abort(new AppError(503, 'SCHOOL_SESSION_LOCK_LOST', 'fixed')); });
+  await assert.rejects(f.sessions.prepare(context, noop, signal()), { code: 'SCHOOL_SESSION_LOCK_LOST', statusCode: 503 });
+  assert.equal(writes, 0); assert.equal(f.counts().reports, 0);
+});
 test('closing reporting preserves prepared-bound identity and fresh result reads', async () => {
   const f = await fixture(), driver = await f.sessions.prepare(context, noop, signal(), f.generation());
   driver.close(); await driver.validate(signal());

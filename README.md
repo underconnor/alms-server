@@ -106,3 +106,9 @@ npm run contract:generate
 ## 라이선스
 
 ALMS Server는 [MIT 라이선스](LICENSE)를 적용합니다. 비공개 프로젝트와 상용 서비스에서도 사용할 수 있으며 배포하는 사본에는 라이선스의 저작권 표시와 허가 문구를 유지해야 합니다. 외부 코드의 고지는 [NOTICE](NOTICE)와 [라이선스 파일](LICENSES/)을 함께 확인합니다. 이 라이선스는 학교 데이터·강의자료에 대한 권리를 부여하지 않습니다.
+
+## 수강 진행 상태와 학교 인증
+
+API와 worker의 학교 쿠키 갱신은 사용자별 PostgreSQL advisory lock으로 조정합니다. 대기 중인 잠금이 검증·heartbeat 연결을 점유하지 않도록 각 역할에 최대2개의 별도 coordinator 연결을 사용합니다. 실제 학교 인증 만료, 학교 세대 변경(409), 잠금 대기/유실(503)을 구분하며 불명확한 학교 보고를 재전송하지 않습니다.
+
+Migration016의 별도 playback_job_progress 테이블에 실제 미디어 관측과 학교 보고 ACK를 저장합니다. Job의 선택적 playbackProgress는 재생 위치·전체 길이·관측 시각·비율과 마지막 ACK를 제공하며 최종 schoolResult·출석 인정과는 다릅니다. 실행 claim이 끝난 뒤의 늦은 관측은 거절합니다. 기존 작업·학교 결과는 다시 쓰지 않으며 서버 시작 전에 현재 migration을 적용해야 합니다. 최신 필드 정의는 [HTTP 계약](docs/http-contract.md)과 [OpenAPI](docs/openapi.json)를 따릅니다.

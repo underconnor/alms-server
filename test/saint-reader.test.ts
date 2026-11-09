@@ -116,3 +116,11 @@ test('combined dashboard exposes successfully read school tasks and preserves ti
   assert.equal(partial.availability.tasks, 'unavailable'); assert.equal(partial.availability.courses, 'available');
   assert.equal(partial.availability.timetable, 'available'); assert.deepEqual(partial.upcomingTasks, []);
 });
+
+test('Saint prevents jar writes when the shared coordinator is lost',async()=>{
+ const f=fixture(),before=f.states.get('a'),life=new AbortController();let writes=0;
+ const failure=new AppError(503,'SCHOOL_SESSION_LOCK_LOST','synthetic coordinator loss');
+ const store={...f.store,runWithSchoolSessionLock:async<T>(_owner:string,run:(signal:AbortSignal)=>Promise<T>)=>run(life.signal),replaceEncryptedSchoolSession:async()=>{writes++;return false;}};
+ const reader=createSaintReader(store,f.key,async(_s,signal)=>{assert.equal(signal,life.signal);life.abort(failure);return{timetable,jar:{}};});
+ await assert.rejects(reader.timetable('a'),e=>e===failure);assert.equal(writes,0);assert.equal(f.states.get('a'),before);
+});

@@ -10,6 +10,9 @@ import { inspectPlaybackTerminationProof, type PlaybackTerminationProof } from '
 import { playbackAccountLock, playbackAccountLockKey } from './playback-lock.js';
 import { publicVerifiedSchoolResult } from './job-verification.js';
 import type { LoginClientContext } from './frontend-clients.js';
+import { publicPlaybackProgress, validPlaybackObservation, validPlaybackReportAck, type PlaybackObservation, type PlaybackReportAck } from './playback-progress.js';
+import type { SchoolSessionLockRunner } from './school-session-lock.js';
+import type { AuthenticationWaitReason } from './playback-auth-wait.js';
 
 const iso = (value: Date | string): string => new Date(value).toISOString();
 type Row = Record<string, any>;
@@ -17,6 +20,9 @@ const userFrom = (r: Row): User => ({ id: r.user_id ?? r.id, displayName: r.disp
 const todoFrom = (r: Row): Todo => ({ id: r.id, title: r.title, completed: r.completed, dueAt: r.due_at ? iso(r.due_at) : null, createdAt: iso(r.created_at), updatedAt: iso(r.updated_at) });
 const completionFrom = (r: Row): PersonalCompletion => ({ courseId: r.course_id, activityId: r.activity_id, completed: r.completed, updatedAt: iso(r.updated_at) });
 const jobFrom = (r: Row): Job => ({ id: r.id, userId: r.user_id, courseId: r.course_id, lectureId: r.lecture_id, status: r.status, scheduledFor: iso(r.scheduled_for), createdAt: iso(r.created_at), updatedAt: iso(r.updated_at), schoolResult: r.school_result, errorCode: r.error_code, idempotencyKey: r.idempotency_key, requestHash: r.request_hash, acceptedGeneration: r.accepted_generation ?? null, executionTokenHash: r.execution_token_hash ?? null, executionOutcome: r.execution_outcome ?? null,
+  playbackProgress: publicPlaybackProgress(r.playback_observation, r.playback_report_ack),
+  authenticationContinuationEligible: r.auth_wait_eligible === true,
+  authWait: r.auth_wait_since && (r.auth_wait_eligible === true || r.continued_as_job_id) ? { waitingSince: iso(r.auth_wait_since), reason: r.auth_wait_reason, canContinue: false, continuedAsJobId: r.continued_as_job_id ?? null } : null,
   lastExecutionTokenHash: r.last_execution_token_hash ?? null, settledAt: r.settled_at ? iso(r.settled_at) : null,
   ...(r.recovery_reason ? { settlement: r.settlement_result ? { settledAt: iso(r.settled_at), schoolResult: r.settlement_result } : null,
     recovery: { eligible: r.recovery_reason === 'eligible', reason: r.recovery_reason, version: r.recovery_version ?? iso(r.updated_at) } } : {}) });
@@ -24,7 +30,9 @@ export const hashToken = (value: string) => createHash('sha256').update(value).d
 
 export interface NewJobInput { courseId: string; lectureId: string; scheduledFor: string; idempotencyKey: string; requestHash: string }
 export interface JobAdmissionAuthorization { admission: PlaybackAdmission; almsTokenHash: string }
-export interface JobTransitionOptions { outcome?: ExecutionOutcome | null; authority?: PlaybackFinalProof; terminationProof?: PlaybackTerminationProof }
+export interface JobTransitionOptions { outcome?: ExecutionOutcome | null; authority?: PlaybackFinalProof; terminationProof?: PlaybackTerminationProof; authenticationWaitReason?: AuthenticationWaitReason }
+export interface JobContinuationAuthorization extends JobAdmissionAuthorization { csrfToken: string; clientId: string | null }
+export interface JobContinuationResult { originalJob: Job; job: Job; continued: true }
 export interface JobSettlementAuthorization { admission: PlaybackAdmission; tokenHash: string; csrfToken: string; schoolResult: SchoolResult }
 export interface CompletionAuthorization { tokenHash: string; csrfToken: string }
 export interface AuthenticatedSchoolSessionSnapshot { almsSessionValid: boolean; encryptedSchoolSession: string | null }
@@ -32,7 +40,20 @@ export interface FrontendAuthCodeInput { codeHash: string; clientId: string; red
 const claimValues = (claim: WorkerClaim) => [claim.jobId, claim.userId, claim.courseId, claim.lectureId, claim.acceptedGeneration, claim.executionTokenHash];
 const claimWhere = 'id=$1 AND user_id=$2 AND course_id=$3 AND lecture_id=$4 AND accepted_generation=$5 AND execution_token_hash=$6';
 const authorityChanged = () => new AppError(409, 'PLAYBACK_AUTHORITY_CHANGED', '학교 인증이나 작업 상태가 바뀌었습니다. 다시 확인해 주세요.');
+const continuationEligible = `auth_wait.job_id IS NOT NULL AND auth_wait.continued_job_id IS NULL
+    AND auth_wait.original_status=job.status AND auth_wait.original_error_code IS NOT DISTINCT FROM job.error_code
+    AND job.execution_token_hash IS NULL AND job.settled_at IS NULL AND job.school_result IS NULL
+    AND EXISTS(SELECT 1 FROM playback_jobs cause WHERE cause.id=auth_wait.blocked_by_job_id AND cause.user_id=job.user_id AND cause.accepted_generation=job.accepted_generation)
+    AND NOT EXISTS(SELECT 1 FROM playback_job_progress observed WHERE observed.job_id=job.id)
+    AND NOT EXISTS(SELECT 1 FROM playback_execution_terminations ended WHERE ended.job_id=job.id)
+    AND NOT EXISTS(SELECT 1 FROM playback_job_settlements settled WHERE settled.job_id=job.id)
+    AND ((job.status IN ('queued','scheduled') AND job.last_execution_token_hash IS NULL AND job.heartbeat_at IS NULL)
+      OR (job.id=auth_wait.blocked_by_job_id AND job.status IN ('needs_reauthentication','needs_verification')
+        AND job.execution_outcome='not_started' AND job.last_execution_token_hash IS NOT NULL))`;
 const jobRecoverySelect = `SELECT job.*, settlement.school_result AS settlement_result,
+  auth_wait.waiting_since AS auth_wait_since, auth_wait.reason AS auth_wait_reason, auth_wait.continued_job_id AS continued_as_job_id,
+  (${continuationEligible}) AS auth_wait_eligible,
+  progress.observation AS playback_observation, progress.report_ack AS playback_report_ack,
   to_char(job.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS recovery_version,
   CASE WHEN job.settled_at IS NOT NULL THEN 'already_settled'
     WHEN job.status<>'needs_verification' OR job.execution_outcome IS DISTINCT FROM 'interrupted' THEN 'not_interrupted'
@@ -45,12 +66,17 @@ const jobRecoverySelect = `SELECT job.*, settlement.school_result AS settlement_
     WHEN EXISTS(SELECT 1 FROM playback_execution_leases lease WHERE lease.user_id=job.user_id
       AND lease.expires_at>clock_timestamp()) THEN 'lease_active'
     ELSE 'eligible' END AS recovery_reason
-  FROM playback_jobs job LEFT JOIN playback_job_settlements settlement ON settlement.job_id=job.id`;
+  FROM playback_jobs job LEFT JOIN playback_job_settlements settlement ON settlement.job_id=job.id
+  LEFT JOIN playback_auth_waits auth_wait ON auth_wait.job_id=job.id
+  LEFT JOIN playback_job_progress progress ON progress.job_id=job.id
+    AND progress.execution_token_hash=COALESCE(job.execution_token_hash,job.last_execution_token_hash)`;
 
 export interface Store {
+  runWithSchoolSessionLock?: SchoolSessionLockRunner;
   analytics: AnalyticsRepository;
   health(): Promise<void>;
   getSession(tokenHash: string): Promise<Session | null>;
+  getEncryptedSchoolSession(userId: string, provider: string): Promise<string | null>;
   getAuthenticatedSchoolSession(userId: string, provider: string, tokenHash: string): Promise<AuthenticatedSchoolSessionSnapshot>;
   createLoginAttempt(stateHash: string,bindingHash: string,context?: LoginClientContext): Promise<void>;
   getLoginClientContext?(stateHash: string): Promise<LoginClientContext | null>;
@@ -72,6 +98,8 @@ export interface Store {
   getJob(userId: string, id: string): Promise<Job | null>;
   findJobRequest(userId: string, idempotencyKey: string, requestHash: string, operation?: WorkerOperation): Promise<Job | null>;
   createJob(userId: string, input: NewJobInput, authorization: JobAdmissionAuthorization, operation?: WorkerOperation): Promise<Job>;
+  findJobContinuation?(userId: string, id: string, idempotencyKey: string, requestHash: string, authorization: Pick<JobContinuationAuthorization, 'almsTokenHash' | 'csrfToken' | 'clientId'>, operation?: WorkerOperation): Promise<JobContinuationResult | null>;
+  continueJob?(userId: string, id: string, idempotencyKey: string, requestHash: string, authorization: JobContinuationAuthorization, operation?: WorkerOperation): Promise<JobContinuationResult>;
   cancelJob(userId: string, id: string): Promise<Job>;
   settleJob?(userId: string, id: string, expectedUpdatedAt: string, authorization: JobSettlementAuthorization, operation?: WorkerOperation): Promise<Job>;
   claimJob(id: string, operation?: WorkerOperation): Promise<Job | null>;
@@ -84,7 +112,10 @@ export interface Store {
 
 export class PgStore implements Store {
   readonly analytics: PgAnalyticsStore;
-  constructor(public pool: Pool) { this.analytics = new PgAnalyticsStore(pool); }
+  readonly runWithSchoolSessionLock?: SchoolSessionLockRunner;
+  constructor(public pool: Pool, options: { runWithSchoolSessionLock?: SchoolSessionLockRunner } = {}) {
+    this.analytics = new PgAnalyticsStore(pool); this.runWithSchoolSessionLock = options.runWithSchoolSessionLock;
+  }
   async query<T extends QueryResultRow = Row>(sql: string, params: unknown[] = []) { return this.pool.query<T>(sql, params); }
   async transaction<T>(run: (client: PoolClient) => Promise<T>): Promise<T> {
     const c = await this.pool.connect();
@@ -93,8 +124,8 @@ export class PgStore implements Store {
     finally { c.release(); }
   }
   async health() {
-    const result = await this.query("SELECT 1 FROM schema_migrations WHERE name IN ('011-playback-job-settlement.sql','012-frontend-clients.sql','013-analytics-frontend-client.sql','014-assignment-operation-recovery.sql')");
-    if (result.rowCount !== 4) throw new Error('Database migrations are pending');
+    const result = await this.query("SELECT 1 FROM schema_migrations WHERE name IN ('011-playback-job-settlement.sql','012-frontend-clients.sql','013-analytics-frontend-client.sql','014-assignment-operation-recovery.sql','016-playback-job-progress.sql','017-playback-auth-wait.sql')");
+    if (result.rowCount !== 6) throw new Error('Database migrations are pending');
   }
   async getSession(tokenHash: string): Promise<Session | null> {
     const { rows: [r] } = await this.query(`SELECT s.*,u.display_name,u.analytics_id,u.analytics_enabled FROM sessions s JOIN users u ON u.id=s.user_id WHERE token_hash=$1 AND expires_at>now()`, [tokenHash]);
@@ -275,6 +306,92 @@ export class PgStore implements Store {
       throw error;
     }
   }
+  private async continuationSession(query: WorkerQuery, userId: string, authorization: Pick<JobContinuationAuthorization, 'almsTokenHash' | 'csrfToken' | 'clientId'>) {
+    const result = await query(`SELECT token_hash FROM sessions WHERE user_id=$1 AND token_hash=$2 AND csrf_token=$3
+      AND client_id IS NOT DISTINCT FROM $4::text AND expires_at>clock_timestamp() FOR SHARE`,
+      [userId, authorization.almsTokenHash, authorization.csrfToken, authorization.clientId]);
+    if (!result.rowCount) throw new AppError(401, 'AUTH_REQUIRED', '다시 로그인해 주세요.');
+  }
+  private async continuationResult(query: WorkerQuery, userId: string, id: string, childId: string): Promise<JobContinuationResult> {
+    const { rows } = await query<Row>(`${jobRecoverySelect} WHERE job.user_id=$1 AND job.id=ANY($2::uuid[])`, [userId, [id, childId]]);
+    const original = rows.find(row => row.id === id), child = rows.find(row => row.id === childId);
+    if (!original || !child || original.continued_as_job_id !== child.id || original.course_id !== child.course_id || original.lecture_id !== child.lecture_id)
+      throw authorityChanged();
+    return { originalJob: jobFrom(original), job: jobFrom(child), continued: true };
+  }
+  /** Exact-key readback remains authenticated after the child has run or completed. */
+  async findJobContinuation(userId: string, id: string, idempotencyKey: string, requestHash: string,
+    authorization: Pick<JobContinuationAuthorization, 'almsTokenHash' | 'csrfToken' | 'clientId'>, operation: WorkerOperation = { timeoutMs: 5000 }): Promise<JobContinuationResult | null> {
+    return this.workerTransaction(async query => {
+      await this.continuationSession(query, userId, authorization);
+      const { rows: [existing] } = await query<Row>('SELECT id,request_hash FROM playback_jobs WHERE user_id=$1 AND idempotency_key=$2', [userId, idempotencyKey]);
+      if (!existing) return null;
+      if (existing.request_hash !== requestHash) throw new AppError(409, 'IDEMPOTENCY_CONFLICT', '같은 요청 키에 다른 작업이 있습니다.');
+      const relation = await query('SELECT job_id FROM playback_auth_waits WHERE job_id=$1 AND continued_job_id=$2', [id, existing.id]);
+      if (!relation.rowCount) throw new AppError(409, 'IDEMPOTENCY_CONFLICT', '같은 요청 키의 작업 관계를 확인할 수 없습니다.');
+      return this.continuationResult(query, userId, id, existing.id);
+    }, operation);
+  }
+  /** Fresh admission and retirement commit together. The old generation is never rebound. */
+  async continueJob(userId: string, id: string, idempotencyKey: string, requestHash: string,
+    authorization: JobContinuationAuthorization, operation: WorkerOperation = { timeoutMs: 5000 }): Promise<JobContinuationResult> {
+    try {
+      return await this.workerTransaction(async query => {
+        await query(playbackAccountLock, [playbackAccountLockKey(userId)]);
+        await query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [userId + ':' + idempotencyKey]);
+        await this.continuationSession(query, userId, authorization);
+        const { rows: [existing] } = await query<Row>('SELECT id,request_hash FROM playback_jobs WHERE user_id=$1 AND idempotency_key=$2', [userId, idempotencyKey]);
+        if (existing) {
+          if (existing.request_hash !== requestHash) throw new AppError(409, 'IDEMPOTENCY_CONFLICT', '같은 요청 키에 다른 작업이 있습니다.');
+          const relation = await query('SELECT job_id FROM playback_auth_waits WHERE job_id=$1 AND continued_job_id=$2', [id, existing.id]);
+          if (!relation.rowCount) throw new AppError(409, 'IDEMPOTENCY_CONFLICT', '같은 요청 키의 작업 관계를 확인할 수 없습니다.');
+          return this.continuationResult(query, userId, id, existing.id);
+        }
+        const owned = await query('SELECT id FROM playback_jobs WHERE user_id=$1 AND id=$2 FOR UPDATE', [userId, id]);
+        if (owned.rowCount !== 1) throw notFound();
+        await query('SELECT job_id FROM playback_auth_waits WHERE job_id=$1 FOR UPDATE', [id]);
+        const { rows: [old] } = await query<Row>(`${jobRecoverySelect} WHERE job.user_id=$1 AND job.id=$2`, [userId, id]);
+        if (!old) throw notFound();
+        if (old.continued_as_job_id) throw new AppError(409, 'PLAYBACK_ALREADY_CONTINUED', '이미 이어서 수강할 요청이 접수됐습니다. 대기열을 확인해 주세요.');
+        if (old.auth_wait_eligible !== true) throw new AppError(409, 'PLAYBACK_CONTINUATION_UNAVAILABLE', '실행하지 않은 인증 대기 요청만 이어서 수강할 수 있습니다.');
+        const proof = inspectPlaybackAdmission(authorization.admission, { userId, courseId: old.course_id, lectureId: old.lecture_id });
+        if (proof.generation === old.accepted_generation) throw new AppError(409, 'PLAYBACK_REAUTHENTICATION_REQUIRED', '학교 인증을 갱신한 뒤 계속 수강해 주세요.');
+        const school = await query("SELECT user_id FROM school_sessions WHERE user_id=$1 AND provider='ssu' AND encrypted_state=$2 FOR SHARE", [userId, proof.encryptedSession]);
+        if (!school.rowCount) throw authorityChanged();
+        const lease = await query(`SELECT 1 FROM playback_execution_leases lease WHERE lease.user_id=$1 AND lease.expires_at>clock_timestamp()
+          AND NOT (lease.owner_kind='worker' AND lease.generation=$2 AND EXISTS(
+            SELECT 1 FROM playback_jobs active WHERE active.user_id=lease.user_id AND active.course_id=lease.course_id
+              AND active.lecture_id=lease.module_item_id AND active.accepted_generation=lease.generation
+              AND active.execution_token_hash=lease.token_hash AND active.status IN ('running','reconciling')
+              AND active.heartbeat_at>clock_timestamp()-interval '90 seconds'))`, [userId, proof.generation]);
+        if (lease.rowCount) throw new AppError(409, 'PLAYBACK_BUSY', '다른 영상의 실행 상태를 먼저 확인해 주세요.');
+        const retired = await query(`UPDATE playback_jobs SET status='cancelled',error_code=COALESCE(error_code,'PLAYBACK_CONTINUED'),
+          execution_outcome=COALESCE(execution_outcome,'not_started'),updated_at=clock_timestamp()
+          WHERE user_id=$1 AND id=$2 AND execution_token_hash IS NULL AND settled_at IS NULL
+            AND status IN ('queued','scheduled','needs_reauthentication','needs_verification') RETURNING id`, [userId, id]);
+        if (retired.rowCount !== 1) throw authorityChanged();
+        const childId = randomUUID(), scheduledFor = new Date(Math.max(Date.now(), new Date(old.scheduled_for).getTime())).toISOString();
+        const status = Date.parse(scheduledFor) > Date.now() + 1000 ? 'scheduled' : 'queued';
+        const created = await query(`INSERT INTO playback_jobs(id,user_id,course_id,lecture_id,status,scheduled_for,idempotency_key,request_hash,accepted_generation)
+          SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9 WHERE clock_timestamp()<to_timestamp($10::double precision/1000)
+            AND EXISTS(SELECT 1 FROM sessions WHERE user_id=$2 AND token_hash=$11 AND csrf_token=$12 AND client_id IS NOT DISTINCT FROM $13::text AND expires_at>clock_timestamp()) RETURNING id`,
+          [childId, userId, old.course_id, old.lecture_id, status, scheduledFor, idempotencyKey, requestHash, proof.generation, proof.expiresAt,
+            authorization.almsTokenHash, authorization.csrfToken, authorization.clientId]);
+        if (created.rowCount !== 1) throw authorityChanged();
+        await query('INSERT INTO job_outbox(job_id) VALUES($1)', [childId]);
+        const related = await query(`UPDATE playback_auth_waits SET continued_job_id=$2,continued_at=clock_timestamp()
+          WHERE job_id=$1 AND continued_job_id IS NULL RETURNING job_id`, [id, childId]);
+        if (related.rowCount !== 1) throw authorityChanged();
+        await this.continuationSession(query, userId, authorization);
+        const deadline = await query('SELECT clock_timestamp()<to_timestamp($1::double precision/1000) AS valid', [proof.expiresAt]);
+        if (deadline.rows[0]?.valid !== true) throw authorityChanged();
+        return this.continuationResult(query, userId, id, childId);
+      }, operation);
+    } catch (error) {
+      if ((error as { code?: string }).code === '23505') throw new AppError(409, 'JOB_ALREADY_ACTIVE', '이 강의의 진행 중인 작업을 먼저 확인해 주세요.');
+      throw error;
+    }
+  }
   async cancelJob(userId: string,id: string) {
     return this.transaction(async c => {
       const { rows: [r] } = await c.query('SELECT * FROM playback_jobs WHERE user_id=$1 AND id=$2 FOR UPDATE',[userId,id]);
@@ -344,7 +461,8 @@ export class PgStore implements Store {
       const { rows: [r] } = await query<Row>(`UPDATE playback_jobs SET status='running',heartbeat_at=clock_timestamp(),updated_at=clock_timestamp(),
         execution_token_hash=$2,last_execution_token_hash=$2
         WHERE id=$1 AND status IN ('queued','scheduled') AND scheduled_for<=clock_timestamp() AND accepted_generation IS NOT NULL
-          AND execution_token_hash IS NULL AND settled_at IS NULL RETURNING *`,[id,tokenHash]);
+          AND execution_token_hash IS NULL AND settled_at IS NULL
+          AND NOT EXISTS(SELECT 1 FROM playback_auth_waits waiting WHERE waiting.job_id=playback_jobs.id AND waiting.continued_job_id IS NULL) RETURNING *`,[id,tokenHash]);
       return r ? jobFrom(r) : null;
     }, operation ?? { timeoutMs: 5000 });
   }
@@ -358,6 +476,10 @@ export class PgStore implements Store {
     const success = to === 'completed' || to === 'succeeded';
     if (success && (!result || to === 'completed' && options.outcome !== 'ended'
       || to === 'succeeded' && (result.recognized !== true || !['ended','not_started'].includes(options.outcome ?? '')))) throw authorityChanged();
+    if (options.authenticationWaitReason && (options.outcome !== 'not_started' || result !== null || options.terminationProof
+      || !['needs_reauthentication','needs_verification'].includes(to) || from.length !== 1 || from[0] !== 'running'
+      || !['AUTH_REQUIRED','SCHOOL_AUTH_REQUIRED','SCHOOL_SESSION_CHANGED','PLAYBACK_AUTHORITY_CHANGED'].includes(error ?? '')))
+      throw authorityChanged();
     const proof = (success || result) ? inspectPlaybackFinalProof(options.authority!, claim) : null;
     return this.workerTransaction(async query => {
       await query(playbackAccountLock, [playbackAccountLockKey(claim.userId)]);
@@ -379,8 +501,61 @@ export class PgStore implements Store {
         execution_outcome=COALESCE($11,execution_outcome),execution_token_hash=CASE WHEN $12 THEN NULL ELSE execution_token_hash END,updated_at=clock_timestamp()
         WHERE ${claimWhere} AND status=ANY($7::text[]) ${proof ? "AND clock_timestamp()<to_timestamp($13::double precision/1000)" : ''} RETURNING *`,
         [...claimValues(claim),from,to,result ? JSON.stringify(result) : null,error,options.outcome ?? null,terminal,...(proof ? [proof.expiresAt] : [])]);
+      if (r && options.authenticationWaitReason) {
+        await query(`INSERT INTO playback_auth_waits(job_id,blocked_by_job_id,reason,original_status,original_error_code)
+          SELECT waiting.id,$1,$7,waiting.status,waiting.error_code FROM playback_jobs waiting
+          WHERE waiting.user_id=$2 AND waiting.accepted_generation=$5 AND waiting.execution_token_hash IS NULL
+            AND EXISTS(SELECT 1 FROM playback_jobs cause WHERE cause.id=$1 AND cause.user_id=$2 AND cause.course_id=$3 AND cause.lecture_id=$4
+              AND cause.accepted_generation=$5 AND cause.last_execution_token_hash=$6 AND cause.execution_outcome='not_started'
+              AND cause.status IN ('needs_reauthentication','needs_verification') AND cause.execution_token_hash IS NULL
+              AND NOT EXISTS(SELECT 1 FROM playback_job_progress attempted WHERE attempted.job_id=cause.id)
+              AND NOT EXISTS(SELECT 1 FROM playback_execution_terminations ended WHERE ended.job_id=cause.id)
+              AND NOT EXISTS(SELECT 1 FROM playback_job_settlements settled WHERE settled.job_id=cause.id))
+            AND waiting.settled_at IS NULL AND waiting.school_result IS NULL
+            AND ((waiting.id=$1 AND waiting.status IN ('needs_reauthentication','needs_verification')
+              AND waiting.execution_outcome='not_started' AND waiting.last_execution_token_hash=$6)
+              OR (waiting.id<>$1 AND waiting.status IN ('queued','scheduled') AND waiting.last_execution_token_hash IS NULL AND waiting.heartbeat_at IS NULL))
+            AND NOT EXISTS(SELECT 1 FROM playback_job_progress observed WHERE observed.job_id=waiting.id)
+            AND NOT EXISTS(SELECT 1 FROM playback_execution_terminations ended WHERE ended.job_id=waiting.id)
+            AND NOT EXISTS(SELECT 1 FROM playback_job_settlements settled WHERE settled.job_id=waiting.id)
+            AND NOT EXISTS(SELECT 1 FROM playback_execution_leases lease WHERE lease.user_id=waiting.user_id
+              AND lease.generation=waiting.accepted_generation AND lease.token_hash=waiting.last_execution_token_hash AND lease.expires_at>clock_timestamp())
+          ON CONFLICT(job_id) DO NOTHING`, [...claimValues(claim), options.authenticationWaitReason]);
+      }
       return r ? jobFrom(r) : null;
     }, operation);
+  }
+  /** Trusted worker display observations. Existing job/school outcomes are never rewritten. */
+  async recordPlaybackObservation(claim: WorkerClaim, value: PlaybackObservation, operation?: WorkerOperation): Promise<boolean> {
+    if (!validPlaybackObservation(value)) return false;
+    const { rowCount } = await this.workerQuery(`WITH authorized AS (
+      SELECT id,execution_token_hash FROM playback_jobs WHERE ${claimWhere} AND status IN ('running','reconciling')
+        AND ($7::jsonb->>'observedAt')::timestamptz<=clock_timestamp()+interval '1 second' FOR UPDATE
+    ) INSERT INTO playback_job_progress(job_id,execution_token_hash,observation)
+      SELECT id,execution_token_hash,$7::jsonb FROM authorized
+      ON CONFLICT(job_id) DO UPDATE SET execution_token_hash=EXCLUDED.execution_token_hash,observation=EXCLUDED.observation,
+        report_ack=CASE WHEN playback_job_progress.execution_token_hash=EXCLUDED.execution_token_hash THEN playback_job_progress.report_ack ELSE NULL END
+      WHERE playback_job_progress.execution_token_hash<>EXCLUDED.execution_token_hash OR playback_job_progress.observation IS NULL
+        OR ((playback_job_progress.observation->>'observedAt')::timestamptz <= ($7::jsonb->>'observedAt')::timestamptz
+          AND (playback_job_progress.observation->>'positionSeconds')::numeric <= ($7::jsonb->>'positionSeconds')::numeric
+          AND ((playback_job_progress.observation->>'ended')::boolean IS NOT TRUE OR ($7::jsonb->>'ended')::boolean IS TRUE))`,
+      [...claimValues(claim), JSON.stringify(value)], operation);
+    return rowCount === 1;
+  }
+  async recordPlaybackReportAck(claim: WorkerClaim, value: PlaybackReportAck, operation?: WorkerOperation): Promise<boolean> {
+    if (!validPlaybackReportAck(value)) return false;
+    const { rowCount } = await this.workerQuery(`WITH authorized AS (
+      SELECT id,execution_token_hash FROM playback_jobs WHERE ${claimWhere} AND status IN ('running','reconciling')
+        AND ($7::jsonb->>'acknowledgedAt')::timestamptz<=clock_timestamp()+interval '1 second' FOR UPDATE
+    ) INSERT INTO playback_job_progress(job_id,execution_token_hash,report_ack)
+      SELECT id,execution_token_hash,$7::jsonb FROM authorized
+      ON CONFLICT(job_id) DO UPDATE SET execution_token_hash=EXCLUDED.execution_token_hash,report_ack=EXCLUDED.report_ack,
+        observation=CASE WHEN playback_job_progress.execution_token_hash=EXCLUDED.execution_token_hash THEN playback_job_progress.observation ELSE NULL END
+      WHERE playback_job_progress.execution_token_hash<>EXCLUDED.execution_token_hash OR playback_job_progress.report_ack IS NULL
+        OR ((playback_job_progress.report_ack->>'acknowledgedAt')::timestamptz <= ($7::jsonb->>'acknowledgedAt')::timestamptz
+          AND array_position(ARRAY['playing','update','ended'],playback_job_progress.report_ack->>'event') <= array_position(ARRAY['playing','update','ended'],$7::jsonb->>'event'))`,
+      [...claimValues(claim), JSON.stringify(value)], operation);
+    return rowCount === 1;
   }
   async heartbeat(claim: WorkerClaim, operation?: WorkerOperation) {
     const result = await this.workerQuery(`UPDATE playback_jobs SET heartbeat_at=clock_timestamp() WHERE ${claimWhere}

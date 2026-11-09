@@ -1,3 +1,5 @@
+import { registerPlaybackContinuation } from './playback-continuation-routes.js';
+import { withPlaybackContinuationState } from './playback-auth-wait.js';
 import { registerJobSettlement } from './job-settlement.js';
 import type { JobResultCache } from './job-result-cache.js';
 import { videoReportDiagnostic } from './video-report-diagnostics.js';
@@ -164,6 +166,7 @@ export async function buildApp(config: Config, store: Store, provider: SchoolPro
   registerManualVideo(app,store,authenticate,manualVideo);
   registerPlaybackStart(app,store,authenticate,playbackStart);
   registerJobVerification(app, store, provider, authenticate);
+  registerPlaybackContinuation(app, store, provider, authenticate, config.sessionEncryptionKey, playbackReadiness);
   registerActivityLearningStatus(app, store, provider, authenticate);
   registerPersonalCompletion(app, store, provider, authenticate);
   const owner = (request: FastifyRequest) => request.session!.user.id;
@@ -470,13 +473,13 @@ export async function buildApp(config: Config, store: Store, provider: SchoolPro
     const jobs = rows.slice(0,limit);
     requirePlaybackClient(request, jobs.some(job => job.acceptedGeneration != null));
     await refreshJobResults(request, reply, jobs);
-    return { items: jobs.map(publicJob), complete: !hasMore, hasMore, limit };
+    return { items: (await withPlaybackContinuationState(store, config.sessionEncryptionKey, owner(request), jobs)).map(publicJob), complete: !hasMore, hasMore, limit };
   });
   app.get('/v1/jobs/:id',protectedRoute,async (request, reply) => {
     const job = await store.getJob(owner(request),paramId(request)); if (!job) throw notFound();
     requirePlaybackClient(request, provider.capabilities.playback || job.acceptedGeneration != null);
     await refreshJobResults(request, reply, [job]);
-    return publicJob(job);
+    return publicJob((await withPlaybackContinuationState(store, config.sessionEncryptionKey, owner(request), [job]))[0]!);
   });
   const jobRequests = new WeakMap<FastifyRequest, { signal: AbortSignal; clean: () => void }>();
   const cleanJobRequest = (request: FastifyRequest) => { jobRequests.get(request)?.clean(); jobRequests.delete(request); };

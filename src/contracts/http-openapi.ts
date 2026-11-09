@@ -135,10 +135,18 @@ export const httpSchemas: Record<string, JsonSchema> = {
   SchoolResult: object({ observedAt: instant, progressPercent: nullable({ type: 'number', minimum: 0, maximum: 100 }),
     attendance: enumeration('present', 'absent', 'late', 'pending', 'not_applicable', 'unknown'), recognized: nullable(bool), evidence: ref('LearningEvidence') },
   ['observedAt', 'progressPercent', 'attendance', 'recognized']),
+  PlaybackProgress: { ...object({ observedAt: instant,
+    positionSeconds: { type: 'number', minimum: 0, maximum: 14400.25 },
+    durationSeconds: { type: 'number', exclusiveMinimum: 0, maximum: 14400 },
+    percent: { type: 'number', minimum: 0, maximum: 100 }, paused: bool, ended: bool,
+    lastReport: nullable(object({ event: enumeration('playing','update','ended'), acknowledgedAt: instant }, undefined, true)) }, undefined, true),
+    description: 'Actual server media observations, not school progress or attendance. Optional/null until observed; percent is min(100, positionSeconds/durationSeconds*100), with up to 0.25s media rounding tolerance. Active observations older than 15s are stale; never interpolate. lastReport records only a validated school ACK and may be null.' },
+  PlaybackAuthWait: { ...object({ waitingSince: instant, reason: enumeration('school_auth_required','school_session_changed'), canContinue: bool, continuedAsJobId: nullable(uuid) }, undefined, true),
+    description: 'Durable proven-before-play authentication wait. canContinue requires a newer verified school SSO generation with LMS ready; POST still performs fresh native admission. queued/scheduled intent remains waiting without school attempts. continuedAsJobId durably identifies the sole replacement, including after response loss. No automatic continuation or unknown/interrupted retry.' },
   Job: object({ id: uuid, courseId: identifier, lectureId: identifier,
     status: enumeration('queued', 'scheduled', 'running', 'pause_requested', 'paused', 'cancel_requested', 'cancelled', 'reconciling', 'succeeded', 'completed', 'failed', 'needs_reauthentication', 'needs_verification'),
     scheduledFor: instant, createdAt: instant, updatedAt: instant, schoolResult: nullable(ref('SchoolResult')), errorCode: nullable(text),
-    executionOutcome: nullable(enumeration('not_started', 'ended', 'interrupted')), settledAt: nullable(instant),
+    executionOutcome: nullable(enumeration('not_started', 'ended', 'interrupted')), authWait: nullable(ref('PlaybackAuthWait')), playbackProgress: nullable(ref('PlaybackProgress')), settledAt: nullable(instant),
     settlement: nullable(object({ settledAt: instant, schoolResult: ref('SchoolResult') })),
     recovery: object({ eligible: bool, reason: enumeration('eligible', 'already_settled', 'not_interrupted', 'termination_unconfirmed', 'execution_active', 'lease_active'), version: instant }) },
   ['id', 'courseId', 'lectureId', 'status', 'scheduledFor', 'createdAt', 'updatedAt', 'schoolResult', 'errorCode', 'executionOutcome']),
@@ -388,6 +396,11 @@ add('post', '/v1/jobs', 'Accept a separate server lecture job', ref('Job'), { st
 add('get', '/v1/jobs/{id}', 'Exact owned playback job', ref('Job'), { headers: [playbackAccept], errors: ['CLIENT_UPDATE_REQUIRED'] });
 add('get', '/v1/jobs/{id}/verify', 'Read exact job school result', object({ job: ref('Job'), schoolResult: ref('SchoolResult'), stateChanged: { const: false } }),
   { headers: [playbackAccept], description: 'Fresh read-only result; job state/history are preserved.', errors: ['SCHOOL_RESULT_UNAVAILABLE', 'JOB_CHANGED', 'JOB_VERIFICATION_BUSY', 'CLIENT_UPDATE_REQUIRED'] });
+add('post', '/v1/jobs/{id}/continue', 'Explicitly continue a proven-unstarted authentication wait', object({ originalJob: ref('Job'), job: ref('Job'), continued: { const: true } }), {
+  status: 202, body: object({}, [], true), headers: [parameters.idempotency, playbackAccept],
+  description: 'Only server-created wait markers for known-before-play failures qualify. Requires newer verified school SSO, fresh native identity/enrollment/media admission, worker readiness, live session/client/CSRF and unchanged school seal. A transaction preserves the old accepted generation and original error evidence, retires the old intent, creates one new normal job/outbox and records one durable old-to-new relation. Future schedules are preserved. Existing completed school videos are excluded. Exact same-key replay returns the same child in any known status without new school admission. The original job UUID may be used as its stable continuation key across reloads; unrelated existing use yields IDEMPOTENCY_CONFLICT, never a fallback key. Response loss requires GET originalJob.authWait.continuedAsJobId then GET that child; a missing pointer during an in-flight request is not proof of failure. Never generate a new key or automatically retry uncertain acceptance. Unknown/interrupted/running/cleanup-uncertain/unmarked historical jobs are ineligible.',
+  errors: ['PLAYBACK_CONTINUATION_UNCONFIRMED','PLAYBACK_CONTINUATION_UNAVAILABLE','PLAYBACK_CONTINUATION_BUSY','PLAYBACK_REAUTHENTICATION_REQUIRED','PLAYBACK_ALREADY_CONTINUED','PLAYBACK_ALREADY_COMPLETED','PLAYBACK_UNAVAILABLE','PLAYBACK_BUSY','PLAYBACK_AUTHORITY_CHANGED','SCHOOL_AUTH_REQUIRED','IDEMPOTENCY_CONFLICT','JOB_ALREADY_ACTIVE','CLIENT_UPDATE_REQUIRED'],
+});
 add('post', '/v1/jobs/{id}/cancel', 'Request cancellation of owner job', ref('Job'), { headers: [playbackAccept], errors: ['CLIENT_UPDATE_REQUIRED'] });
 for (const action of ['pause', 'resume']) add('post', '/v1/jobs/{id}/' + action, 'Unsupported school pause/resume control', null, { status: 503, headers: [playbackAccept], errors: ['PLAYBACK_CONTROL_UNAVAILABLE', 'CLIENT_UPDATE_REQUIRED'] });
 add('post', '/v1/jobs/{id}/settle', 'Record verified local recovery settlement', object({ job: ref('Job'), settlementRecorded: { const: true }, stateChanged: { const: false } }),

@@ -121,7 +121,9 @@ test('Readystream owner lease conflict and changed school generation prevent eve
   assert.equal(conflict.counts().created, 0); assert.equal(conflict.counts().released, 0);
   assert.equal(conflict.school.counts().reports, 0);
   const changed = await worker(); const prepared = await changed.prepare(); changed.school.reset();
-  await assert.rejects(changed.adapter.play(prepared, signal()), { code: 'SCHOOL_AUTH_REQUIRED' });
+  // A new accepted school generation invalidates this old claim; it does not
+  // establish that the newly signed-in school session has expired.
+  await assert.rejects(changed.adapter.play(prepared, signal()), { code: 'SCHOOL_SESSION_CHANGED', statusCode: 409 });
   assert.equal(changed.school.counts().reports, 0); assert.deepEqual(changed.acknowledgements, []);
 });
 

@@ -13,7 +13,7 @@ export function createQueueClient(databaseUrl: string) {
 export async function dispatchOutbox(store: PgStore, boss: PgBoss, operation: WorkerOperation = { timeoutMs: 5000 }) {
   return store.workerTransaction(async query => {
     await query(`UPDATE job_outbox o SET dispatched_at=now() FROM playback_jobs j WHERE j.id=o.job_id AND o.dispatched_at IS NULL AND j.status NOT IN ('queued','scheduled')`);
-    const { rows } = await query(`SELECT o.job_id,j.user_id,j.scheduled_for FROM job_outbox o JOIN playback_jobs j ON j.id=o.job_id WHERE o.dispatched_at IS NULL AND j.status IN ('queued','scheduled') AND j.accepted_generation IS NOT NULL ORDER BY j.created_at LIMIT 20 FOR UPDATE OF o SKIP LOCKED`);
+    const { rows } = await query(`SELECT o.job_id,j.user_id,j.scheduled_for FROM job_outbox o JOIN playback_jobs j ON j.id=o.job_id WHERE o.dispatched_at IS NULL AND j.status IN ('queued','scheduled') AND j.accepted_generation IS NOT NULL AND NOT EXISTS(SELECT 1 FROM playback_auth_waits waiting WHERE waiting.job_id=j.id AND waiting.continued_job_id IS NULL) ORDER BY j.created_at LIMIT 20 FOR UPDATE OF o SKIP LOCKED`);
     for (const row of rows) {
       // send() uses a separate bounded SQL connection. A delayed acknowledgement can leave a
       // queue entry, but rollback leaves this outbox retryable with the same deterministic ID.

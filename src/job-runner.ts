@@ -5,6 +5,7 @@ import { resultStatus, type Job, type ExecutionOutcome, type SchoolResult } from
 import { playbackContext, type PreparedPlayback, type SchoolProvider } from './provider.js';
 import { boundedWorkerOperation, type WorkerOperation } from './worker-bounds.js';
 import type { PlaybackTerminationProof } from './playback-termination.js';
+import type { AuthenticationWaitReason } from './playback-auth-wait.js';
 
 const claimedHandles = new WeakSet<object>();
 export const workerJobLimits = { operationMs: 5000, preparationMs: 90_000, resultMs: 90_000, cleanupMs: 10_000, finalizationMs: 10_000 };
@@ -141,12 +142,12 @@ export async function executeJob(id: string, store: Store, provider: SchoolProvi
   try {
     await boundedWorkerOperation(async finalSignal => {
       const read = () => db(operation => store.getWorkerJob(claim, operation), finalSignal);
-      const transition = async (from: Job['status'][], to: Job['status'], value: SchoolResult | null, code: string | null, success = false) => {
+      const transition = async (from: Job['status'][], to: Job['status'], value: SchoolResult | null, code: string | null, success = false, authenticationWaitReason?: AuthenticationWaitReason) => {
         const signal = success ? AbortSignal.any([finalSignal, controller.signal]) : finalSignal;
         // Final success and any fresh result are bound to this prepared generation even after disposal.
         const authority = value && prepared && provider.validatePlayback
           ? await boundedWorkerOperation(inner => provider.validatePlayback!(prepared!, inner), { signal, timeoutMs: limits.operationMs }) : undefined;
-        return db(operation => store.transitionJob(claim, from, to, value, code, { outcome, authority, terminationProof }, operation), signal);
+        return db(operation => store.transitionJob(claim, from, to, value, code, { outcome, authority, terminationProof, ...(authenticationWaitReason ? { authenticationWaitReason } : {}) }, operation), signal);
       };
       const finishCancellation = async () => {
         const current = await read();
@@ -181,9 +182,16 @@ export async function executeJob(id: string, store: Store, provider: SchoolProvi
       if (!available && !interrupted) { await transition(['running'], 'failed', null, 'PLAYBACK_UNAVAILABLE'); return; }
       if (failure || controller.signal.aborted) {
         const expired = !reportUnconfirmed && failure instanceof AppError && ['AUTH_REQUIRED', 'SCHOOL_AUTH_REQUIRED'].includes(failure.code);
+        const changedSchool = failure instanceof AppError && ['SCHOOL_SESSION_CHANGED','PLAYBACK_AUTHORITY_CHANGED'].includes(failure.code);
+        // Only a preparation failure known to precede any returned runtime handle can
+        // preserve untouched queue intents. Unknown reports/cleanup/claim loss never qualify.
+        const knownUnstarted = !prepared && outcome === 'not_started' && !reportUnconfirmed && !cleanupFailed && !interrupted && current.status === 'running';
+        const authenticationWaitReason = knownUnstarted && (expired || changedSchool)
+          ? expired ? 'school_auth_required' as const : 'school_session_changed' as const : undefined;
         const status = expired && current.status !== 'pause_requested' ? 'needs_reauthentication' : 'needs_verification';
-        const code = reportUnconfirmed ? 'PLAYBACK_REPORT_UNKNOWN' : expired ? 'AUTH_REQUIRED' : interrupted ? 'WORKER_INTERRUPTED' : 'SCHOOL_RESULT_UNKNOWN';
-        if (!await transition([current.status], status, null, code)) await finishCancellation();
+        const code = reportUnconfirmed ? 'PLAYBACK_REPORT_UNKNOWN' : expired ? 'AUTH_REQUIRED'
+          : authenticationWaitReason === 'school_session_changed' && failure instanceof AppError ? failure.code : interrupted ? 'WORKER_INTERRUPTED' : 'SCHOOL_RESULT_UNKNOWN';
+        if (!await transition([current.status], status, null, code, false, authenticationWaitReason)) await finishCancellation();
         return;
       }
       if (!await transition(['reconciling'], resultStatus(result, outcome), result, resultStatus(result, outcome) === 'needs_verification' ? 'SCHOOL_RESULT_UNKNOWN' : null, true))
