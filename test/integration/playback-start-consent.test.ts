@@ -509,4 +509,24 @@ describe('exact queue start consent and one-use attempts in isolated PostgreSQL'
     await store.finishPlaybackStart(claim, a.attemptId, 'acknowledged', key, op);
     assert.equal((await store.getJob(f.owner, claim.jobId))?.startConsent?.attempt, 'acknowledged');
   });
+  it('a reserved or unknown start can never become an authentication continuation', async () => {
+    for (const outcome of ['reserved', 'unknown'] as const) {
+      const f = await fixture(),
+        claim = await f.claim();
+      await f.lease(claim);
+      const a = (await store.reservePlaybackStart(claim, key, op))!;
+      if (outcome === 'unknown') await store.finishPlaybackStart(claim, a.attemptId, 'unknown', key, op);
+      await assert.rejects(
+        store.transitionJob(claim, ['running'], 'needs_reauthentication', null, 'AUTH_REQUIRED', {
+          outcome: 'not_started',
+          authenticationWaitReason: 'school_auth_required',
+        }),
+        { code: 'PLAYBACK_AUTHORITY_CHANGED' },
+      );
+      const job = await store.getJob(f.owner, claim.jobId);
+      assert.equal(job?.status, 'running');
+      assert.equal(job?.authWait, null);
+      assert.equal((await pool.query('SELECT 1 FROM playback_auth_waits WHERE job_id=$1', [claim.jobId])).rowCount, 0);
+    }
+  });
 });

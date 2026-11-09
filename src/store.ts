@@ -48,6 +48,7 @@ const continuationEligible = `auth_wait.job_id IS NOT NULL AND auth_wait.continu
     AND job.execution_token_hash IS NULL AND job.settled_at IS NULL AND job.school_result IS NULL
     AND EXISTS(SELECT 1 FROM playback_jobs cause WHERE cause.id=auth_wait.blocked_by_job_id AND cause.user_id=job.user_id AND cause.accepted_generation=job.accepted_generation)
     AND NOT EXISTS(SELECT 1 FROM playback_job_progress observed WHERE observed.job_id=job.id)
+    AND NOT EXISTS(SELECT 1 FROM playback_start_attempts attempted_start WHERE attempted_start.job_id=job.id)
     AND NOT EXISTS(SELECT 1 FROM playback_execution_terminations ended WHERE ended.job_id=job.id)
     AND NOT EXISTS(SELECT 1 FROM playback_job_settlements settled WHERE settled.job_id=job.id)
     AND ((job.status IN ('queued','scheduled') AND job.last_execution_token_hash IS NULL AND job.heartbeat_at IS NULL)
@@ -525,6 +526,7 @@ export class PgStore implements Store {
     const proof = (success || result) ? inspectPlaybackFinalProof(options.authority!, claim) : null;
     return this.workerTransaction(async query => {
       await query(playbackAccountLock, [playbackAccountLockKey(claim.userId)]);
+      if(options.authenticationWaitReason && (await query('SELECT 1 FROM playback_start_attempts WHERE job_id=$1',[claim.jobId])).rowCount)throw authorityChanged();
       if (proof) {
         const school = await query("SELECT user_id FROM school_sessions WHERE user_id=$1 AND provider='ssu' AND encrypted_state=$2 AND clock_timestamp()<to_timestamp($3::double precision/1000) FOR SHARE",
           [claim.userId, proof.encryptedSession, proof.expiresAt]);
@@ -551,6 +553,7 @@ export class PgStore implements Store {
               AND cause.accepted_generation=$5 AND cause.last_execution_token_hash=$6 AND cause.execution_outcome='not_started'
               AND cause.status IN ('needs_reauthentication','needs_verification') AND cause.execution_token_hash IS NULL
               AND NOT EXISTS(SELECT 1 FROM playback_job_progress attempted WHERE attempted.job_id=cause.id)
+              AND NOT EXISTS(SELECT 1 FROM playback_start_attempts attempted_start WHERE attempted_start.job_id=cause.id)
               AND NOT EXISTS(SELECT 1 FROM playback_execution_terminations ended WHERE ended.job_id=cause.id)
               AND NOT EXISTS(SELECT 1 FROM playback_job_settlements settled WHERE settled.job_id=cause.id))
             AND waiting.settled_at IS NULL AND waiting.school_result IS NULL
@@ -558,6 +561,7 @@ export class PgStore implements Store {
               AND waiting.execution_outcome='not_started' AND waiting.last_execution_token_hash=$6)
               OR (waiting.id<>$1 AND waiting.status IN ('queued','scheduled') AND waiting.last_execution_token_hash IS NULL AND waiting.heartbeat_at IS NULL))
             AND NOT EXISTS(SELECT 1 FROM playback_job_progress observed WHERE observed.job_id=waiting.id)
+            AND NOT EXISTS(SELECT 1 FROM playback_start_attempts attempted_start WHERE attempted_start.job_id=waiting.id)
             AND NOT EXISTS(SELECT 1 FROM playback_execution_terminations ended WHERE ended.job_id=waiting.id)
             AND NOT EXISTS(SELECT 1 FROM playback_job_settlements settled WHERE settled.job_id=waiting.id)
             AND NOT EXISTS(SELECT 1 FROM playback_execution_leases lease WHERE lease.user_id=waiting.user_id
