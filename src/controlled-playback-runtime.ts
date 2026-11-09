@@ -19,6 +19,10 @@ const codes = [
   'CLEANUP_FAILED',
 ] as const;
 export type ControlledPlaybackFailure = (typeof codes)[number];
+export type ControlledPlaybackFailureOrigin = 'media_proxy_failure' | 'media_snapshot_invalid' | 'observation_rejected'
+  | 'route_blocked' | 'periodic_guard_failed' | 'report_failed' | 'other';
+export type ControlledPlaybackSnapshotReason = 'sampling_gap' | 'position_reverse' | 'position_advance' | 'visibility'
+  | 'seeking' | 'media_error' | 'media_shape' | 'inactive_playback' | 'initial_playback' | 'terminal_evidence' | 'capture_failed';
 export class ControlledPlaybackError extends Error {
   constructor(readonly code: ControlledPlaybackFailure) {
     super(code);
@@ -43,6 +47,9 @@ export interface ControlledPlaybackInput {
   stream(request: VideoRequest): Promise<VideoResponse>;
   /** Synchronous observation only; reporting and DB checks must not block the sampler. */
   observe(value: ControlledPlaybackObservation): void;
+  /** First local stop fact only; observer failures cannot change playback or cleanup. */
+  observeFailure?(value: Readonly<{ code: ControlledPlaybackFailure; origin: ControlledPlaybackFailureOrigin;
+    snapshotReason?: ControlledPlaybackSnapshotReason }>): void;
   /** Trusted single-use pre-play work with the actual validated, paused media observation. */
   beforePlay?(value: ControlledPlaybackObservation, signal: AbortSignal): Promise<void>;
   /** One school attempt; the hook must honor signal and must never retry a write. */
@@ -62,7 +69,7 @@ export function createControlledPlaybackSource(input: ControlledPlaybackInput): 
   if (
     !input ||
     Object.keys(input).some(
-      (key) => !['expectedDurationSeconds', 'validate', 'stream', 'observe', 'beforePlay', 'report', 'timeouts'].includes(key),
+      (key) => !['expectedDurationSeconds', 'validate', 'stream', 'observe', 'observeFailure', 'beforePlay', 'report', 'timeouts'].includes(key),
     ) ||
     !Number.isFinite(input.expectedDurationSeconds) ||
     input.expectedDurationSeconds <= 0 ||
@@ -70,6 +77,7 @@ export function createControlledPlaybackSource(input: ControlledPlaybackInput): 
     ['validate', 'stream', 'observe', 'report'].some(
       (key) => typeof input[key as keyof ControlledPlaybackInput] !== 'function',
     ) || (input.beforePlay !== undefined && typeof input.beforePlay !== 'function')
+    || (input.observeFailure !== undefined && typeof input.observeFailure !== 'function')
   )
     return fail('SOURCE_INVALID');
   if (input.timeouts && Object.keys(input.timeouts).some((key) => !['startMs', 'stallMs', 'totalMs'].includes(key)))
@@ -272,10 +280,19 @@ export function createControlledPlaybackRuntime(dependencies: { launch?: Launch 
       signal = AbortSignal.any([external, io.signal]);
     const started = performance.now();
     let failure: ControlledPlaybackFailure | undefined;
+    let firstFailure: ControlledPlaybackFailure | undefined;
+    const observeFailure = (code: ControlledPlaybackFailure, origin: ControlledPlaybackFailureOrigin = 'other',
+      snapshotReason?: ControlledPlaybackSnapshotReason) => {
+      if (firstFailure !== undefined) return;
+      firstFailure = code;
+      try { data.observeFailure?.(Object.freeze({ code, origin, ...(snapshotReason ? { snapshotReason } : {}) })); } catch {}
+    };
     let browser: Browser | undefined,
       server: LaunchResult['server'] | undefined,
       context: BrowserContext | undefined,
       proxy: PlaybackMediaProxy | undefined;
+    const failureCode = (error: unknown): ControlledPlaybackFailure => external.aborted
+      ? 'ABORTED' : error instanceof ControlledPlaybackError ? error.code : browser ? 'MEDIA_INVALID' : 'LAUNCH_FAILED';
     let pendingLaunch: Promise<LaunchResult> | undefined,
       cleanupFinished = false,
       launchSettled = false;
@@ -294,8 +311,11 @@ export function createControlledPlaybackRuntime(dependencies: { launch?: Launch 
       interrupt = reject;
     });
     void interruption.catch(() => {});
-    const stop = (code: ControlledPlaybackFailure) => {
+    const stop = (code: ControlledPlaybackFailure, origin: ControlledPlaybackFailureOrigin =
+      code === 'ROUTE_BLOCKED' ? 'route_blocked' : code === 'REPORT_FAILED' ? 'report_failed' : 'other') => {
       failure ??= code;
+      // Record the local stop before aborting an in-flight report's refresh.
+      observeFailure(failure, origin);
       io.abort();
       interrupt(new ControlledPlaybackError(failure));
     };
@@ -356,7 +376,7 @@ export function createControlledPlaybackRuntime(dependencies: { launch?: Launch 
           onMedia: () => {
             mediaSeen = true;
           },
-          onFailure: () => stop('MEDIA_INVALID'),
+          onFailure: () => stop('MEDIA_INVALID', 'media_proxy_failure'),
         });
         guard();
         pendingLaunch = (dependencies.launch ?? launch)().then(
@@ -453,8 +473,8 @@ export function createControlledPlaybackRuntime(dependencies: { launch?: Launch 
               if (event.isTrusted) events[kind]++;
             });
         });
-        const capture = () =>
-          page.evaluate((): Snapshot => {
+        const capture = async () => {
+          try { return await page.evaluate((): Snapshot => {
             const v = document.querySelector('video') as HTMLVideoElement & {
               __almsControlled: {
                 playing: number;
@@ -480,18 +500,23 @@ export function createControlledPlaybackRuntime(dependencies: { launch?: Launch 
               endedCount: v.__almsControlled.ended,
               seekCount: v.__almsControlled.seeking,
             };
-          });
+          }); } catch (error) {
+            const code = failureCode(error);
+            observeFailure(code, code === 'MEDIA_INVALID' ? 'media_snapshot_invalid' : 'other', code === 'MEDIA_INVALID' ? 'capture_failed' : undefined);
+            throw error;
+          }
+        };
+        const invalidSnapshot = (reason: ControlledPlaybackSnapshotReason): never => {
+          observeFailure('MEDIA_INVALID', 'media_snapshot_invalid', reason);
+          return fail('MEDIA_INVALID');
+        };
         const verify = (value: Snapshot) => {
+          if (!value.connected || value.count !== 1 || page.frames().length !== 1) return invalidSnapshot('media_shape');
+          if (!value.visible) return invalidSnapshot('visibility');
+          if (value.loop || value.playbackRate !== 1) return invalidSnapshot('media_shape');
+          if (value.seeking || value.seekCount !== 0) return invalidSnapshot('seeking');
+          if (value.error) return invalidSnapshot('media_error');
           if (
-            !value.connected ||
-            value.count !== 1 ||
-            page.frames().length !== 1 ||
-            !value.visible ||
-            value.loop ||
-            value.playbackRate !== 1 ||
-            value.seeking ||
-            value.seekCount !== 0 ||
-            value.error ||
             value.src !== allowedProxy.mediaUrl ||
             !Number.isFinite(value.positionSeconds) ||
             value.positionSeconds < 0 ||
@@ -499,7 +524,7 @@ export function createControlledPlaybackRuntime(dependencies: { launch?: Launch 
             value.durationSeconds <= 0 ||
             Math.abs(value.durationSeconds - data.expectedDurationSeconds) > 1
           )
-            return fail('MEDIA_INVALID');
+            return invalidSnapshot('media_shape');
         };
         const observation = (value: Snapshot): ControlledPlaybackObservation =>
             Object.freeze({
@@ -511,11 +536,17 @@ export function createControlledPlaybackRuntime(dependencies: { launch?: Launch 
               seeking: value.seeking,
               visible: value.visible,
             });
-        const observe = (value: Snapshot) => data.observe(observation(value));
+        const observe = (value: Snapshot) => {
+          try { data.observe(observation(value)); } catch (error) {
+            const code = failureCode(error);
+            observeFailure(code, code === 'MEDIA_INVALID' ? 'observation_rejected' : 'other');
+            throw error;
+          }
+        };
         let initial = await capture();
         guard();
         verify(initial);
-        if (!initial.paused || initial.ended || initial.positionSeconds !== 0) return fail('MEDIA_INVALID');
+        if (!initial.paused || initial.ended || initial.positionSeconds !== 0) return invalidSnapshot('initial_playback');
         // A long explicit-start handshake must not seed the ordinary report controller's
         // observation clock. Its first observation is a fresh DOM capture after the ACK.
         if (!data.beforePlay) observe(initial);
@@ -531,7 +562,7 @@ export function createControlledPlaybackRuntime(dependencies: { launch?: Launch 
           await check();
           initial = await capture(); guard(); verify(initial);
           if (!initial.paused || initial.ended || initial.positionSeconds !== 0 || initial.playingCount !== 0)
-            return fail('MEDIA_INVALID');
+            return invalidSnapshot('initial_playback');
           observe(initial);
           await check();
         }
@@ -550,21 +581,18 @@ export function createControlledPlaybackRuntime(dependencies: { launch?: Launch 
           guard();
           verify(value);
           const elapsed = (now - previousAt) / 1000;
-          if (
-            elapsed > 1.5 ||
-            value.positionSeconds < previous.positionSeconds - 0.05 ||
-            value.positionSeconds - previous.positionSeconds > elapsed + 1
-          )
-            return fail('MEDIA_INVALID');
+          if (elapsed > 1.5) return invalidSnapshot('sampling_gap');
+          if (value.positionSeconds < previous.positionSeconds - 0.05) return invalidSnapshot('position_reverse');
+          if (value.positionSeconds - previous.positionSeconds > elapsed + 1) return invalidSnapshot('position_advance');
           if (!previous.paused && !previous.ended) activeElapsed += elapsed;
           // First capture follows the real click; this tolerance cannot accumulate between samples.
-          if (value.positionSeconds > activeElapsed + 1) return fail('MEDIA_INVALID');
+          if (value.positionSeconds > activeElapsed + 1) return invalidSnapshot('position_advance');
           if (value.positionSeconds > previous.positionSeconds + 0.01) {
             advanced = true;
             lastProgress = now;
           }
           if (value.playingCount > 0) playingSeen = true;
-          if (playingSeen && value.paused && !value.ended) return fail('MEDIA_INVALID');
+          if (playingSeen && value.paused && !value.ended) return invalidSnapshot('inactive_playback');
           finalPosition = value.positionSeconds;
           duration = value.durationSeconds;
           // After the terminal report starts, continue safety checks but never observe a closed SDK controller.
@@ -579,7 +607,7 @@ export function createControlledPlaybackRuntime(dependencies: { launch?: Launch 
               !reportStarted ||
               Math.abs(duration - finalPosition) > 0.2
             )
-              return fail('MEDIA_INVALID');
+              return invalidSnapshot('terminal_evidence');
             if (!report && !terminalReport) send('ended');
             if (terminalReport && !report) {
               if (validation) await validation;
@@ -600,7 +628,7 @@ export function createControlledPlaybackRuntime(dependencies: { launch?: Launch 
               },
               () => {
                 if (validation === current) validation = null;
-                stop('GUARD_FAILED');
+                stop('GUARD_FAILED', 'periodic_guard_failed');
               },
             );
           }
@@ -611,19 +639,17 @@ export function createControlledPlaybackRuntime(dependencies: { launch?: Launch 
       };
       await Promise.race([operation(), interruption]);
     } catch (error) {
-      failure ??= external.aborted
-        ? 'ABORTED'
-        : error instanceof ControlledPlaybackError
-          ? error.code
-          : browser
-            ? 'MEDIA_INVALID'
-            : 'LAUNCH_FAILED';
+      failure ??= failureCode(error);
+      observeFailure(failure);
     } finally {
       clearTimeout(timer);
       external.removeEventListener('abort', cancelled);
       io.abort();
       if (!await closeRuntimeResources(() => ({ pendingLaunch, launchSettled, browser, server, context, proxy }),
-        () => { cleanupFinished = true; })) failure = 'CLEANUP_FAILED';
+        () => { cleanupFinished = true; })) {
+        failure = 'CLEANUP_FAILED';
+        observeFailure(failure);
+      }
     }
     if (failure) throw new ControlledPlaybackError(failure);
     return {

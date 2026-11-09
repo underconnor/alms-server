@@ -9,6 +9,7 @@ import {
   createControlledPlaybackRuntime,
   createControlledPlaybackSource,
   ControlledPlaybackError,
+  type ControlledPlaybackFailure,
   type ControlledPlaybackInput,
 } from '../src/controlled-playback-runtime.js';
 const failure = (code: string) => (error: unknown) => error instanceof ControlledPlaybackError && error.code === code;
@@ -41,6 +42,7 @@ test('source is opaque, snapshots callback references, and rejects unsupported s
     { timeouts: { anything: true } },
     { report: null },
     { beforePlay: true },
+    { observeFailure: true },
   ])
     assert.throws(() => createControlledPlaybackSource({ ...input(), ...extra } as any), failure('SOURCE_INVALID'));
   raw.validate = async () => assert.fail('mutated callback');
@@ -83,6 +85,7 @@ function fake(
     endAfter?: number;
     reportDelay?: number;
     beforePlay?: ControlledPlaybackInput['beforePlay'];
+    observeFailure?: ControlledPlaybackInput['observeFailure'];
     modify?: (value: any) => void;
   } = {},
 ) {
@@ -177,6 +180,7 @@ function fake(
       ...input(),
       expectedDurationSeconds: options.endAfter ?? 0.6,
       ...(options.beforePlay ? { beforePlay: options.beforePlay } : {}),
+      ...(options.observeFailure ? { observeFailure: options.observeFailure } : {}),
       observe: () => {
         observed++;
       },
@@ -203,7 +207,8 @@ function fake(
 }
 
 test('normal observed playback reports once at start and end, sampling continues during slow report, and terminal ACK stops observations', async () => {
-  const f = fake({ endAfter: 0.6, reportDelay: 700 }),
+  const failures: unknown[] = [];
+  const f = fake({ endAfter: 0.6, reportDelay: 700, observeFailure: value => { failures.push(value); } }),
     runtime = createControlledPlaybackRuntime({
       launch: async () => f.launched,
     });
@@ -213,6 +218,7 @@ test('normal observed playback reports once at start and end, sampling continues
   assert.ok(f.counts().captured > f.counts().observed);
   assert.ok(f.counts().observed >= 5);
   assert.equal(f.child.exitCode, 0);
+  assert.deepEqual(failures, []);
 });
 
 test('before-play hook receives actual verified paused metadata once and a fresh capture precedes the real click', async () => {
@@ -253,6 +259,7 @@ test('cancellation during a deferred start fences its late completion and closes
 test('invalid real observation aborts the in-flight report signal and never reports success', async () => {
   let signal: AbortSignal | undefined,
     observed = 0;
+  const failures: Readonly<{ code: ControlledPlaybackFailure }>[] = [];
   const f = fake({
       endAfter: 2,
       modify: (value) => {
@@ -264,6 +271,12 @@ test('invalid real observation aborts the in-flight report signal and never repo
     });
   const source = createControlledPlaybackSource({
     ...input(),
+    observeFailure: value => {
+      assert.equal(signal?.aborted, false);
+      assert.equal(Object.isFrozen(value), true);
+      failures.push(value);
+      throw new Error('private observer failure');
+    },
     observe: () => {
       observed++;
     },
@@ -276,7 +289,87 @@ test('invalid real observation aborts the in-flight report signal and never repo
   assert.equal(signal?.aborted, true);
   assert.equal(observed, 3);
   assert.equal(f.child.exitCode, 0);
+  assert.deepEqual(failures, [{ code: 'MEDIA_INVALID', origin: 'media_snapshot_invalid', snapshotReason: 'media_shape' }]);
 });
+
+test('media transport and observation rejection have distinct fixed origins without exposing the thrown error', async () => {
+  for (const origin of ['media_proxy_failure', 'observation_rejected'] as const) {
+    const facts: unknown[] = [], f = fake();
+    const runtime = createControlledPlaybackRuntime({ launch: async () => f.launched });
+    const source = createControlledPlaybackSource({ ...input(), expectedDurationSeconds: 0.6,
+      observeFailure: value => { facts.push(value); },
+      ...(origin === 'media_proxy_failure' ? { stream: async () => { throw new Error('private-url-token-stream'); } }
+        : { observe: () => { throw new Error('private-url-token-observation'); } }),
+    });
+    await assert.rejects(runtime.play(source, new AbortController().signal), failure('MEDIA_INVALID'));
+    assert.deepEqual(facts, [{ code: 'MEDIA_INVALID', origin }]);
+    assert.doesNotMatch(JSON.stringify(facts), /private|token|url/);
+    assert.equal(f.child.exitCode, 0); assert.deepEqual(f.reports, []);
+  }
+});
+
+for (const mode of ['MEDIA_INVALID', 'GUARD_FAILED', 'ABORTED'] as const) {
+  test(`first runtime ${mode} survives an actual SDK refresh pending during the one report attempt`, async () => {
+    const { fixture: schoolFixture, context: scope } = await import('./helpers/school-video-fixture.js');
+    const owner = randomUUID(), school = await schoolFixture({ durationSeconds: 4, owner });
+    let refreshPending = false, refreshEntered!: () => void, releaseRefresh!: () => void, released = 0;
+    const entered = new Promise<void>(resolve => { refreshEntered = resolve; });
+    const release = new Promise<void>(resolve => { releaseRefresh = resolve; });
+    school.onReturn(async () => {
+      if (school.counts().reports === 1 && school.paths.at(-1) === '/api/v1/users/self/profile') {
+        refreshPending = true; refreshEntered(); await release;
+        throw new Error('private-refresh-response');
+      }
+    });
+    const f = fake({ endAfter: 4, modify: value => {
+      if (mode === 'MEDIA_INVALID' && refreshPending && value.positionSeconds >= 0.4) value.visible = false;
+    } });
+    const runtime = createControlledPlaybackRuntime({ launch: async () => f.launched });
+    const claim = { jobId: randomUUID(), userId: owner, courseId: scope.courseId, lectureId: scope.moduleItemId,
+      acceptedGeneration: school.generation(), executionTokenHash: 'e'.repeat(64) };
+    const facts: Readonly<{ code: ControlledPlaybackFailure }>[] = [];
+    const diagnostics: ReturnType<typeof workerVideoReportDiagnostic>[] = [], acknowledgements: unknown[] = [];
+    const adapter = createSchoolPlayback({ school: school.sessions,
+      validateClaim: async (_claim, supplied) => { supplied.throwIfAborted(); if (mode === 'GUARD_FAILED' && refreshPending) throw new Error('private-claim-change'); },
+      validateFinalClaim: async (_claim, supplied) => { supplied.throwIfAborted(); },
+      createAdmission: () => ({}), createFinalProof: () => ({}),
+      leases: { acquire: async () => true, renew: async () => true, release: async () => { released++; } },
+      stream: async (_owner, prepare, request) => {
+        await request.validate(); await (await prepare(request.signal)).validate();
+        return { status: 200, contentLength: 4, body: Readable.from([Buffer.from('test')]) };
+      },
+      runtime: { createSource: value => createControlledPlaybackSource({ ...value, observeFailure: fact => {
+        value.observeFailure?.(fact); facts.push(fact); releaseRefresh();
+      } }), play: runtime.play, dispose: runtime.dispose },
+      reportFailure: value => { diagnostics.push(value); }, reportAcknowledged: value => { acknowledgements.push(value); },
+    });
+    const abort = new AbortController();
+    const prepared = await adapter.preparePlayback({ userId: claim.userId, claim }, { courseId: claim.courseId, lectureId: claim.lectureId }, abort.signal);
+    const playing = adapter.play(prepared, abort.signal);
+    const rejected = assert.rejects(playing, error => {
+      assert.equal((error as { code: string }).code, 'PLAYBACK_REPORT_UNKNOWN');
+      assert.equal(videoReportDiagnostic(error).runtimeFirstFailure, mode);
+      assert.doesNotMatch(JSON.stringify(error), /runtimeFirstFailure|private-refresh|private-claim/);
+      return true;
+    });
+    try {
+      await Promise.race([entered, playing.then(() => assert.fail('refresh must precede completion'))]);
+      if (mode === 'ABORTED') abort.abort();
+      await rejected;
+      const origin = mode === 'MEDIA_INVALID' ? 'media_snapshot_invalid' : mode === 'GUARD_FAILED' ? 'periodic_guard_failed' : 'other';
+      assert.deepEqual(facts, [{ code: mode, origin, ...(mode === 'MEDIA_INVALID' ? { snapshotReason: 'visibility' } : {}) }]);
+      assert.equal(Object.isFrozen(facts[0]), true);
+      assert.equal(diagnostics.length, 1); assert.equal(diagnostics[0].runtimeFirstFailure, mode);
+      assert.equal(diagnostics[0].runtimeFirstFailureOrigin, origin);
+      assert.equal(diagnostics[0].runtimeSnapshotReason, mode === 'MEDIA_INVALID' ? 'visibility' : undefined);
+      assert.doesNotMatch(JSON.stringify(diagnostics), /private|https|token|userId|jobId|courseId/);
+      assert.equal(school.counts().reports, 1); assert.deepEqual(acknowledgements, []);
+      assert.equal(f.child.exitCode, 0); assert.equal(released, 0);
+      await prepared.dispose(); assert.equal(school.counts().reports, 1); assert.equal(released, 0);
+      assert.ok(prepared.terminationProof?.());
+    } finally { releaseRefresh(); await prepared.dispose(); }
+  });
+}
 
 test('guard failure ends playback while continuing sampling during the pending check', async () => {
   let checks = 0,
@@ -325,7 +418,8 @@ test('cancel and hung close force only the owned process within the cleanup budg
 });
 
 test('unconfirmed kill preserves a cleanup failure for future disposal', async () => {
-  const f = fake({ hungClose: true, killFails: true, endAfter: 2 }),
+  const failures: unknown[] = [];
+  const f = fake({ hungClose: true, killFails: true, endAfter: 2, observeFailure: value => { failures.push(value); } }),
     runtime = createControlledPlaybackRuntime({
       launch: async () => f.launched,
     }),
@@ -337,6 +431,7 @@ test('unconfirmed kill preserves a cleanup failure for future disposal', async (
   abort.abort();
   await rejected;
   await assert.rejects(runtime.dispose(source), failure('CLEANUP_FAILED'));
+  assert.deepEqual(failures, [{ code: 'ABORTED', origin: 'other' }]);
 });
 
 test('cancel during launch waits for the late process exit before disposal succeeds', async () => {
@@ -364,21 +459,55 @@ test('cancel during launch waits for the late process exit before disposal succe
 });
 
 test('seek, hidden page, extra video, loop, and incorrect duration are rejected before reporting', async () => {
-  for (const change of [
-    { seekCount: 1 },
-    { visible: false },
-    { count: 2 },
-    { loop: true },
-    { durationSeconds: 99 },
-    { positionSeconds: 0.1 },
-  ]) {
-    const f = fake({ modify: (value) => Object.assign(value, change) }),
+  for (const [change, reason] of [
+    [{ seekCount: 1 }, 'seeking'],
+    [{ visible: false }, 'visibility'],
+    [{ error: 3 }, 'media_error'],
+    [{ count: 2 }, 'media_shape'],
+    [{ loop: true }, 'media_shape'],
+    [{ durationSeconds: 99 }, 'media_shape'],
+    [{ positionSeconds: 0.1 }, 'initial_playback'],
+  ] as const) {
+    const facts: unknown[] = [];
+    const f = fake({ modify: (value) => Object.assign(value, change), observeFailure: value => { facts.push(value); } }),
       runtime = createControlledPlaybackRuntime({
         launch: async () => f.launched,
       });
     await assert.rejects(runtime.play(f.source(), new AbortController().signal), failure('MEDIA_INVALID'));
     assert.deepEqual(f.reports, []);
     assert.equal(f.child.exitCode, 0);
+    assert.deepEqual(facts, [{ code: 'MEDIA_INVALID', origin: 'media_snapshot_invalid', snapshotReason: reason }]);
+  }
+});
+
+test('sampling gap keeps the exact 1.5 second boundary and distinguishes subsequent motion failures', async t => {
+  for (const mode of ['sampling_gap', 'boundary', 'position_reverse', 'position_advance', 'inactive_playback'] as const) {
+    let now = 0, sampledBoundary = false;
+    const clock = t.mock.method(performance, 'now', () => now);
+    const abort = new AbortController(), facts: unknown[] = [];
+    const f = fake({ endAfter: 4, modify: value => {
+      if (value.paused) return;
+      if (mode === 'sampling_gap' || mode === 'boundary') {
+        if (value.positionSeconds >= 0.2) now = mode === 'sampling_gap' ? 1501 : 1500;
+      } else {
+        now = Math.round(value.positionSeconds * 1000);
+        if (mode === 'position_reverse' && value.positionSeconds >= 0.4) value.positionSeconds = 0;
+        if (mode === 'position_advance' && value.positionSeconds >= 0.2) value.positionSeconds = 3;
+        if (mode === 'inactive_playback' && value.positionSeconds >= 0.2) value.paused = true;
+      }
+    } });
+    const runtime = createControlledPlaybackRuntime({ launch: async () => f.launched });
+    const source = createControlledPlaybackSource({ ...input(), expectedDurationSeconds: 4,
+      observeFailure: fact => { facts.push(fact); },
+      observe: value => { if (mode === 'boundary' && value.positionSeconds >= 0.2) { sampledBoundary = true; abort.abort(); } },
+    });
+    try {
+      await assert.rejects(runtime.play(source, abort.signal), failure(mode === 'boundary' ? 'ABORTED' : 'MEDIA_INVALID'));
+      assert.deepEqual(facts, mode === 'boundary' ? [{ code: 'ABORTED', origin: 'other' }]
+        : [{ code: 'MEDIA_INVALID', origin: 'media_snapshot_invalid', snapshotReason: mode }]);
+      if (mode === 'boundary') assert.equal(sampledBoundary, true);
+      assert.equal(f.child.exitCode, 0);
+    } finally { clock.mock.restore(); }
   }
 });
 
@@ -503,11 +632,13 @@ test('a third report failure after two ACKs stops without an ended report or aut
   let now = 0, first!: () => void, done = false;
   const started = new Promise<void>(resolve => { first = resolve; });
   const sent: string[] = [];
+  const failures: unknown[] = [];
   const f = fake({ endAfter: 700 });
   const runtime = createControlledPlaybackRuntime({ launch: async () => f.launched });
   t.mock.timers.enable({ apis: ['setTimeout'] });
   t.mock.method(performance, 'now', () => now);
   const source = createControlledPlaybackSource({ ...input(), expectedDurationSeconds: 700,
+    observeFailure: value => { failures.push(value); },
     report: async event => {
       sent.push(event); if (event === 'playing') first();
       if (sent.length === 3) throw new Error('private transport failure');
@@ -529,6 +660,7 @@ test('a third report failure after two ACKs stops without an ended report or aut
   assert.equal(f.child.exitCode, 0);
   await assert.rejects(runtime.play(source, new AbortController().signal), failure('SOURCE_USED'));
   assert.equal(sent.length, 3);
+  assert.deepEqual(failures, [{ code: 'REPORT_FAILED', origin: 'report_failed' }]);
 });
 
 test('cancellation during the third pending report aborts its signal and closes only the owned runtime', async (t) => {
