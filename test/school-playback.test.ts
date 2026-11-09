@@ -357,6 +357,60 @@ test('an unsent baseline conflict remains conservative while its false possible-
   assert.equal(f.counts().reportCalls, 1); assert.equal(f.counts().releaseCalls, 0);
 });
 
+test('a primary report failure is logged before any runtime stop and later cleanup cannot replace the first stop fact', async () => {
+  const f = fixture(), prepared = await f.prepare();
+  f.reportWith(async () => { throw new SchoolVideoReportError('upstream_unavailable', 'refresh', true); });
+  f.playWith(async (input, running) => {
+    try { await input.report('playing', running); } catch {
+      assert.equal(f.diagnostics.length, 1); assert.equal(f.diagnostics[0].runtimeFirstFailure, undefined);
+      input.observeFailure?.(Object.freeze({ code: 'REPORT_FAILED', origin: 'report_failed' }));
+      input.observeFailure?.(Object.freeze({ code: 'CLEANUP_FAILED', origin: 'other' }));
+      throw new Error('private runtime normalization');
+    }
+    return evidence;
+  });
+  await assert.rejects(f.adapter.play(prepared, signal()), error => {
+    assert.equal((error as AppError).code, 'PLAYBACK_REPORT_UNKNOWN');
+    assert.deepEqual(videoReportDiagnostic(error), { stage: 'refresh', code: 'upstream_unavailable', mayHaveWritten: true,
+      runtimeFirstFailure: 'REPORT_FAILED', runtimeFirstFailureOrigin: 'report_failed' });
+    assert.doesNotMatch(JSON.stringify(error), /runtimeFirstFailure|private/); return true;
+  });
+  assert.equal(f.diagnostics[0].runtimeFirstFailure, undefined);
+  assert.equal(f.counts().reportCalls, 1); assert.equal(f.counts().disposeCalls, 1); assert.equal(f.counts().releaseCalls, 0);
+  assert.deepEqual(f.acknowledgements, []);
+});
+
+test('observation diagnostics retain only the existing SDK private classification, never an error property', async () => {
+  const { fixture: schoolFixture, context } = await import('./helpers/school-video-fixture.js');
+  const school = await schoolFixture(), driver = await school.sessions.prepare(context, noop, signal());
+  try {
+    for (const trusted of [true, false]) {
+      const f = fixture(), prepared = await f.prepare();
+      f.driver.observe = trusted ? value => driver.observe(value) : () => {
+        throw Object.assign(new Error('private-observation-error'), { kind: 'visibility', observationFailure: 'visibility' });
+      };
+      f.playWith(async (input) => {
+        try { input.observe({ ...observed, visible: false }); } catch {
+          input.observeFailure?.(Object.freeze({ code: 'MEDIA_INVALID', origin: 'observation_rejected' }));
+          throw new Error('MEDIA_INVALID');
+        }
+        return evidence;
+      });
+      await assert.rejects(f.adapter.play(prepared, signal()), error => {
+        const facts = videoReportDiagnostic(error);
+        assert.equal(facts.runtimeFirstFailure, 'MEDIA_INVALID');
+        assert.equal(facts.runtimeFirstFailureOrigin, 'observation_rejected');
+        assert.equal(facts.runtimeObservationFailure, trusted ? 'visibility' : undefined);
+        assert.equal(facts.runtimeSnapshotReason, undefined);
+        assert.doesNotMatch(JSON.stringify(error), /runtimeObservation|private-observation/);
+        return true;
+      });
+      assert.equal(f.counts().reportCalls, 0); assert.equal(f.counts().releaseCalls, 1);
+      assert.equal(f.counts().disposeCalls, 1); assert.deepEqual(f.diagnostics, []); assert.deepEqual(f.acknowledgements, []);
+    }
+  } finally { driver.close(); }
+});
+
 test('a throwing diagnostic observer cannot alter report uncertainty or runtime cleanup', async () => {
   const f = fixture(() => { throw new Error('observer failed'); }), prepared = await f.prepare();
   f.reportWith(async () => { throw new SchoolVideoReportError('unexpected_response', 'transmission', true); });

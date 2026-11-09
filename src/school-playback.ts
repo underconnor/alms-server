@@ -1,6 +1,7 @@
 import { createPlaybackTerminationProof, type PlaybackTerminationProof } from './playback-termination.js';
 import { inspect } from 'node:util';
 import { z } from 'zod';
+import { inspectSchoolVideoObservationFailure, type SchoolVideoObservationFailureKind } from '@alms/ssu-api';
 import { AppError } from './errors.js';
 import { boundedWorkerOperation } from './worker-bounds.js';
 import { createVideoStreamer, type VideoRequest, type VideoResponse } from './video-stream.js';
@@ -9,7 +10,8 @@ import type { PreparedPlayback } from './provider.js';
 import type { PlaybackLeaseRepository, PlaybackLeaseScope } from './manual-video-lease.js';
 import type { ManualVideoObservation } from './manual-video-types.js';
 import type { PreparedSchoolVideo, SchoolVideoSessions } from './school-video-session.js';
-import { rememberVideoReportDiagnostic, rememberVideoReportPreparation, rememberVideoReportOutcomeFailure, workerVideoReportDiagnostic } from './video-report-diagnostics.js';
+import type { ControlledPlaybackFailure, ControlledPlaybackFailureOrigin, ControlledPlaybackSnapshotReason } from './controlled-playback-runtime.js';
+import { rememberVideoReportDiagnostic, rememberVideoReportPreparation, rememberVideoReportOutcomeFailure, rememberVideoRuntimeFailure, workerVideoReportDiagnostic } from './video-report-diagnostics.js';
 import { copyPlaybackStartDiagnostic } from './playback-start-diagnostics.js';
 
 const id = z.string().min(1).max(200).regex(/^[A-Za-z0-9:_-]+$/);
@@ -25,6 +27,8 @@ export interface SchoolPlaybackInput {
   validate(signal: AbortSignal): Promise<void>;
   stream(request: VideoRequest): Promise<VideoResponse>;
   observe(value: ManualVideoObservation): void;
+  observeFailure?(value: Readonly<{ code: ControlledPlaybackFailure; origin: ControlledPlaybackFailureOrigin;
+    snapshotReason?: ControlledPlaybackSnapshotReason }>): void;
   beforePlay?(value: ManualVideoObservation, signal: AbortSignal): Promise<void>;
   report(event: 'playing' | 'update' | 'ended', signal: AbortSignal): Promise<void>;
 }
@@ -88,6 +92,8 @@ export function createSchoolPlayback<Source, Admission, FinalProof>(dependencies
     lifetime: AbortController; played: boolean; disposed: boolean; cleanupConfirmed: boolean; uncertain: boolean; reporting: boolean;
     callbacks: Set<Promise<unknown>>; runtimePending: boolean; runtimeStopped: boolean; closeSucceeded: boolean; termination?: PlaybackTerminationProof;
     startInvoked: boolean; startReady: boolean; starting: boolean; startPending?: Promise<void>;
+    runtimeFirstFailure?: Readonly<{ code: ControlledPlaybackFailure; origin: ControlledPlaybackFailureOrigin; snapshotReason?: ControlledPlaybackSnapshotReason }>;
+    runtimeObservationFailure?: SchoolVideoObservationFailureKind;
     disposePromise?: Promise<void>; reportPending?: Promise<void>; failure?: unknown; reportFailure?: unknown; ended: boolean; endedReport: boolean };
   const states = new WeakMap<PreparedPlayback, State>();
   const read = (prepared: PreparedPlayback) => { const state = states.get(prepared); if (!state) throw changed(); return state; };
@@ -227,10 +233,15 @@ export function createSchoolPlayback<Source, Admission, FinalProof>(dependencies
             },
             observe: observation => {
               if (!state || state.disposed || lifetime.signal.aborted) throw changed();
-              driver!.observe(observation);
+              try { driver!.observe(observation); } catch (error) {
+                try { state.runtimeObservationFailure ??= inspectSchoolVideoObservationFailure(error)?.kind; } catch {}
+                throw error;
+              }
               // Sampling never waits for persistence, and a display observer cannot change playback.
               try { dependencies.observeProgress?.(claim, Object.freeze({ ...observation })); } catch {}
             },
+            observeFailure: value => { if (state) state.runtimeFirstFailure ??= Object.freeze({ code: value.code, origin: value.origin,
+              ...(value.snapshotReason ? { snapshotReason: value.snapshotReason } : {}) }); },
             ...(dependencies.reservePlaybackStart ? { beforePlay: (observation: ManualVideoObservation, current: AbortSignal) => beforePlay(state!, observation, current) } : {}),
             report: (event, reportSignal) => {
               if (!state || state.disposed || !state.startReady || state.starting || state.reporting || lifetime.signal.aborted) return Promise.reject(changed());
@@ -264,6 +275,9 @@ export function createSchoolPlayback<Source, Admission, FinalProof>(dependencies
                 // Before this boundary no school report was attempted. Once entered, do not
                 // infer non-delivery from authentication, cancellation or response loss.
                 owned.uncertain ||= enteredSchoolReport; owned.failure ??= error; owned.reportFailure ??= error;
+                if (owned.runtimeFirstFailure && error !== null && typeof error === 'object')
+                  rememberVideoRuntimeFailure(error, owned.runtimeFirstFailure.code, owned.runtimeFirstFailure.origin,
+                    owned.runtimeFirstFailure.snapshotReason, owned.runtimeObservationFailure);
                 // Observability cannot alter authority, cleanup, uncertainty or retry behavior.
                 try { dependencies.reportFailure?.(workerVideoReportDiagnostic(error, event)); } catch {}
                 throw owned.uncertain ? unknown(error) : error;
@@ -306,7 +320,14 @@ export function createSchoolPlayback<Source, Admission, FinalProof>(dependencies
         // The runner transitions to reconciling after play resolves. Close execution first,
         // so no final-only authority can ever authorize another observation or report.
         await dispose(state); signal.throwIfAborted();
-      } catch (error) { await dispose(state).catch(() => {}); throw state.uncertain ? unknown(state.reportFailure ?? state.failure ?? error) : state.failure ?? error; }
+      } catch (error) {
+        await dispose(state).catch(() => {});
+        const result = state.uncertain ? unknown(state.reportFailure ?? state.failure ?? error) : state.failure ?? error;
+        if (state.runtimeFirstFailure && result !== null && typeof result === 'object')
+          rememberVideoRuntimeFailure(result, state.runtimeFirstFailure.code, state.runtimeFirstFailure.origin,
+            state.runtimeFirstFailure.snapshotReason, state.runtimeObservationFailure);
+        throw result;
+      }
     },
     async playbackLearningStatus(prepared: PreparedPlayback, signal: AbortSignal): Promise<SchoolResult> {
       const state = read(prepared);

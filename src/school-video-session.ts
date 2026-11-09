@@ -1,6 +1,7 @@
 import { verifiedVideoMedia } from './verified-video-media.js';
 import { z } from 'zod';
-import { rememberVideoReportPreparation, rememberVideoReportResult, videoReportDiagnostic, type VideoReportPreparationStage, type VideoReportContext } from './video-report-diagnostics.js';
+import { rememberVideoReportPreparation, rememberVideoReportResult, rememberVideoReportTransmission, rememberVideoReportFailureContext, videoReportDiagnostic,
+  type VideoReportPreparationStage, type VideoReportContext, type VideoReportTransmission, type VideoReportPhase } from './video-report-diagnostics.js';
 import { SchoolHttpClient, initializeLearningxClient, selectDefaultTerms, inspectSchoolVideoLaunch,
   prepareSchoolVideoCallbackBinding, createSchoolManualVideoReportController, observeSchoolManualVideoPlayback,
   reportSchoolManualVideoPlayback, closeSchoolManualVideoReportController, inspectSchoolManualVideoReportController,
@@ -26,6 +27,7 @@ const changed = () => new AppError(409, 'SCHOOL_SESSION_CHANGED', '학교 인증
 const required = () => new AppError(401, 'SCHOOL_AUTH_REQUIRED', '학교 인증을 다시 확인해 주세요.');
 type Session = z.infer<typeof stored>;
 type Connection = { client: LearningxClient; http: SchoolHttpClient; session: Session; current: () => Promise<void> };
+type ReportAttempt = { phase: VideoReportPhase; transportEntered: boolean; freshReadFinished: boolean };
 
 /** Fresh, account-scoped school preparation and reporting. Handles and URLs remain in this process only. */
 export interface SchoolVideoTarget { owner: string; courseId: string; moduleItemId: string }
@@ -135,16 +137,23 @@ export function createSchoolVideoSessions(store: SchoolVideoSessionStore, key: B
     let lastPosition: number | null = null, observationState: VideoReportContext['observationState'] = 'missing',
       positionDelta: VideoReportContext['positionDelta'] = 'unknown';
     let startConsumed = false;
-    let active: { connection: Connection; validate: () => Promise<void>; signal: AbortSignal } | null = null, reporting = false;
+    let active: { connection: Connection; validate: () => Promise<void>; signal: AbortSignal; attempt: ReportAttempt } | null = null, reporting = false;
     const createReportController = (launch: typeof original.launch) => createSchoolManualVideoReportController(prepareSchoolVideoCallbackBinding(launch, original.login), {
       signal: lifetime.signal,
       validateCurrent: async sdkSignal => {
-        if (!active) throw new SchoolError('unsupported'); sdkSignal.throwIfAborted(); active.signal.throwIfAborted();
+        if (!active) throw new SchoolError('unsupported');
+        active.attempt.phase = active.attempt.freshReadFinished ? 'post_refresh_guard'
+          : active.attempt.transportEntered ? 'post_transport_guard' : 'pre_transport_guard';
+        sdkSignal.throwIfAborted(); active.signal.throwIfAborted();
         await active.validate(); await active.connection.current(); sdkSignal.throwIfAborted();
       },
       readFresh: async sdkSignal => {
         if (!active) throw new SchoolError('unsupported');
-        return active.connection.client.moduleLearningStatus(context.courseId, context.moduleItemId, AbortSignal.any([sdkSignal, active.signal]));
+        const current = active;
+        current.attempt.phase = 'fresh_read';
+        const result = await current.connection.client.moduleLearningStatus(context.courseId, context.moduleItemId, AbortSignal.any([sdkSignal, current.signal]));
+        current.attempt.freshReadFinished = true;
+        return result;
       },
     });
     let controller = createReportController(original.launch);
@@ -263,6 +272,16 @@ export function createSchoolVideoSessions(store: SchoolVideoSessionStore, key: B
       },
       report: async (event, current, reportSignal) => {
         let stage: VideoReportPreparationStage = 'guard', mayHaveWritten = false;
+        let transmission: VideoReportTransmission | undefined;
+        const attempt: ReportAttempt = { phase: 'preflight', transportEntered: false, freshReadFinished: false };
+        const rememberFailure = (error: unknown) => {
+          // Existing unsent preflight diagnostics remain unchanged; these facts describe
+          // the attempted transport and subsequent checks only.
+          if (!mayHaveWritten || !error || typeof error !== 'object') return;
+          if (transmission) rememberVideoReportTransmission(error, transmission);
+          rememberVideoReportFailureContext(error, { phase: attempt.phase,
+            reportSignalAborted: reportSignal.aborted, lifetimeAborted: lifetime.signal.aborted });
+        };
         const snapshot = (): VideoReportContext => {
           const state = inspectSchoolManualVideoReportController(controller);
           return { event, controllerPhase: state.phase, controllerAttempt: state.attempts === 0 ? 'none' : 'previous', observationState, positionDelta };
@@ -287,37 +306,62 @@ export function createSchoolVideoSessions(store: SchoolVideoSessionStore, key: B
               throw new AppError(409, 'PLAYBACK_OBSERVATION_INVALID', '학교 진도가 변경됐습니다. 학교 결과를 확인한 뒤 다시 재생해 주세요.');
             }
             // No owner lock spans playback. A report restores the latest jar and owns it only through its fresh read/CAS.
-            active = { connection, validate: current, signal: reportSignal };
+            active = { connection, validate: current, signal: reportSignal, attempt };
             try {
-              stage = 'manual_event'; reportContext = snapshot();
+              stage = 'manual_event'; attempt.phase = 'pre_transport_guard'; reportContext = snapshot();
               const transmissionDiagnostic: { code: ReturnType<typeof videoReportDiagnostic>['code'] | 'none';
                 response: ReturnType<typeof inspectSchoolVideoReportResponseFailure> } = { code: 'none', response: null };
               const result = await reportSchoolManualVideoPlayback(controller, event, {
                 forwardVideoReport: async (request, sdkSignal) => { mayHaveWritten = true; invalidateRequired = true;
-                  try { return await connection.http.forwardVideoReport(request, sdkSignal); }
+                  attempt.transportEntered = true; attempt.phase = 'transmission';
+                  try {
+                    const response = await connection.http.forwardVideoReport(request, sdkSignal);
+                    // This receipt records only the strict HTTP parser's fact. A later SDK
+                    // refresh/CAS/guard failure still fails normally and must never be retried.
+                    transmission = response?.acknowledged === true
+                      ? Object.freeze({ outcome: 'acknowledged', code: 'none' })
+                      : Object.freeze({ outcome: 'failed', code: 'unexpected_response' });
+                    attempt.phase = 'post_transport_guard';
+                    return response;
+                  }
                   catch (error) { transmissionDiagnostic.code = videoReportDiagnostic(error).code;
-                    transmissionDiagnostic.response = inspectSchoolVideoReportResponseFailure(error); throw error; } },
+                    transmissionDiagnostic.response = inspectSchoolVideoReportResponseFailure(error);
+                    transmission = Object.freeze({ outcome: 'failed', code: transmissionDiagnostic.code,
+                      ...(transmissionDiagnostic.response ? { responseFailure: transmissionDiagnostic.response.kind } : {}) });
+                    throw error; } },
               });
-              stage = 'post_report';
+              stage = 'post_report'; attempt.phase = 'post_report';
               if (result.transport === 'acknowledged') knownSchoolProgress = result.school.progressSeconds;
               const returned = { transport: result.transport, school: projectLearningStatus(result.school, context.courseId, context.moduleItemId),
                 state: inspectSchoolManualVideoReportController(controller).phase === 'ready' ? 'ready' as const : 'closed' as const };
+              if (transmission) rememberVideoReportTransmission(returned, transmission);
               rememberVideoReportResult(returned, { controllerPhase: inspectSchoolManualVideoReportController(controller).phase,
                 transmissionCode: result.transport === 'acknowledged' ? 'none' : transmissionDiagnostic.code === 'none' ? 'unknown' : transmissionDiagnostic.code,
                 publishedStillTrue: result.school.published === true, openedStillTrue: result.school.opened === true,
                 omitProgressStillFalse: result.school.omitProgress === false,
                 durationExactlyMatches: result.school.durationSeconds === original.data.detail.durationSeconds,
                 ...(result.transport === 'unknown' && transmissionDiagnostic.response ? { responseFailure: transmissionDiagnostic.response.kind } : {}) });
-              return returned;
+              attempt.phase = 'session_persist'; return returned;
+            } catch (error) {
+              // Preserve this boundary before execute's final authority check or the
+              // caller's later teardown can change either cancellation signal.
+              rememberFailure(error); throw error;
             } finally { active = null; }
           });
           return value.value;
         } catch (error) {
+          rememberFailure(error);
           rememberVideoReportPreparation(error, stage, mayHaveWritten, reportContext); throw error;
         } finally {
           // Run outside the school owner lock: the reader's invalidation acquires that same lock.
-          try { if (invalidateRequired) await boundedWorkerOperation(() => invalidate(context.owner, context.courseId, context.moduleItemId), { timeoutMs: 5_000 }); }
-          catch (error) { rememberVideoReportPreparation(error, 'cache_invalidation', mayHaveWritten, reportContext); throw error; }
+          try { if (invalidateRequired) {
+            attempt.phase = 'cache_invalidation';
+            await boundedWorkerOperation(() => invalidate(context.owner, context.courseId, context.moduleItemId), { timeoutMs: 5_000 });
+          } }
+          catch (error) {
+            rememberFailure(error);
+            rememberVideoReportPreparation(error, 'cache_invalidation', mayHaveWritten, reportContext); throw error;
+          }
           finally { reporting = false; }
         }
       },

@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { SchoolError, SchoolVideoReportError } from '@alms/ssu-api';
 import { AppError } from '../src/errors.js';
 import { videoReportDiagnostic, rememberVideoReportDiagnostic, rememberVideoReportPreparation, workerVideoReportDiagnostic,
-  rememberVideoReportResult, rememberVideoReportOutcomeFailure } from '../src/video-report-diagnostics.js';
+  rememberVideoReportResult, rememberVideoReportOutcomeFailure, rememberVideoReportTransmission, rememberVideoRuntimeFailure,
+  rememberVideoReportFailureContext } from '../src/video-report-diagnostics.js';
 test('school report stage and possible write survive normalization without source data', () => {
   const source = new SchoolVideoReportError('unexpected_response','refresh',true);
   Object.assign(source,{ url:'https://private.invalid/?token=secret',body:'private',cause:new Error('secret') });
@@ -104,4 +105,125 @@ test('response failure classification is copied only from private allowlisted re
     assert.equal(videoReportDiagnostic(error).outcome?.responseFailure,responseFailure==='private-response'?undefined:responseFailure);
     assert.doesNotMatch(JSON.stringify(videoReportDiagnostic(error)),/private/);
   }
+});
+
+test('strict transmission facts survive a later refresh failure and normalization as an immutable separate fact', () => {
+  const source = new SchoolVideoReportError('upstream_unavailable', 'refresh', true);
+  const facts = { outcome: 'failed' as const, code: 'unexpected_response' as const, responseFailure: 'ack_result_rejected' as const,
+    url: 'private-url', body: 'private-body' };
+  rememberVideoReportTransmission(source, facts);
+  Object.assign(facts, { code: 'private-code', responseFailure: 'private-failure' });
+  rememberVideoReportTransmission(source, { outcome: 'acknowledged', code: 'none' });
+  rememberVideoReportPreparation(source, 'manual_event', true);
+  const error = new AppError(503, 'PLAYBACK_REPORT_UNKNOWN', 'fixed'); rememberVideoReportDiagnostic(error, source);
+  assert.deepEqual(videoReportDiagnostic(error), { stage: 'refresh', code: 'upstream_unavailable', mayHaveWritten: true,
+    transmission: { outcome: 'failed', code: 'unexpected_response', responseFailure: 'ack_result_rejected' } });
+  assert.equal(Object.isFrozen(videoReportDiagnostic(error).transmission), true);
+  assert.doesNotMatch(JSON.stringify(videoReportDiagnostic(error)), /private|url|body/);
+  assert.doesNotMatch(JSON.stringify(error), /transmission|responseFailure/);
+});
+
+test('invalid transmission facts cannot invent an ACK or inject raw values', () => {
+  const samples = [
+    { outcome: 'private', code: 'none' }, { outcome: 'acknowledged', code: 'unexpected_response' },
+    { outcome: 'acknowledged', code: 'none', responseFailure: 'ack_result_rejected' },
+    { outcome: 'failed', code: 'none' }, { outcome: 'failed', code: 'private' },
+    { outcome: 'failed', code: 'unexpected_response', responseFailure: 'private' },
+  ];
+  for (const facts of samples) {
+    const error = new AppError(503, 'PLAYBACK_REPORT_UNKNOWN', 'fixed');
+    rememberVideoReportTransmission(error, facts as any);
+    assert.equal(videoReportDiagnostic(error).transmission, undefined);
+  }
+  assert.equal(videoReportDiagnostic({ transmission: { outcome: 'acknowledged', code: 'none' } }).transmission, undefined);
+});
+
+test('result normalization keeps a strict ACK fact separate from an unsuccessful post-report outcome', () => {
+  const result = { transport: 'acknowledged' as const, state: 'closed' as const };
+  rememberVideoReportTransmission(result, { outcome: 'acknowledged', code: 'none' });
+  const error = new AppError(503, 'PLAYBACK_REPORT_UNKNOWN', 'fixed');
+  rememberVideoReportOutcomeFailure(error, result, 'nonterminal_controller_closed');
+  assert.deepEqual(videoReportDiagnostic(error).transmission, { outcome: 'acknowledged', code: 'none' });
+  assert.equal(videoReportDiagnostic(error).outcome?.reason, 'nonterminal_controller_closed');
+  assert.doesNotMatch(JSON.stringify(result), /transmission/);
+});
+
+test('first runtime stop is fixed, separate and cannot be overwritten by report normalization', () => {
+  const source = new SchoolVideoReportError('upstream_unavailable', 'refresh', true);
+  const error = new AppError(503, 'PLAYBACK_REPORT_UNKNOWN', 'fixed');
+  rememberVideoRuntimeFailure(error, 'private-runtime-code' as any);
+  assert.equal(videoReportDiagnostic(error).runtimeFirstFailure, undefined);
+  rememberVideoRuntimeFailure(error, 'MEDIA_INVALID'); rememberVideoRuntimeFailure(error, 'REPORT_FAILED');
+  rememberVideoReportDiagnostic(error, source); rememberVideoReportPreparation(error, 'manual_event', true);
+  assert.deepEqual(videoReportDiagnostic(error), { stage: 'refresh', code: 'upstream_unavailable', mayHaveWritten: true,
+    runtimeFirstFailure: 'MEDIA_INVALID' });
+  assert.equal(videoReportDiagnostic({ runtimeFirstFailure: 'MEDIA_INVALID' }).runtimeFirstFailure, undefined);
+  assert.doesNotMatch(JSON.stringify(error), /runtimeFirstFailure/);
+});
+
+test('report phase and signal facts are immutable allowlisted snapshots and survive normalization', () => {
+  const source = new SchoolVideoReportError('upstream_unavailable', 'refresh', true);
+  const facts = { phase: 'fresh_read' as const, reportSignalAborted: false, lifetimeAborted: false, reason: 'private-reason', url: 'private-url' };
+  rememberVideoReportFailureContext(source, facts); Object.assign(facts, { phase: 'private-phase', lifetimeAborted: true });
+  rememberVideoReportFailureContext(source, { phase: 'cache_invalidation', reportSignalAborted: true, lifetimeAborted: true });
+  const error = new AppError(503, 'PLAYBACK_REPORT_UNKNOWN', 'fixed');
+  rememberVideoReportDiagnostic(error, source); rememberVideoReportPreparation(error, 'manual_event', true);
+  assert.deepEqual(videoReportDiagnostic(error).reportFailure, { phase: 'fresh_read', reportSignalAborted: false, lifetimeAborted: false });
+  assert.equal(Object.isFrozen(videoReportDiagnostic(error).reportFailure), true);
+  assert.doesNotMatch(JSON.stringify(videoReportDiagnostic(error)), /private|url|reason/);
+  assert.doesNotMatch(JSON.stringify(error), /reportFailure|reportSignalAborted/);
+  for (const malformed of [{ phase: 'private', reportSignalAborted: false, lifetimeAborted: false },
+    { phase: 'fresh_read', reportSignalAborted: 'false', lifetimeAborted: false },
+    { phase: ['fresh_read'], reportSignalAborted: false, lifetimeAborted: false }]) {
+    const other = new AppError(503, 'PLAYBACK_REPORT_UNKNOWN', 'fixed'); rememberVideoReportFailureContext(other, malformed as any);
+    assert.equal(videoReportDiagnostic(other).reportFailure, undefined);
+  }
+  assert.equal(videoReportDiagnostic({ reportFailure: { phase: 'fresh_read', reportSignalAborted: false, lifetimeAborted: false } }).reportFailure, undefined);
+});
+
+test('runtime origin remains bound to the first runtime code and does not inherit a later source origin', () => {
+  const first = new AppError(503, 'PLAYBACK_REPORT_UNKNOWN', 'fixed'), later = new SchoolVideoReportError('upstream_unavailable', 'refresh', true);
+  rememberVideoRuntimeFailure(first, 'MEDIA_INVALID', 'observation_rejected');
+  rememberVideoRuntimeFailure(first, 'REPORT_FAILED', 'report_failed');
+  rememberVideoRuntimeFailure(later, 'GUARD_FAILED', 'periodic_guard_failed');
+  rememberVideoReportDiagnostic(first, later); rememberVideoReportPreparation(first, 'manual_event', true);
+  assert.equal(videoReportDiagnostic(first).runtimeFirstFailure, 'MEDIA_INVALID');
+  assert.equal(videoReportDiagnostic(first).runtimeFirstFailureOrigin, 'observation_rejected');
+  const legacy = new AppError(503, 'PLAYBACK_REPORT_UNKNOWN', 'fixed'); rememberVideoRuntimeFailure(legacy, 'MEDIA_INVALID');
+  rememberVideoReportDiagnostic(legacy, later);
+  assert.equal(videoReportDiagnostic(legacy).runtimeFirstFailureOrigin, undefined);
+  const invalid = new AppError(503, 'PLAYBACK_REPORT_UNKNOWN', 'fixed'); rememberVideoRuntimeFailure(invalid, 'MEDIA_INVALID', 'private-origin' as any);
+  assert.equal(videoReportDiagnostic(invalid).runtimeFirstFailureOrigin, undefined);
+});
+
+test('runtime snapshot and SDK observation details stay fixed and bound to their first matching origin', () => {
+  const snapshot = new AppError(503, 'PLAYBACK_REPORT_UNKNOWN', 'fixed');
+  rememberVideoRuntimeFailure(snapshot, 'MEDIA_INVALID', 'media_snapshot_invalid', 'sampling_gap', 'pair_progress');
+  rememberVideoRuntimeFailure(snapshot, 'MEDIA_INVALID', 'media_snapshot_invalid', 'position_reverse');
+  const other = new SchoolVideoReportError('upstream_unavailable', 'refresh', true);
+  rememberVideoRuntimeFailure(other, 'MEDIA_INVALID', 'observation_rejected', undefined, 'pair_progress');
+  rememberVideoReportDiagnostic(snapshot, other); rememberVideoReportPreparation(snapshot, 'manual_event', true);
+  assert.equal(videoReportDiagnostic(snapshot).runtimeSnapshotReason, 'sampling_gap');
+  assert.equal(videoReportDiagnostic(snapshot).runtimeObservationFailure, undefined);
+  assert.equal(videoReportDiagnostic(snapshot).runtimeFirstFailureOrigin, 'media_snapshot_invalid');
+  const normalized = new AppError(503, 'PLAYBACK_REPORT_UNKNOWN', 'fixed'); rememberVideoReportDiagnostic(normalized, other);
+  assert.equal(videoReportDiagnostic(normalized).runtimeObservationFailure, 'pair_progress');
+  assert.equal(videoReportDiagnostic(normalized).runtimeSnapshotReason, undefined);
+  const legacy = new AppError(503, 'PLAYBACK_REPORT_UNKNOWN', 'fixed'); rememberVideoRuntimeFailure(legacy, 'MEDIA_INVALID');
+  rememberVideoReportDiagnostic(legacy, other); assert.equal(videoReportDiagnostic(legacy).runtimeObservationFailure, undefined);
+  assert.equal(videoReportDiagnostic(legacy).runtimeFirstFailureOrigin, undefined);
+});
+
+test('unclassified or mismatched runtime details cannot inject diagnostic facts', () => {
+  for (const [origin, snapshotReason, observationFailure] of [
+    ['other','sampling_gap','pair_progress'], ['media_snapshot_invalid','private-reason','pair_progress'],
+    ['observation_rejected','sampling_gap','private-reason'], ['private-origin','sampling_gap','pair_progress'],
+  ]) {
+    const error = new AppError(503, 'PLAYBACK_REPORT_UNKNOWN', 'fixed');
+    rememberVideoRuntimeFailure(error, 'MEDIA_INVALID', origin as any, snapshotReason as any, observationFailure as any);
+    assert.equal(videoReportDiagnostic(error).runtimeSnapshotReason, undefined);
+    assert.equal(videoReportDiagnostic(error).runtimeObservationFailure, undefined);
+    assert.doesNotMatch(JSON.stringify(videoReportDiagnostic(error)), /private/);
+  }
+  assert.equal(videoReportDiagnostic({ runtimeSnapshotReason: 'sampling_gap', runtimeObservationFailure: 'pair_progress' }).runtimeSnapshotReason, undefined);
 });

@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createPlaybackLogProjection } from '../src/playback-log-projection.js';
-import { workerVideoReportDiagnostic, rememberVideoReportPreparation } from '../src/video-report-diagnostics.js';
+import { workerVideoReportDiagnostic, rememberVideoReportPreparation, rememberVideoReportTransmission,
+  rememberVideoRuntimeFailure } from '../src/video-report-diagnostics.js';
 import { AppError } from '../src/errors.js';
 const from = '2026-10-12T11:36:56.194Z', until = '2026-10-12T12:08:12.249441Z';
 const line = (row: unknown, time = '2026-10-12T12:04:33.685928123Z') => time + ' ' + JSON.stringify(row);
@@ -119,4 +120,105 @@ test('response failure projection preserves new fixed classifications and old lo
   assert.equal((p.result().records[2] as any).outcome.responseFailure,'content_type');
   assert.equal((p.result().records[3] as any).outcome.responseFailure,undefined);assert.equal((p.result().records[4] as any).outcome.responseFailure,undefined);
   assert.doesNotMatch(JSON.stringify(p.result()),/private|"body"/);assert.equal(p.result().reportAckCount,null);
+});
+
+test('worker log projection keeps independent strict transmission and first runtime facts without source data', () => {
+  const p = createPlaybackLogProjection('worker', { from, until });
+  for (const outcome of ['acknowledged', 'failed'] as const) {
+    const error = new AppError(503, 'PLAYBACK_REPORT_UNKNOWN', 'private-error');
+    rememberVideoReportPreparation(error, 'manual_event', true);
+    rememberVideoReportTransmission(error, outcome === 'acknowledged' ? { outcome, code: 'none' }
+      : { outcome, code: 'unexpected_response', responseFailure: 'ack_result_rejected' });
+    rememberVideoRuntimeFailure(error, 'MEDIA_INVALID');
+    const deployed = workerVideoReportDiagnostic(error, 'playing');
+    p.push(line({ ...deployed, ...secret, transmission: { ...deployed.transmission, ...secret } }));
+    assert.deepEqual(p.result().records.at(-1), { ...deployed, time: '2026-10-12T12:04:33.685928123Z' });
+    assert.equal(Object.isFrozen((p.result().records.at(-1) as any).transmission), true);
+  }
+  assert.equal(p.result().workerReportFailureCount, 2); assert.equal(p.result().reportAckCount, null);
+  assert.doesNotMatch(JSON.stringify(p.result()), /private|url|headers|userId|jobId|contentId|stack|body|token/);
+});
+
+test('malformed transmission and runtime fields cannot invent an ACK in projected logs', () => {
+  const p = createPlaybackLogProjection('worker', { from, until });
+  const base = { event: 'worker_video_report_failed', reportEvent: 'playing', stage: 'refresh', code: 'upstream_unavailable', mayHaveWritten: true };
+  const samples = [undefined, [], { outcome: ['acknowledged'], code: 'none' }, { outcome: 'acknowledged', code: 'unexpected_response' },
+    { outcome: 'acknowledged', code: 'none', responseFailure: 'ack_result_rejected' }, { outcome: 'failed', code: 'none' },
+    { outcome: 'private-outcome', code: 'unknown' }, { outcome: 'failed', code: 'private-code' },
+    { outcome: 'failed', code: 'unexpected_response', responseFailure: ['ack_result_rejected'] },
+    { outcome: 'failed', code: 'unexpected_response', responseFailure: 'private-response' }];
+  for (const transmission of samples) p.push(line({ ...base, transmission, runtimeFirstFailure: 'private-runtime', ...secret }));
+  assert.ok(p.result().records.every(value => !('transmission' in value) && !('runtimeFirstFailure' in value)));
+  assert.equal(p.result().workerReportFailureCount, samples.length); assert.equal(p.result().reportAckCount, null);
+  assert.doesNotMatch(JSON.stringify(p.result()), /private|url|body|stack|token/);
+});
+
+test('every supported runtime first failure survives projection and unknown values stay absent', () => {
+  const p = createPlaybackLogProjection('worker', { from, until });
+  const codes = ['SOURCE_INVALID','SOURCE_USED','ABORTED','LAUNCH_FAILED','ROUTE_BLOCKED','MEDIA_INVALID','START_TIMEOUT',
+    'STALLED','GUARD_FAILED','REPORT_FAILED','BEFORE_PLAY_FAILED','EXECUTION_TIMEOUT','CLEANUP_FAILED'];
+  const base = { event: 'worker_video_report_failed', reportEvent: 'playing', stage: 'refresh', code: 'unknown', mayHaveWritten: true };
+  for (const runtimeFirstFailure of [...codes, ['MEDIA_INVALID'], 'private-runtime']) p.push(line({ ...base, runtimeFirstFailure }));
+  assert.deepEqual(p.result().records.slice(0, codes.length).map(value => (value as any).runtimeFirstFailure), codes);
+  assert.ok(p.result().records.slice(codes.length).every(value => !('runtimeFirstFailure' in value)));
+  assert.doesNotMatch(JSON.stringify(p.result()), /private/);
+});
+
+test('report failure phases and cancellation snapshots are projected only from complete fixed fields', () => {
+  const p = createPlaybackLogProjection('worker', { from, until });
+  const base = { event: 'worker_video_report_failed', reportEvent: 'playing', stage: 'refresh', code: 'upstream_unavailable', mayHaveWritten: true };
+  const phases = ['preflight','pre_transport_guard','transmission','post_transport_guard','fresh_read','post_refresh_guard','post_report','session_persist','cache_invalidation'];
+  for (const phase of phases) p.push(line({ ...base, reportFailure: { phase, reportSignalAborted: true, lifetimeAborted: false, ...secret } }));
+  assert.deepEqual(p.result().records.map(value => (value as any).reportFailure), phases.map(phase => ({ phase, reportSignalAborted: true, lifetimeAborted: false })));
+  assert.ok(p.result().records.every(value => Object.isFrozen((value as any).reportFailure)));
+  for (const reportFailure of [null, [], { phase: ['fresh_read'], reportSignalAborted: false, lifetimeAborted: false },
+    { phase: 'private-phase', reportSignalAborted: false, lifetimeAborted: false },
+    { phase: 'fresh_read', reportSignalAborted: 'false', lifetimeAborted: false },
+    { phase: 'fresh_read', reportSignalAborted: false }]) p.push(line({ ...base, reportFailure }));
+  assert.ok(p.result().records.slice(phases.length).every(value => !('reportFailure' in value)));
+  assert.doesNotMatch(JSON.stringify(p.result()), /private|url|stack|token|body/);
+});
+
+test('runtime origin projection requires a valid first code and strips unknown origins', () => {
+  const p = createPlaybackLogProjection('worker', { from, until });
+  const base = { event: 'worker_video_report_failed', reportEvent: 'playing', stage: 'refresh', code: 'unknown', mayHaveWritten: true };
+  const origins = ['media_proxy_failure','media_snapshot_invalid','observation_rejected','route_blocked','periodic_guard_failed','report_failed','other'];
+  for (const runtimeFirstFailureOrigin of origins) p.push(line({ ...base, runtimeFirstFailure: 'MEDIA_INVALID', runtimeFirstFailureOrigin }));
+  assert.deepEqual(p.result().records.map(value => (value as any).runtimeFirstFailureOrigin), origins);
+  for (const fields of [{ runtimeFirstFailureOrigin: 'observation_rejected' },
+    { runtimeFirstFailure: 'private-code', runtimeFirstFailureOrigin: 'observation_rejected' },
+    { runtimeFirstFailure: 'MEDIA_INVALID', runtimeFirstFailureOrigin: 'private-origin' },
+    { runtimeFirstFailure: 'MEDIA_INVALID', runtimeFirstFailureOrigin: ['observation_rejected'] }]) p.push(line({ ...base, ...fields }));
+  assert.ok(p.result().records.slice(origins.length).every(value => !('runtimeFirstFailureOrigin' in value)));
+  assert.doesNotMatch(JSON.stringify(p.result()), /private/);
+});
+
+test('runtime snapshot and SDK observation detail projections require the exact matching origin', () => {
+  const p = createPlaybackLogProjection('worker', { from, until });
+  const base = { event: 'worker_video_report_failed', reportEvent: 'playing', stage: 'refresh', code: 'unknown', mayHaveWritten: true,
+    runtimeFirstFailure: 'MEDIA_INVALID' };
+  const snapshots = ['sampling_gap','position_reverse','position_advance','visibility','seeking','media_error','media_shape',
+    'inactive_playback','initial_playback','terminal_evidence','capture_failed'];
+  const observations = ['playback_shape','visibility','client_cumulative','initial_position','initial_baseline','duration','server_clock',
+    'timing_value','timing_mode','client_clock_reverse','observation_gap','client_clock_ahead','clock_residual','pair_clock_drift',
+    'position_reverse','pair_progress','inactive_progress','lifetime_server_progress','lifetime_client_progress'];
+  for (const runtimeSnapshotReason of snapshots) p.push(line({ ...base, runtimeFirstFailureOrigin: 'media_snapshot_invalid', runtimeSnapshotReason,
+    runtimeObservationFailure: 'pair_progress', ...secret }));
+  assert.deepEqual(p.result().records.map(value => (value as any).runtimeSnapshotReason), snapshots);
+  assert.ok(p.result().records.every(value => !('runtimeObservationFailure' in value)));
+  for (const runtimeObservationFailure of observations) p.push(line({ ...base, runtimeFirstFailureOrigin: 'observation_rejected', runtimeObservationFailure,
+    runtimeSnapshotReason: 'sampling_gap', ...secret }));
+  assert.deepEqual(p.result().records.slice(snapshots.length).map(value => (value as any).runtimeObservationFailure), observations);
+  assert.ok(p.result().records.slice(snapshots.length).every(value => !('runtimeSnapshotReason' in value)));
+  const validCount = p.result().records.length;
+  for (const fields of [
+    { runtimeSnapshotReason: 'sampling_gap', runtimeObservationFailure: 'pair_progress' },
+    { runtimeFirstFailureOrigin: 'other', runtimeSnapshotReason: 'sampling_gap', runtimeObservationFailure: 'pair_progress' },
+    { runtimeFirstFailureOrigin: 'media_snapshot_invalid', runtimeSnapshotReason: 'private-reason' },
+    { runtimeFirstFailureOrigin: 'media_snapshot_invalid', runtimeSnapshotReason: ['sampling_gap'] },
+    { runtimeFirstFailureOrigin: 'observation_rejected', runtimeObservationFailure: 'private-reason' },
+    { runtimeFirstFailureOrigin: 'observation_rejected', runtimeObservationFailure: ['pair_progress'] },
+  ]) p.push(line({ ...base, ...fields }));
+  assert.ok(p.result().records.slice(validCount).every(value => !('runtimeSnapshotReason' in value) && !('runtimeObservationFailure' in value)));
+  assert.doesNotMatch(JSON.stringify(p.result()), /private|url|token|body|stack/);
 });

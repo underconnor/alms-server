@@ -17,6 +17,16 @@ const codes = ['authentication_required', 'identity_mismatch', 'upstream_unavail
   'AUTH_REQUIRED', 'SCHOOL_AUTH_REQUIRED', 'SCHOOL_SESSION_CHANGED', 'PLAYBACK_OBSERVATION_INVALID', 'PLAYBACK_SESSION_EXPIRED', 'PLAYBACK_BUSY', 'NOT_FOUND', 'unknown'];
 const responseKinds = ['content_type','declared_length','missing_body','body_limit','length_mismatch','utf8',
   'ack_body','ack_callback','ack_envelope','ack_json','ack_schema','ack_result_rejected','ack_invalid_playback_rate','ack_error_code'];
+const runtimeCodes = ['SOURCE_INVALID','SOURCE_USED','ABORTED','LAUNCH_FAILED','ROUTE_BLOCKED','MEDIA_INVALID','START_TIMEOUT',
+  'STALLED','GUARD_FAILED','REPORT_FAILED','BEFORE_PLAY_FAILED','EXECUTION_TIMEOUT','CLEANUP_FAILED'];
+const runtimeOrigins = ['media_proxy_failure','media_snapshot_invalid','observation_rejected','route_blocked','periodic_guard_failed','report_failed','other'];
+const snapshotReasons = ['sampling_gap','position_reverse','position_advance','visibility','seeking','media_error','media_shape',
+  'inactive_playback','initial_playback','terminal_evidence','capture_failed'];
+const observationFailures = ['playback_shape','visibility','client_cumulative','initial_position','initial_baseline','duration','server_clock',
+  'timing_value','timing_mode','client_clock_reverse','observation_gap','client_clock_ahead','clock_residual','pair_clock_drift',
+  'position_reverse','pair_progress','inactive_progress','lifetime_server_progress','lifetime_client_progress'];
+const reportPhases = ['preflight','pre_transport_guard','transmission','post_transport_guard','fresh_read','post_refresh_guard',
+  'post_report','session_persist','cache_invalidation'];
 const contextValues = {
   event: ['playing', 'update', 'unload', 'ended'], controllerPhase: ['ready', 'reporting', 'needs_verification', 'closed'],
   controllerAttempt: ['none', 'previous'], observationState: ['missing', 'playing', 'paused', 'ended'], positionDelta: ['unknown', 'unchanged', 'advanced', 'regressed'],
@@ -33,7 +43,10 @@ function timestamp(value: string): bigint | null {
 }
 type RouteRecord = { role: typeof roles[keyof typeof roles]; method: string; status: number; time: string; elapsedMs?: number };
 type FailureRecord = { event: 'worker_video_report_failed'; time: string; reportEvent: string; stage: string; code: string;
-  mayHaveWritten: boolean | null; context?: Record<string, string>; outcome?: Record<string, string | boolean | null> };
+  mayHaveWritten: boolean | null; context?: Record<string, string>; outcome?: Record<string, string | boolean | null>;
+  transmission?: Readonly<Record<string, string>>; runtimeFirstFailure?: string; runtimeFirstFailureOrigin?: string;
+  runtimeSnapshotReason?: string; runtimeObservationFailure?: string;
+  reportFailure?: Readonly<{ phase: string; reportSignalAborted: boolean; lifetimeAborted: boolean }> };
 
 /** Supply logs from one identified source. The caller must separately verify release and capture integrity. */
 export function createPlaybackLogProjection(source: 'api' | 'worker', window: { from: string; until: string; recordLimit?: number }) {
@@ -69,6 +82,30 @@ export function createPlaybackLogProjection(source: 'api' | 'worker', window: { 
         if (row.event !== 'worker_video_report_failed') { ignored++; return; }
         record = { event: 'worker_video_report_failed', time, reportEvent: fixed(row.reportEvent, ['playing', 'update', 'ended', 'unknown']),
           stage: fixed(row.stage, stages), code: fixed(row.code, codes), mayHaveWritten: typeof row.mayHaveWritten === 'boolean' ? row.mayHaveWritten : null };
+        const transmission = row.transmission;
+        if (object(transmission) && typeof transmission.outcome === 'string' && ['acknowledged','failed'].includes(transmission.outcome)
+          && typeof transmission.code === 'string' && [...codes,'none'].includes(transmission.code)
+          && (transmission.outcome === 'acknowledged' ? transmission.code === 'none' && transmission.responseFailure === undefined : transmission.code !== 'none')
+          && (transmission.responseFailure === undefined || typeof transmission.responseFailure === 'string' && responseKinds.includes(transmission.responseFailure))) {
+          record.transmission = Object.freeze({ outcome: transmission.outcome, code: transmission.code,
+            ...(typeof transmission.responseFailure === 'string' ? { responseFailure: transmission.responseFailure } : {}) });
+        }
+        if (typeof row.runtimeFirstFailure === 'string' && runtimeCodes.includes(row.runtimeFirstFailure)) {
+          record.runtimeFirstFailure = row.runtimeFirstFailure;
+          if (typeof row.runtimeFirstFailureOrigin === 'string' && runtimeOrigins.includes(row.runtimeFirstFailureOrigin)) {
+            record.runtimeFirstFailureOrigin = row.runtimeFirstFailureOrigin;
+            if (row.runtimeFirstFailureOrigin === 'media_snapshot_invalid' && typeof row.runtimeSnapshotReason === 'string'
+              && snapshotReasons.includes(row.runtimeSnapshotReason)) record.runtimeSnapshotReason = row.runtimeSnapshotReason;
+            if (row.runtimeFirstFailureOrigin === 'observation_rejected' && typeof row.runtimeObservationFailure === 'string'
+              && observationFailures.includes(row.runtimeObservationFailure)) record.runtimeObservationFailure = row.runtimeObservationFailure;
+          }
+        }
+        const reportFailure = row.reportFailure;
+        if (object(reportFailure) && typeof reportFailure.phase === 'string' && reportPhases.includes(reportFailure.phase)
+          && typeof reportFailure.reportSignalAborted === 'boolean' && typeof reportFailure.lifetimeAborted === 'boolean') {
+          record.reportFailure = Object.freeze({ phase: reportFailure.phase,
+            reportSignalAborted: reportFailure.reportSignalAborted, lifetimeAborted: reportFailure.lifetimeAborted });
+        }
         const context = row.context;
         if (object(context) && Object.entries(contextValues).every(([key, values]) => typeof context[key] === 'string' && values.includes(context[key]))) {
           record.context = Object.freeze(Object.fromEntries(Object.keys(contextValues).map(key => [key, context[key] as string])));
