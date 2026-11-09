@@ -12,7 +12,7 @@ import { boundedWorkerOperation } from './worker-bounds.js';
 import { AppError, notFound } from './errors.js';
 import { projectLearningStatus } from './learning-status.js';
 import type { PreparedPlaybackStart } from './playback-start-service.js';
-import type { PreparedManualVideo } from './manual-video-types.js';
+import type { PreparedManualVideo, ManualVideoObservation } from './manual-video-types.js';
 import type { PreparedVideoSource } from './video-stream.js';
 import type { SchoolResult } from './domain.js';
 import { playbackStartFailureDiagnostic, rememberPlaybackStartDiagnostic, type PlaybackStartFailureDiagnostic } from './playback-start-diagnostics.js';
@@ -31,8 +31,9 @@ type Connection = { client: LearningxClient; http: SchoolHttpClient; session: Se
 export interface SchoolVideoTarget { owner: string; courseId: string; moduleItemId: string }
 export interface PreparedSchoolVideo extends PreparedManualVideo {
   readonly durationSeconds: number;
-  /** Separate explicit confirmation, never invoked by normal reports or workers. */
-  confirmStart?: PreparedPlaybackStart['confirmStart'];
+  /** Separate explicit confirmation. Workers require a durable exact-job start reservation. */
+  confirmStart?: (observation: ManualVideoObservation, validate: () => Promise<void>, signal: AbortSignal,
+    observeTransportAck?: () => Promise<void>) => ReturnType<PreparedPlaybackStart['confirmStart']>;
   /** Identity/claim proof survives close; a caller must still prove its current authority. */
   authority(validate: () => Promise<void>, signal: AbortSignal): Promise<{ generation: string; encryptedSession: string }>;
   readFresh(validate: () => Promise<void>, signal: AbortSignal): Promise<SchoolResult>;
@@ -129,13 +130,13 @@ export function createSchoolVideoSessions(store: SchoolVideoSessionStore, key: B
     const initialMedia = original.data.contentType === 'readystream'
       ? await verifiedVideoMedia(context.owner, prepared.session.generation, original.launch, currentPrepared, signal, fetcher) : null;
     if (initialMedia) original = { ...original, launch: initialMedia.launch, data: inspectSchoolVideoLaunch(initialMedia.launch) };
+    let preparedMedia: Awaited<ReturnType<typeof verifiedVideoMedia>> | null = initialMedia;
     let knownSchoolProgress = original.data.detail.attendance.progressSeconds;
     let lastPosition: number | null = null, observationState: VideoReportContext['observationState'] = 'missing',
       positionDelta: VideoReportContext['positionDelta'] = 'unknown';
     let startConsumed = false;
     let active: { connection: Connection; validate: () => Promise<void>; signal: AbortSignal } | null = null, reporting = false;
-    const binding = prepareSchoolVideoCallbackBinding(original.launch, original.login);
-    const controller = createSchoolManualVideoReportController(binding, {
+    const createReportController = (launch: typeof original.launch) => createSchoolManualVideoReportController(prepareSchoolVideoCallbackBinding(launch, original.login), {
       signal: lifetime.signal,
       validateCurrent: async sdkSignal => {
         if (!active) throw new SchoolError('unsupported'); sdkSignal.throwIfAborted(); active.signal.throwIfAborted();
@@ -146,10 +147,11 @@ export function createSchoolVideoSessions(store: SchoolVideoSessionStore, key: B
         return active.connection.client.moduleLearningStatus(context.courseId, context.moduleItemId, AbortSignal.any([sdkSignal, active.signal]));
       },
     });
+    let controller = createReportController(original.launch);
     const inspectedController = inspectSchoolManualVideoReportController(controller);
     const observationTiming = 'observationTiming' in inspectedController && inspectedController.observationTiming === 'client_monotonic_v1'
       ? 'client_monotonic_v1' as const : undefined;
-    return { generation: prepared.session.generation, encryptedSession: prepared.encrypted, baseline: original.data.detail.attendance.progressSeconds!, durationSeconds: original.data.detail.durationSeconds!,
+    return { generation: prepared.session.generation, encryptedSession: prepared.encrypted, get baseline() { return original.data.detail.attendance.progressSeconds!; }, durationSeconds: original.data.detail.durationSeconds!,
       ...(observationTiming ? { observationTiming } : {}),
       validate: async currentSignal => { await sameSession(context.owner, prepared.session, currentSignal); },
       authority: async (validate, currentSignal) => {
@@ -171,23 +173,28 @@ export function createSchoolVideoSessions(store: SchoolVideoSessionStore, key: B
         const combined = AbortSignal.any([currentSignal, lifetime.signal]);
         const current = async () => { combined.throwIfAborted(); await validate(); await sameSession(context.owner, prepared.session, combined); combined.throwIfAborted(); };
         await current();
-        const resolved = initialMedia ?? await verifiedVideoMedia(context.owner, prepared.session.generation,
+        const resolved = preparedMedia ?? await verifiedVideoMedia(context.owner, prepared.session.generation,
           original.launch, current, combined, fetcher);
         await current();
+        preparedMedia = resolved;
         return { contentId: resolved.media.contentId, mediaUrl: resolved.media.mediaUrl, validate: current,
           ...(resolved.media.detail.resourceType === 'readystream' ? { resourceType: 'readystream' as const } : {}) };
       },
-      confirmStart: async (observation, validate, currentSignal) => {
+      confirmStart: async (observation, validate, currentSignal, observeTransportAck) => {
         if (startConsumed || reporting || lifetime.signal.aborted) throw new SchoolError('unsupported');
+        if (options.allowReadystreamWorker === true && !preparedMedia) throw new SchoolError('unsupported');
         startConsumed = true;
         let mayHaveWritten = false;
         let transmissionDiagnostic: PlaybackStartFailureDiagnostic | undefined;
         let startStage: PlaybackStartFailureDiagnostic['stage'] = 'validation';
+        let rebound: { original: typeof original; media: Awaited<ReturnType<typeof verifiedVideoMedia>> } | undefined;
         const combined = AbortSignal.any([currentSignal, lifetime.signal]);
         try {
           const result = await execute(context.owner, prepared.session, validate, combined, async connection => {
             const fresh = await ownedLaunch(connection, context.courseId, context.moduleItemId, combined);
             if (fresh.login !== original.login || fresh.userId !== original.userId || !sameLaunch(original.data, fresh.data)) throw new SchoolError('forbidden_target');
+            if (options.allowReadystreamWorker === true && fresh.data.detail.attendance.completed === true)
+              throw new AppError(409, 'PLAYBACK_ALREADY_COMPLETED', '학교에서 이미 완료한 영상은 다시 자동수강하지 않습니다.');
             const verifiedStart = fresh.data.contentType === 'readystream'
               ? await verifiedVideoMedia(context.owner, prepared.session.generation, fresh.launch, connection.current, combined, fetcher) : null;
             await connection.current();
@@ -200,16 +207,42 @@ export function createSchoolVideoSessions(store: SchoolVideoSessionStore, key: B
               const result = await startSchoolVideoPlayback(start, { startVideoPlayback: async (request, sdkSignal) => {
                 startStage = 'transmission';
                 mayHaveWritten = true;
-                try { return await connection.http.startVideoPlayback(request, sdkSignal); }
+                try {
+                  const response = await connection.http.startVideoPlayback(request, sdkSignal);
+                  // Only the strict SDK transport parser can produce this fact. It is separate
+                  // from fresh-read/CAS/authority success and never grants playback by itself.
+                  if (response.acknowledged === true) await observeTransportAck?.();
+                  return response;
+                }
                 catch (error) { transmissionDiagnostic = playbackStartFailureDiagnostic(error, 'transmission', true); throw error; }
               } });
               startStage = 'refresh';
               const returned = { transport: result.transport, school: projectLearningStatus(result.school, context.courseId, context.moduleItemId) };
               if (result.transport === 'unknown') rememberPlaybackStartDiagnostic(returned,
                 transmissionDiagnostic ?? playbackStartFailureDiagnostic(undefined, 'transmission', mayHaveWritten));
+              if (result.transport === 'acknowledged' && options.allowReadystreamWorker === true) {
+                // A start ACK never substitutes for an ordinary playing ACK. Rebind only from
+                // a fresh, exact owned launch/baseline; the next actual playing still reports.
+                const next = await ownedLaunch(connection, context.courseId, context.moduleItemId, combined);
+                if (!preparedMedia || next.login !== original.login || next.userId !== original.userId || !sameLaunch(original.data, next.data))
+                  throw new SchoolError('forbidden_target');
+                const media = await verifiedVideoMedia(context.owner, prepared.session.generation, next.launch, connection.current, combined, fetcher);
+                if (media.media.contentId !== preparedMedia.media.contentId || media.media.mediaUrl !== preparedMedia.media.mediaUrl)
+                  throw new SchoolError('forbidden_target');
+                await connection.current();
+                rebound = { original: { ...next, launch: media.launch, data: inspectSchoolVideoLaunch(media.launch) }, media };
+              }
               return returned;
             } finally { closeSchoolVideoPlaybackStartController(start); }
           });
+          if (rebound) {
+            combined.throwIfAborted();
+            closeSchoolManualVideoReportController(controller);
+            original = rebound.original; preparedMedia = rebound.media;
+            knownSchoolProgress = original.data.detail.attendance.progressSeconds;
+            lastPosition = null; observationState = 'missing'; positionDelta = 'unknown';
+            controller = createReportController(original.launch);
+          }
           return result.value;
         } catch (error) {
           rememberPlaybackStartDiagnostic(error, transmissionDiagnostic ?? playbackStartFailureDiagnostic(error, startStage, mayHaveWritten)); throw error;

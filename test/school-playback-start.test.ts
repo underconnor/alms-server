@@ -124,3 +124,91 @@ test('lost jar CAS after a start remains uncertain and still invalidates exact J
   await assert.rejects(driver.confirmStart!(paused, noop, signal()), {code:'SCHOOL_SESSION_CHANGED'});
   assert.equal(f.counts().starts, 1); assert.equal(f.counts().invalidated, 1); driver.close();
 });
+
+test('worker confirmed start rebinds the exact fresh baseline then uses a separate strict ordinary playing report', async () => {
+  for (const type of ['mp4', 'readystream']) {
+    const f = await fixture({ allowPlaybackStart: true, workerOnly: true, allowReadystreamWorker: true });
+    f.setType(type); f.setProgress(45);
+    const driver = await f.sessions.prepare(context, noop, signal());
+    try {
+      await driver.prepareMedia(noop, signal()); driver.observe(paused);
+      f.onReturn(async () => { if (f.counts().starts === 1 && f.paths.at(-1)?.endsWith('/progress')) f.setProgress(60); });
+      const started = await driver.confirmStart!(paused, noop, signal());
+      assert.equal(started.transport, 'acknowledged'); assert.equal(started.school.recognized, null);
+      assert.equal(driver.baseline, 60); assert.equal(f.counts().reports, 0);
+      f.onReturn(noop); driver.observe(paused); driver.observe(observation);
+      const result = await driver.report('playing', noop, signal());
+      assert.equal(result.transport, 'acknowledged'); assert.equal(result.state, 'ready'); assert.equal(result.school.recognized, null);
+      assert.equal(f.counts().starts, 1); assert.equal(f.counts().reports, 1);
+      await assert.rejects(driver.confirmStart!(paused, noop, signal())); assert.equal(f.counts().starts, 1);
+    } finally { driver.close(); }
+  }
+});
+
+test('strict worker start ACK cannot authorize a rejected ordinary playing ACK or a retransmission', async () => {
+  const f = await fixture({ allowPlaybackStart: true, workerOnly: true, allowReadystreamWorker: true });
+  const driver = await f.sessions.prepare(context, noop, signal());
+  try {
+    await driver.prepareMedia(noop, signal());
+    assert.equal((await driver.confirmStart!(paused, noop, signal())).transport, 'acknowledged');
+    f.setReportResponse(callback => new Response(callback + '({"result":true,"error_code":"synthetic-rejected"});', { headers: { 'content-type': 'text/javascript' } }));
+    driver.observe(paused); driver.observe(observation);
+    assert.equal((await driver.report('playing', noop, signal())).transport, 'unknown');
+    await assert.rejects(driver.report('playing', noop, signal()));
+    assert.equal(f.counts().starts, 1); assert.equal(f.counts().reports, 1);
+  } finally { driver.close(); }
+});
+
+test('fresh worker completion and post-start target or generation drift never become permission to play', async () => {
+  for (const mode of ['completed', 'target', 'generation', 'cas'] as const) {
+    const f = await fixture({ allowPlaybackStart: true, workerOnly: true, allowReadystreamWorker: true });
+    const driver = await f.sessions.prepare(context, noop, signal());
+    try {
+      await driver.prepareMedia(noop, signal());
+      if (mode === 'completed') f.setDetails({ attendance_data: { progress: 600, last_at: 600, completed: true, attendance_status: 'attendance' } });
+      else f.onReturn(async () => {
+        if (f.counts().starts !== 1) return;
+        if (mode === 'target') f.setType('movie');
+        if (mode === 'generation') f.reset();
+        if (mode === 'cas') f.setCas(false);
+      });
+      await assert.rejects(driver.confirmStart!(paused, noop, signal()));
+      assert.equal(f.counts().starts, mode === 'completed' ? 0 : 1); assert.equal(f.counts().reports, 0);
+      await assert.rejects(driver.confirmStart!(paused, noop, signal()));
+      assert.equal(f.counts().starts, mode === 'completed' ? 0 : 1);
+    } finally { driver.close(); }
+  }
+});
+
+test('strict transport ACK is observed once before later authority or refresh failure and grants no playback', async () => {
+  for (const mode of ['cancel', 'cas', 'target', 'observer-failure'] as const) {
+    const f = await fixture({ allowPlaybackStart: true, workerOnly: true, allowReadystreamWorker: true });
+    const driver = await f.sessions.prepare(context, noop, signal());
+    const abort = new AbortController(); let received = 0;
+    try {
+      await driver.prepareMedia(noop, signal());
+      const outcome = await driver.confirmStart!(paused, noop, abort.signal, async (...args) => {
+        assert.deepEqual(args, []); received++;
+        if (mode === 'cancel') abort.abort();
+        if (mode === 'cas') f.setCas(false);
+        if (mode === 'target') f.setType('movie');
+        if (mode === 'observer-failure') throw new Error('synthetic ambiguous fact commit');
+      }).then(result => ({ result }), error => ({ error }));
+      if ('result' in outcome) assert.equal(outcome.result.transport, 'unknown');
+      assert.equal(received, 1); assert.equal(f.counts().starts, 1); assert.equal(f.counts().reports, 0);
+      await assert.rejects(driver.confirmStart!(paused, noop, signal()));
+      assert.equal(received, 1); assert.equal(f.counts().starts, 1);
+    } finally { driver.close(); }
+  }
+});
+
+test('rejected school start acknowledgement never emits a transport ACK fact', async () => {
+  const f = await fixture({ allowPlaybackStart: true, workerOnly: true, allowReadystreamWorker: true });
+  const driver = await f.sessions.prepare(context, noop, signal()); let received = 0;
+  try {
+    await driver.prepareMedia(noop, signal()); f.setAck(false);
+    const result = await driver.confirmStart!(paused, noop, signal(), async () => { received++; });
+    assert.equal(result.transport, 'unknown'); assert.equal(received, 0);
+    assert.equal(f.counts().starts, 1); assert.equal(f.counts().reports, 0);
+  } finally { driver.close(); }
+});

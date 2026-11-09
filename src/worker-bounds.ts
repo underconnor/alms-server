@@ -3,7 +3,7 @@ import type { Pool, PoolClient, QueryResultRow } from 'pg';
 export class WorkerDeadlineError extends Error {
   constructor() { super('WORKER_OPERATION_TIMEOUT'); }
 }
-export interface WorkerOperation { signal?: AbortSignal; timeoutMs: number }
+export interface WorkerOperation { signal?: AbortSignal; timeoutMs: number; readCommitted?: boolean }
 export type WorkerQuery = <R extends QueryResultRow = QueryResultRow>(sql: string, values?: unknown[]) => Promise<import('pg').QueryResult<R>>;
 // Only the worker pools use these connection defaults; API requests keep their existing settings.
 export const workerPgOptions = {
@@ -57,7 +57,7 @@ export function workerTransaction<T>(pool: Pool, run: (query: WorkerQuery) => Pr
         signal.throwIfAborted();
         return result;
       };
-      await query('BEGIN');
+      await query(options.readCommitted === true ? 'BEGIN ISOLATION LEVEL READ COMMITTED' : 'BEGIN');
       await query("SELECT set_config('statement_timeout',$1,true),set_config('lock_timeout',$1,true),set_config('idle_in_transaction_session_timeout',$1,true)", [String(options.timeoutMs)]);
       const value = await run(query);
       // The guarded query rejects after any prior abort, including a late UPDATE response.

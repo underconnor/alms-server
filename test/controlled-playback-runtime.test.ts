@@ -40,6 +40,7 @@ test('source is opaque, snapshots callback references, and rejects unsupported s
     { timeouts: { startMs: 499 } },
     { timeouts: { anything: true } },
     { report: null },
+    { beforePlay: true },
   ])
     assert.throws(() => createControlledPlaybackSource({ ...input(), ...extra } as any), failure('SOURCE_INVALID'));
   raw.validate = async () => assert.fail('mutated callback');
@@ -81,6 +82,7 @@ function fake(
     killFails?: boolean;
     endAfter?: number;
     reportDelay?: number;
+    beforePlay?: ControlledPlaybackInput['beforePlay'];
     modify?: (value: any) => void;
   } = {},
 ) {
@@ -89,6 +91,8 @@ function fake(
     signalCode: null as string | null,
   };
   let captured = 0,
+    capturedBeforePlay = 1,
+    clicks = 0,
     playing = false,
     url = '',
     contextClosed = 0,
@@ -107,7 +111,7 @@ function fake(
     evaluate: async (fn: Function) => {
       if (!String(fn).includes('positionSeconds')) return;
       captured++;
-      const position = playing ? Math.min((captured - 2) * 0.2, options.endAfter ?? 0.6) : 0;
+      const position = playing ? Math.min((captured - capturedBeforePlay - 1) * 0.2, options.endAfter ?? 0.6) : 0;
       const ended = playing && position === (options.endAfter ?? 0.6);
       const value = {
         positionSeconds: position,
@@ -131,6 +135,7 @@ function fake(
     },
     locator: () => ({
       click: async () => {
+        clicks++; capturedBeforePlay = captured;
         playing = true;
         mediaDone = fetch(url.replace('/player', '/media'))
           .then((r) => r.arrayBuffer())
@@ -171,6 +176,7 @@ function fake(
     createControlledPlaybackSource({
       ...input(),
       expectedDurationSeconds: options.endAfter ?? 0.6,
+      ...(options.beforePlay ? { beforePlay: options.beforePlay } : {}),
       observe: () => {
         observed++;
       },
@@ -186,6 +192,7 @@ function fake(
     reports,
     counts: () => ({
       captured,
+      clicks,
       observed,
       contextClosed,
       killed,
@@ -206,6 +213,41 @@ test('normal observed playback reports once at start and end, sampling continues
   assert.ok(f.counts().captured > f.counts().observed);
   assert.ok(f.counts().observed >= 5);
   assert.equal(f.child.exitCode, 0);
+});
+
+test('before-play hook receives actual verified paused metadata once and a fresh capture precedes the real click', async () => {
+  let calls = 0;
+  const f = fake({ beforePlay: async (value, current) => {
+    calls++; assert.equal(Object.isFrozen(value), true);
+    assert.deepEqual(value, { positionSeconds: 0, durationSeconds: 0.6, playbackRate: 1, paused: true, ended: false, seeking: false, visible: true });
+    assert.equal(f.counts().clicks, 0); assert.deepEqual(f.reports, []);
+    await delay(350); current.throwIfAborted(); assert.equal(f.counts().clicks, 0); assert.equal(f.counts().captured, 1); assert.equal(f.counts().observed, 0);
+  } });
+  const runtime = createControlledPlaybackRuntime({ launch: async () => f.launched });
+  const result = await runtime.play(f.source(), new AbortController().signal);
+  assert.equal(calls, 1); assert.equal(f.counts().clicks, 1); assert.ok(f.counts().captured >= 5);
+  assert.deepEqual(f.reports, ['playing', 'ended']); assert.equal(result.ended, true); assert.equal(f.child.exitCode, 0);
+});
+
+test('failed start hook or changed post-hook real metadata closes the runtime without a click or progress report', async () => {
+  for (const mode of ['rejected', 'hidden', 'advanced'] as const) {
+    let hookCompleted = false;
+    const f = fake({ beforePlay: async () => { if (mode === 'rejected') throw new Error('private-start-failure'); hookCompleted = true; },
+      modify: value => { if (hookCompleted && mode === 'hidden') value.visible = false; if (hookCompleted && mode === 'advanced') value.positionSeconds = 0.1; } });
+    const runtime = createControlledPlaybackRuntime({ launch: async () => f.launched });
+    await assert.rejects(runtime.play(f.source(), new AbortController().signal), failure(mode === 'rejected' ? 'BEFORE_PLAY_FAILED' : 'MEDIA_INVALID'));
+    assert.equal(f.counts().clicks, 0); assert.deepEqual(f.reports, []); assert.equal(f.child.exitCode, 0);
+  }
+});
+
+test('cancellation during a deferred start fences its late completion and closes only the owned runtime', async () => {
+  let release!: () => void, current: AbortSignal | undefined;
+  const f = fake({ beforePlay: async (_value, supplied) => { current = supplied; await new Promise<void>(resolve => { release = resolve; }); } });
+  const runtime = createControlledPlaybackRuntime({ launch: async () => f.launched }), abort = new AbortController();
+  const playing = runtime.play(f.source(), abort.signal), rejected = assert.rejects(playing, failure('ABORTED'));
+  while (!release) await delay(1);
+  abort.abort(); await rejected; assert.equal(current!.aborted, true); assert.equal(f.child.exitCode, 0);
+  release(); await delay(5); assert.equal(f.counts().clicks, 0); assert.deepEqual(f.reports, []);
 });
 
 test('invalid real observation aborts the in-flight report signal and never reports success', async () => {
@@ -523,6 +565,113 @@ test('cancellation during the third pending report aborts its signal and closes 
   assert.deepEqual(sent, ['playing', 'update', 'update']);
   assert.equal(f.child.exitCode, 0); assert.equal(f.counts().killed, 0);
 });
+
+for (const startOutcome of ['acknowledged', 'unknown'] as const) {
+  test(`long before-play handshake keeps ordinary SDK observations fresh with ${startOutcome} start`, { timeout: 20_000 }, async (t) => {
+    const { fixture: schoolFixture, context: scope } = await import('./helpers/school-video-fixture.js');
+    const school = await schoolFixture({ durationSeconds: 2, allowPlaybackStart: true, workerOnly: true, allowReadystreamWorker: true });
+    const f = fake({ endAfter: 2 }), runtime = createControlledPlaybackRuntime({ launch: async () => f.launched });
+    const latch = () => {
+      let release!: () => void;
+      return { promise: new Promise<void>(resolve => { release = resolve; }), release: () => release() };
+    };
+    const entered = latch(), releaseHandshake = latch(), handshakeSettled = latch();
+    const startEntered = latch(), startResponse = latch(), playingSettled = latch(), endedSettled = latch();
+    const claim = { jobId: randomUUID(), userId: scope.owner, courseId: scope.courseId, lectureId: scope.moduleItemId,
+      acceptedGeneration: school.generation(), executionTokenHash: 'e'.repeat(64) };
+    let now = 0, observations = 0, received = 0, released = 0, nextObservation: (() => void) | undefined;
+    let lastPosition = 0, startResponseHeld = false;
+    const outcomes: string[] = [], reports: string[] = [];
+    const grant = { attemptId: randomUUID(), consentId: randomUUID(), expiresAt: new Date(Date.now() + 60_000).toISOString() };
+    t.mock.timers.enable({ apis: ['setTimeout'] }); t.mock.method(performance, 'now', () => now);
+    school.onReturn(async () => {
+      if (!startResponseHeld && school.counts().starts === 1 && school.counts().reports === 0) {
+        startResponseHeld = true; startEntered.release(); await startResponse.promise;
+      }
+    });
+    const adapter = createSchoolPlayback({ school: school.sessions,
+      validateClaim: async (value, current) => { current.throwIfAborted(); assert.deepEqual(value, claim); },
+      validateFinalClaim: async () => {}, createAdmission: () => ({}), createFinalProof: () => ({}),
+      leases: { acquire: async () => true, renew: async () => true, release: async () => { released++; } },
+      reservePlaybackStart: async () => grant,
+      observePlaybackStartTransportAck: async (_claim, id) => { assert.equal(id, grant.attemptId); received++; },
+      finishPlaybackStart: async (_claim, _id, outcome) => { outcomes.push(outcome); },
+      stream: async (_owner, prepare, request) => {
+        await request.validate(); await (await prepare(request.signal)).validate();
+        return { status: 200, contentLength: 4, body: Readable.from([Buffer.from('test')]) };
+      },
+      runtime: { createSource: value => createControlledPlaybackSource({ ...value,
+        observe: observation => {
+          observations++; lastPosition = observation.positionSeconds; value.observe(observation); nextObservation?.();
+        },
+        beforePlay: async (observation, current) => {
+          entered.release(); await releaseHandshake.promise;
+          assert.equal(observations, 0); assert.equal(f.counts().clicks, 0); assert.equal(school.counts().reports, 0);
+          try { await value.beforePlay!(observation, current); }
+          finally { handshakeSettled.release(); }
+        }, report: async (event, current) => {
+          reports.push(event);
+          try { await value.report(event, current); }
+          finally { (event === 'playing' ? playingSettled : endedSettled).release(); }
+        } }), play: runtime.play, dispose: runtime.dispose },
+    });
+    const prepared = await adapter.preparePlayback({ userId: claim.userId, claim }, { courseId: claim.courseId, lectureId: claim.lectureId }, new AbortController().signal);
+    if (startOutcome === 'unknown') school.setAck(false);
+    const result = adapter.play(prepared, new AbortController().signal);
+    // Capture rejection without a second, cleanup-induced expectation masking the original result.
+    const settled = result.then(() => ({ ok: true as const }), error => ({ ok: false as const, error }));
+    const beforeSettlement = async (pending: Promise<void>) => {
+      const outcome = await Promise.race([pending.then(() => ({ pendingFinished: true as const })), settled]);
+      if (!('pendingFinished' in outcome)) {
+        if (!outcome.ok) throw outcome.error;
+        assert.fail('Playback settled before the expected fixture stage');
+      }
+    };
+    try {
+      await beforeSettlement(entered.promise);
+      now += 16_000; t.mock.timers.tick(16_000);
+      assert.equal(observations, 0); assert.equal(f.counts().clicks, 0); releaseHandshake.release();
+      // Actual SDK fixture IO must reach and settle its start callback before another virtual tick.
+      await beforeSettlement(startEntered.promise);
+      assert.equal(now, 16_000); assert.equal(school.counts().starts, 1);
+      assert.equal(observations, 0); assert.equal(received, 0); assert.deepEqual(outcomes, []);
+      startResponse.release(); await handshakeSettled.promise;
+      if (startOutcome === 'acknowledged') {
+        await beforeSettlement(playingSettled.promise);
+        await new Promise<void>(resolve => setImmediate(resolve));
+        // Advance exactly one sample at a time, never a fixed virtual budget ahead of pending IO.
+        for (let frame = 1; frame <= 10; frame++) {
+          const sampled = latch(); nextObservation = sampled.release;
+          now += 200; t.mock.timers.tick(200);
+          await beforeSettlement(sampled.promise); nextObservation = undefined;
+          assert.ok(Math.abs(lastPosition - frame * 0.2) < 0.001);
+          await new Promise<void>(resolve => setImmediate(resolve));
+        }
+        await beforeSettlement(endedSettled.promise);
+        await new Promise<void>(resolve => setImmediate(resolve));
+        now += 200; t.mock.timers.tick(200);
+      }
+      const outcome = await settled;
+      if (startOutcome === 'acknowledged') {
+        if (!outcome.ok) throw outcome.error;
+      } else {
+        assert.equal(outcome.ok, false);
+        if (!outcome.ok) assert.equal((outcome.error as { code: string }).code, 'PLAYBACK_REPORT_UNKNOWN');
+        assert.equal(now, 16_000);
+      }
+      assert.equal(school.counts().starts, 1); assert.deepEqual(outcomes, [startOutcome]);
+      assert.equal(received, startOutcome === 'acknowledged' ? 1 : 0);
+      assert.equal(f.counts().clicks, startOutcome === 'acknowledged' ? 1 : 0);
+      assert.deepEqual(reports, startOutcome === 'acknowledged' ? ['playing', 'ended'] : []);
+      assert.equal(released, startOutcome === 'acknowledged' ? 1 : 0);
+      if (startOutcome === 'unknown') assert.equal(observations, 0);
+      assert.equal(f.child.exitCode, 0); assert.equal(f.counts().killed, 0);
+    } finally {
+      releaseHandshake.release(); startResponse.release(); nextObservation = undefined;
+      t.mock.timers.reset(); await prepared.dispose(); await settled;
+    }
+  });
+}
 
 for (const mode of ['acknowledged', 'unknown', 'cas'] as const) {
   test(`controlled runtime and real SDK survive two periodic intervals with ${mode} third transport`, async (t) => {

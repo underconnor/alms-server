@@ -15,7 +15,7 @@ const schoolResult: SchoolResult = { observedAt: '2026-01-01T00:00:00Z', progres
 const observed = { positionSeconds: 0, durationSeconds: 600, playbackRate: 1, paused: false, ended: false, seeking: false, visible: true };
 const evidence = { ended: true as const, browserClosed: true as const, processExited: true as const };
 function fixture(reportFailure?: (diagnostic: ReturnType<typeof workerVideoReportDiagnostic>) => void,
-  progress: Pick<SchoolPlaybackDependencies<unknown, unknown, unknown>, 'observeProgress' | 'progressReportAcknowledged' | 'flushProgress'> = {}) {
+  progress: Pick<SchoolPlaybackDependencies<unknown, unknown, unknown>, 'observeProgress' | 'progressReportAcknowledged' | 'flushProgress' | 'reservePlaybackStart' | 'observePlaybackStartTransportAck' | 'finishPlaybackStart'> = {}) {
   const claim: SchoolPlaybackClaim = { jobId: randomUUID(), userId: randomUUID(), courseId: '10', lectureId: '20',
     acceptedGeneration: randomUUID(), executionTokenHash: 'a'.repeat(64) };
   const target = { courseId: claim.courseId, lectureId: claim.lectureId }, context = { userId: claim.userId, claim };
@@ -26,6 +26,7 @@ function fixture(reportFailure?: (diagnostic: ReturnType<typeof workerVideoRepor
   const diagnostics: ReturnType<typeof workerVideoReportDiagnostic>[] = [];
   const acknowledgements: WorkerVideoReportAcknowledgement[] = [];
   let playHook = async (value: SchoolPlaybackInput, running: AbortSignal) => {
+    if (value.beforePlay) { const paused = { ...observed, paused: true }; await value.beforePlay(paused, running); value.observe(paused); }
     value.observe(observed); await value.report('playing', running);
     value.observe({ ...observed, positionSeconds: 600, ended: true, paused: true }); await value.report('ended', running); return evidence;
   };
@@ -66,6 +67,7 @@ function fixture(reportFailure?: (diagnostic: ReturnType<typeof workerVideoRepor
     createFinalProof: (scope, value) => { assert.deepEqual(scope, claim); assert.equal(value.generation, generation); return { kind: 'final' as const }; },
     reportFailure: diagnostic => { diagnostics.push(diagnostic); reportFailure?.(diagnostic); },
     reportAcknowledged: diagnostic => { acknowledgements.push(diagnostic); },
+    ...(progress.reservePlaybackStart ? { observePlaybackStartTransportAck: async () => {} } : {}),
     ...progress,
   });
   return { adapter, claim, target, context, driver, diagnostics, acknowledgements, input: () => input!, counts: () => ({ prepareCalls, mediaCalls, freshCalls, observeCalls, reportCalls, disposeCalls, releaseCalls }),
@@ -77,6 +79,136 @@ function fixture(reportFailure?: (diagnostic: ReturnType<typeof workerVideoRepor
     reportWith: (hook: typeof reportHook) => { reportHook = hook; }, disposeWith: (hook: typeof disposeHook) => { disposeHook = hook; },
   };
 }
+const startReservation = () => ({ attemptId: randomUUID(), consentId: randomUUID(), expiresAt: new Date(Date.now() + 60_000).toISOString() });
+
+test('worker start consumes one exact reservation before ordinary reports and retains the same lease', async () => {
+  const events: string[] = [], grant = startReservation();
+  const f = fixture(undefined, {
+    reservePlaybackStart: async (claim, current) => { current.throwIfAborted(); assert.deepEqual(claim, f.claim); events.push('reserved'); return grant; },
+    finishPlaybackStart: async (claim, id, outcome, current) => { current.throwIfAborted(); assert.deepEqual(claim, f.claim); assert.equal(id, grant.attemptId); events.push(outcome); },
+  });
+  f.driver.confirmStart = async (value, validate, current, recordAck) => {
+    assert.deepEqual(value, { ...observed, paused: true }); assert.equal(Object.isFrozen(value), true);
+    await validate(); current.throwIfAborted(); events.push('start'); await recordAck!(); return { transport: 'acknowledged', school: schoolResult };
+  };
+  f.reportWith(async event => { events.push(event); });
+  const prepared = await f.prepare(); f.logout(); await f.adapter.play(prepared, signal());
+  assert.deepEqual(events, ['reserved', 'start', 'acknowledged', 'playing', 'ended']);
+  assert.equal(f.counts().releaseCalls, 1); assert.equal(f.counts().disposeCalls, 1);
+  await assert.rejects(f.input().beforePlay!({ ...observed, paused: true }, signal()));
+});
+
+test('no grant preserves legacy playback without a start write and incomplete bridge wiring is refused', async () => {
+  let reserves = 0;
+  const f = fixture(undefined, { reservePlaybackStart: async () => { reserves++; return null; }, finishPlaybackStart: async () => assert.fail('no attempt') });
+  f.driver.confirmStart = async () => assert.fail('no consent');
+  const prepared = await f.prepare(); await f.adapter.play(prepared, signal());
+  assert.equal(reserves, 1); assert.equal(f.counts().reportCalls, 2); assert.equal(f.counts().releaseCalls, 1);
+  assert.throws(() => fixture(undefined, { reservePlaybackStart: async () => null }), { code: 'PLAYBACK_AUTHORITY_CHANGED' });
+});
+
+test('invalid pre-play observation cannot reserve consent or call school start', async () => {
+  for (const change of [{ paused: false }, { visible: false }, { positionSeconds: 1 }, { playbackRate: 2 }, { durationSeconds: 10 }]) {
+    let reserves = 0;
+    const f = fixture(undefined, { reservePlaybackStart: async () => { reserves++; return startReservation(); }, finishPlaybackStart: noop });
+    f.driver.confirmStart = async () => assert.fail('invalid observation');
+    const prepared = await f.prepare();
+    await assert.rejects(f.input().beforePlay!({ ...observed, paused: true, ...change }, signal()));
+    await prepared.dispose(); assert.equal(reserves, 0); assert.equal(f.counts().reportCalls, 0); assert.equal(f.counts().releaseCalls, 1);
+  }
+});
+
+test('known consent refusals never start while ambiguous reservation and prior attempt preserve the lease', async () => {
+  for (const code of ['PLAYBACK_START_CONSENT_INVALID', 'PLAYBACK_START_CONSENT_EXPIRED', 'PLAYBACK_START_CONSENT_REVOKED',
+    'PLAYBACK_START_RESERVATION_UNCONFIRMED', 'PLAYBACK_START_ATTEMPT_EXISTS']) {
+    const uncertain = code.includes('RESERVATION_UNCONFIRMED') || code.includes('ATTEMPT_EXISTS');
+    const f = fixture(undefined, { reservePlaybackStart: async () => { throw new AppError(409, code, 'fixed'); }, finishPlaybackStart: async () => assert.fail('no known reservation') });
+    f.driver.confirmStart = async () => assert.fail('no fresh reservation');
+    const prepared = await f.prepare();
+    await assert.rejects(f.adapter.play(prepared, signal()), { code: uncertain ? 'PLAYBACK_REPORT_UNKNOWN' : code });
+    assert.equal(f.counts().reportCalls, 0); assert.equal(f.counts().releaseCalls, uncertain ? 0 : 1);
+  }
+});
+
+test('unknown start persists once and cannot click through or retry an ordinary report', async () => {
+  const finished: string[] = []; let calls = 0;
+  const f = fixture(undefined, { reservePlaybackStart: async () => startReservation(), finishPlaybackStart: async (_claim, _id, outcome) => { finished.push(outcome); } });
+  f.driver.confirmStart = async (_value, validate) => { await validate(); calls++; return { transport: 'unknown', school: schoolResult }; };
+  const prepared = await f.prepare();
+  await assert.rejects(f.adapter.play(prepared, signal()), { code: 'PLAYBACK_REPORT_UNKNOWN' });
+  await assert.rejects(f.input().beforePlay!({ ...observed, paused: true }, signal()));
+  await assert.rejects(f.input().report('playing', signal()));
+  assert.deepEqual(finished, ['unknown']); assert.equal(calls, 1); assert.equal(f.counts().reportCalls, 0); assert.equal(f.counts().releaseCalls, 0);
+});
+
+test('received start ACK is persisted before eligibility recheck and is never downgraded on cancellation or persistence failure', async () => {
+  for (const mode of ['cancel', 'commit-loss', 'generation'] as const) {
+    const outcomes: string[] = [];
+    const f = fixture(undefined, { reservePlaybackStart: async () => startReservation(),
+      finishPlaybackStart: async (_claim, _id, outcome, current) => {
+        current.throwIfAborted(); outcomes.push(outcome);
+        if (mode === 'commit-loss') throw new Error('ambiguous commit');
+        if (mode === 'cancel') f.setStatus('cancel_requested');
+        if (mode === 'generation') f.reauthenticate();
+      } });
+    f.driver.confirmStart = async (_value, _validate, _current, recordAck) => { await recordAck!(); return { transport: 'acknowledged', school: schoolResult }; };
+    const prepared = await f.prepare(); await assert.rejects(f.adapter.play(prepared, signal()), { code: 'PLAYBACK_REPORT_UNKNOWN' });
+    assert.deepEqual(outcomes, ['acknowledged']); assert.equal(f.counts().reportCalls, 0); assert.equal(f.counts().releaseCalls, 0);
+  }
+});
+
+test('a valid acknowledged start continues ordinary playback after its grant deadline', async () => {
+  const grant = { ...startReservation(), expiresAt: new Date(Date.now() + 40).toISOString() };
+  const f = fixture(undefined, { reservePlaybackStart: async () => grant,
+    finishPlaybackStart: async () => { await new Promise(resolve => setTimeout(resolve, 50)); } });
+  f.driver.confirmStart = async (_value, _validate, _current, recordAck) => { await recordAck!(); return { transport: 'acknowledged', school: schoolResult }; };
+  const prepared = await f.prepare(); await f.adapter.play(prepared, signal());
+  assert.equal(f.counts().reportCalls, 2); assert.equal(f.counts().releaseCalls, 1);
+});
+
+test('transport ACK fact survives later ineligibility without becoming acknowledged permission or ordinary playback', async () => {
+  for (const mode of ['cancel', 'generation', 'fact-commit-loss', 'missing-observer'] as const) {
+    const grant = startReservation(), facts: string[] = [], outcomes: string[] = []; let starts = 0;
+    const f = fixture(undefined, { reservePlaybackStart: async () => grant,
+      observePlaybackStartTransportAck: async (claim, id, current) => {
+        assert.deepEqual(claim, f.claim); assert.equal(id, grant.attemptId); current.throwIfAborted(); facts.push('transport-ack');
+        if (mode === 'cancel') f.setStatus('cancel_requested');
+        if (mode === 'generation') f.reauthenticate();
+        if (mode === 'fact-commit-loss') throw new Error('synthetic ambiguous fact commit');
+      }, finishPlaybackStart: async (_claim, _id, outcome) => { outcomes.push(outcome); } });
+    f.driver.confirmStart = async (_value, validate, _current, recordAck) => {
+      starts++;
+      if (mode !== 'missing-observer') { await recordAck!(); await validate(); }
+      return { transport: 'acknowledged', school: schoolResult };
+    };
+    const prepared = await f.prepare();
+    await assert.rejects(f.adapter.play(prepared, signal()), { code: 'PLAYBACK_REPORT_UNKNOWN' });
+    assert.deepEqual(facts, mode === 'missing-observer' ? [] : ['transport-ack']);
+    assert.deepEqual(outcomes, ['unknown']); assert.equal(starts, 1);
+    assert.equal(f.counts().reportCalls, 0); assert.equal(f.counts().releaseCalls, 0);
+    await assert.rejects(f.input().beforePlay!({ ...observed, paused: true }, signal()));
+    await assert.rejects(f.input().report('playing', signal())); assert.equal(starts, 1);
+  }
+});
+
+test('late start completion after disposal cannot play and blocks termination proof until its callback drains', async () => {
+  let release!: () => void, current: AbortSignal | undefined;
+  const outcomes: string[] = [];
+  const f = fixture(undefined, { reservePlaybackStart: async () => startReservation(),
+    finishPlaybackStart: async (_claim, _id, outcome) => { outcomes.push(outcome); } });
+  f.driver.confirmStart = async (_value, _validate, supplied) => {
+    current = supplied; await new Promise<void>(resolve => { release = resolve; });
+    supplied.throwIfAborted(); return { transport: 'acknowledged', school: schoolResult };
+  };
+  const prepared = await f.prepare(), proof = prepared as typeof prepared & { terminationProof(): unknown };
+  const pending = f.input().beforePlay!({ ...observed, paused: true }, signal()), rejected = assert.rejects(pending, { code: 'PLAYBACK_REPORT_UNKNOWN' });
+  while (!release) await new Promise(resolve => setImmediate(resolve));
+  await prepared.dispose(); await rejected;
+  assert.equal(current!.aborted, true); assert.equal(proof.terminationProof(), null);
+  release(); await new Promise(resolve => setImmediate(resolve));
+  assert.notEqual(proof.terminationProof(), null); assert.deepEqual(outcomes, ['unknown']); assert.equal(f.counts().reportCalls, 0); assert.equal(f.counts().releaseCalls, 0);
+});
+
 test('admission checks school and supported media without acquiring a lease or starting reports', async () => {
   const f = fixture(), proof = await f.adapter.authorizePlayback({ userId: f.claim.userId }, f.target, { signal: signal(), validate: noop });
   assert.deepEqual(proof, { kind: 'admission' }); assert.equal(f.counts().mediaCalls, 1); assert.equal(f.counts().reportCalls, 0);
