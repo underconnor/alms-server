@@ -17234,6 +17234,261 @@
         ]
       }
     },
+    "/v1/jobs/{id}/continue": {
+      "post": {
+        "operationId": "post_v1_jobs_id_continue",
+        "summary": "Explicitly continue a proven-unstarted authentication wait",
+        "description": "Only server-created wait markers for known-before-play failures qualify. Requires newer verified school SSO, fresh native identity/enrollment/media admission, worker readiness, live session/client/CSRF and unchanged school seal. A transaction preserves the old accepted generation and original error evidence, retires the old intent, creates one new normal job/outbox and records one durable old-to-new relation. Future schedules are preserved. Existing completed school videos are excluded. Exact same-key replay returns the same child in any known status without new school admission. The original job UUID may be used as its stable continuation key across reloads; unrelated existing use yields IDEMPOTENCY_CONFLICT, never a fallback key. Response loss requires GET originalJob.authWait.continuedAsJobId then GET that child; a missing pointer during an in-flight request is not proof of failure. Never generate a new key or automatically retry uncertain acceptance. Unknown/interrupted/running/cleanup-uncertain/unmarked historical jobs are ineligible.",
+        "security": [
+          {
+            "cookieSession": []
+          },
+          {
+            "bearerSession": [],
+            "clientHeader": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "X-ALMS-Client-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+            },
+            "description": "Required with bearer authentication. If provided with cookie, must equal the session-bound registered client."
+          },
+          {
+            "name": "Origin",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uri"
+            },
+            "description": "Exact registered origin; required on writes and on every bearer request."
+          },
+          {
+            "name": "X-CSRF-Token",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Session CSRF token returned by /v1/me or bearer token exchange. All authenticated writes require it."
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Reuse only for the identical accepted request. Uncertain writes must be read back, not retried with a new key."
+          },
+          {
+            "name": "Accept",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "const": "application/json; alms-playback=2"
+            },
+            "description": "Required when playback is enabled or the job was admitted with school authority."
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "originalJob": {
+                      "$ref": "#/components/schemas/Job"
+                    },
+                    "job": {
+                      "$ref": "#/components/schemas/Job"
+                    },
+                    "continued": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "originalJob",
+                    "job",
+                    "continued"
+                  ],
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Normalized failure. Do not use message text as a state code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "x-alms-error-codes": [
+          "INVALID_REQUEST",
+          "RATE_LIMITED",
+          "INTERNAL_ERROR",
+          "AUTH_REQUIRED",
+          "CLIENT_ORIGIN_INVALID",
+          "SCHOOL_AUTH_REQUIRED",
+          "SCHOOL_SESSION_CHANGED",
+          "CSRF_INVALID",
+          "PLAYBACK_CONTINUATION_UNCONFIRMED",
+          "PLAYBACK_CONTINUATION_UNAVAILABLE",
+          "PLAYBACK_CONTINUATION_BUSY",
+          "PLAYBACK_REAUTHENTICATION_REQUIRED",
+          "PLAYBACK_ALREADY_CONTINUED",
+          "PLAYBACK_ALREADY_COMPLETED",
+          "PLAYBACK_UNAVAILABLE",
+          "PLAYBACK_BUSY",
+          "PLAYBACK_AUTHORITY_CHANGED",
+          "SCHOOL_AUTH_REQUIRED",
+          "IDEMPOTENCY_CONFLICT",
+          "JOB_ALREADY_ACTIVE",
+          "CLIENT_UPDATE_REQUIRED"
+        ],
+        "x-alms-bearer-required-headers": [
+          "Authorization",
+          "X-ALMS-Client-Id",
+          "Origin"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/jobs/{id}/cancel": {
       "post": {
         "operationId": "post_v1_jobs_id_cancel",
@@ -21766,6 +22021,44 @@
         "additionalProperties": false,
         "description": "Actual server media observations, not school progress or attendance. Optional/null until observed; percent is min(100, positionSeconds/durationSeconds*100), with up to 0.25s media rounding tolerance. Active observations older than 15s are stale; never interpolate. lastReport records only a validated school ACK and may be null."
       },
+      "PlaybackAuthWait": {
+        "type": "object",
+        "properties": {
+          "waitingSince": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "school_auth_required",
+              "school_session_changed"
+            ]
+          },
+          "canContinue": {
+            "type": "boolean"
+          },
+          "continuedAsJobId": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "waitingSince",
+          "reason",
+          "canContinue",
+          "continuedAsJobId"
+        ],
+        "additionalProperties": false,
+        "description": "Durable proven-before-play authentication wait. canContinue requires a newer verified school SSO generation with LMS ready; POST still performs fresh native admission. queued/scheduled intent remains waiting without school attempts. continuedAsJobId durably identifies the sole replacement, including after response loss. No automatic continuation or unknown/interrupted retry."
+      },
       "Job": {
         "type": "object",
         "properties": {
@@ -21844,6 +22137,16 @@
                   "ended",
                   "interrupted"
                 ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "authWait": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PlaybackAuthWait"
               },
               {
                 "type": "null"
