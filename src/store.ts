@@ -291,7 +291,15 @@ export class PgStore implements Store {
   async getJobQueueSnapshot(userId: string, courseId?: string): Promise<PlaybackQueueSnapshot> {
     // One SQL statement gives counts and rows the same snapshot. It never refreshes
     // school state, invalidates caches, dispatches work, or touches the old history.
-    const { rows: [snapshot] } = await this.query(`WITH owned AS (
+    // These short polling reads must not pay JIT compilation on every request.
+    // Unrelated reads on this pool retain their session default.
+    const client = await this.pool.connect();
+    let snapshot: Row | undefined;
+    let destroy = false;
+    try {
+      await client.query('BEGIN READ ONLY');
+      await client.query('SET LOCAL jit=off');
+      const { rows } = await client.query<Row>(`WITH owned AS (
       ${jobRecoverySelect} WHERE job.user_id=$1 AND ($2::text IS NULL OR job.course_id=$2)
     ), ready_global AS (
       SELECT job.id,job.created_at,metadata.duration_seconds,
@@ -336,6 +344,13 @@ export class PgStore implements Store {
           AND active.accepted_generation=lease.generation AND active.execution_token_hash=lease.token_hash)) AS blocking_lease,
       (SELECT COALESCE(json_agg(selected ORDER BY (status=ANY($4::text[])) DESC,created_at ASC,id ASC),'[]'::json) FROM selected) AS items`,
     [userId, courseId ?? null, [...activePlaybackQueueStatuses, ...pendingPlaybackQueueStatuses], activePlaybackQueueStatuses, playbackQueueLimit]);
+      snapshot = rows[0];
+      await client.query('COMMIT');
+    } catch (error) {
+      try { await client.query('ROLLBACK'); }
+      catch { destroy = true; }
+      throw error;
+    } finally { client.release(destroy); }
     if (!snapshot) throw new Error('PLAYBACK_QUEUE_SNAPSHOT_MISSING');
     const hasMore = snapshot.total > playbackQueueLimit;
     return { jobs: snapshot.items.map(jobFrom), counts: { active: snapshot.active, waiting: snapshot.total - snapshot.active, total: snapshot.total },
