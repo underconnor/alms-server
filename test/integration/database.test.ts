@@ -15,7 +15,7 @@ import { migrate } from '../../src/migrations.js';
 import { executeJob } from '../../src/job-runner.js';
 import { workerTransaction, workerPgOptions } from '../../src/worker-bounds.js';
 import { unavailableSchoolProvider,type SchoolProvider } from '../../src/provider.js';
-import { createQueueClient,startWorker,QUEUE } from '../../src/queue.js';
+import { startWorker } from '../../src/queue.js';
 import { decryptSchoolSession } from '../../src/crypto.js';
 import { AppError } from '../../src/errors.js';
 import { createSchoolProvider } from '../../src/school-adapter.js';
@@ -69,12 +69,8 @@ describe('real PostgreSQL: migrations, auth, ownership and durable jobs',{ skip:
     if (pool) {
       if (a && b) {
         const owners=[a.user.id,b.user.id,...authUsers];
-        const jobs=await pool.query('SELECT id FROM playback_jobs WHERE user_id=ANY($1::uuid[])',[owners]);
-        if (jobs.rowCount) {
-          const cleanupQueue=createQueueClient(databaseUrl!); cleanupQueue.on('error',() => {});
-          try { await cleanupQueue.start(); await cleanupQueue.deleteJob(QUEUE,jobs.rows.map(row => row.id)); }
-          finally { await cleanupQueue.stop(); }
-        }
+        // The only actual broker consumer below owns and drops its isolated schema.
+        // Direct worker fixtures never create a queue in the shared schema.
         await pool.query('DELETE FROM users WHERE id=ANY($1::uuid[])',[owners]);
       }
       await pool.end();
