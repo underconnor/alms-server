@@ -93,6 +93,18 @@ worker는 약2초 간격으로 최신 관측을 coalesce해 별도 `playback_job
 
 ## 화면에서 독립적인 데이터
 
+### 진행 중·대기 중 수강과 실행 순서
+
+`GET /v1/jobs/queue?courseId=<optional>`는 최신 이력200개와 별도로 owner의 진행 중·대기 중 작업을 조회한다. 응답은 `{items:[{job,notBefore,waitReason,position,estimatedStartAt,estimateReason}],counts:{active,waiting,total},complete,hasMore,limit:200,serverTime,worker:{state}}`다. 기존 공개 Job·세션·등록 client·Origin·playback Accept 보호를 유지한다. 학교 provider 호출·결과 캐시 갱신/무효화·작업 변경은 없다. MCP 도구도 추가하지 않는다.
+
+active는 running/reconciling/cancel_requested/pause_requested, waiting은 queued/scheduled/paused 및 입증된 미시작 인증 대기다. 두 count는 겹치지 않고 합이 total이며, 선택한 owner/course 범위 전체를 센다. 목록이200개로 잘려도 count는 정확하다. rows/counts/serverTime/예상 근거는 동일 SQL snapshot이다. 완료·일반 과거 unknown은 기존 history에 보존한다. 표시 순서는 active 우선·createdAt/id 오름차순이고, 실제 실행은 **현재 실행 가능한 due 작업의 접수순(createdAt,id)**이다. 미래 예약은 시각이 되기 전에는 dispatch/순번 대상이 아니며, due 후 이 정렬에 합류한다. 예약이 새로 due되거나 상태가 바뀌면 이후 위치/예상도 바뀔 수 있다.
+
+position은 현재 실행을 제외한 전역 due 대기 후보 중1부터 시작하며 미래 예약·인증 대기·legacy transport 불명확·worker/권한 차단이면 null이다. 다른 사용자의 ID·과목·영상·미디어 관측이나 broker ID는 노출하지 않는다. `notBefore`는 scheduledFor와 같고 확정 시작 시각이 아니다. estimatedStartAt은 현재 실행의 신선한 실제 관측 잔여 길이와 앞선 ready 작업의 신뢰한 admission duration을 합산한 조건부 예상이다. 준비·학교 응답·정리 지연을 보장하지 않으며 경과 시간으로 진행률을 보간하지 않는다. stale/null 관측, 알려지지 않은 선행 길이, 기존 transport 불명확, 인증/동의/실행 차단이면 null과 고정 estimateReason을 반환한다. 동의 만료를 예상으로 연장하지 않는다. worker.ready는 유휴 상태가 아니다.
+
+waitReason은 active에서 null, 대기에서는 authentication_wait → paused → start_permission_expired → scheduled → worker_unavailable → waiting 순이다. 모든 차단 원인이나 fresh 학교 인증을 진단하는 값이 아니다. 기존 canContinue는 새 학교 세대의 표시 조건이며 명시적 POST와 fresh admission을 대체하지 않는다. observedAt이15초 이상 오래되면 마지막 관측을 유지하고 지연을 표시한다. job.updatedAt은 진행률 갱신 시각이 아니다.
+
+019는 별도 queue metadata와 조회 index만 추가하며 과거 행 backfill은 없다. 새 접수/명시적 계속 수강의 정상 transaction에 adapter가 검증한 길이와 broker dispatch ID를 저장한다. caller의 길이는 받지 않는다. scheduler fence 아래 전체 due 후보의 head를 먼저 고르고 정확히 그 outbox만 잠근다. broker INSERT·outbox·metadata는 같은 PG transaction이다. 실제 broker ID·global active/lease·현재 head를 claim 때 다시 검사한다. 기존 non-head 메시지나 claim 실패로 소비된 transport는 current/last token·heartbeat·progress·시작시도·종료근거·settlement·학교 결과가 모두 없는 queued/scheduled에서만 새 transport로 회수한다. 기존 unknown/실행 흔적이 있으면 재시작하지 않는다. 재생/ACK/학교 결과·권한·종료 증거 정책은 유지한다.
+
 `GET /v1/todos`의 개인 TODO와 `GET /v1/jobs`의 수강 작업 목록은 기존 `items`에 `{complete,hasMore,limit}`를 추가한다. 개인 TODO는 최신 500개, 작업은 최신 200개를 유지하며 `createdAt` 내림차순 뒤 `id` 내림차순으로 같은 시각의 순서도 고정한다. 서버는 같은 소유자·선택한 `courseId` 범위에서 한 행을 추가 조회해 잘림을 확인한다. 항목이 정확히 상한만큼 있고 더 없으면 `complete:true,hasMore:false`, 초과하면 `complete:false,hasMore:true`다. `complete`는 목록의 완전성이며 개별 TODO 완료·수강 종료·학교 인정 상태가 아니다.
 
 이 응답은 총개수나 다음 페이지를 추정하지 않는다. cursor·추가 페이지·새 필터는 아직 제공하지 않으며 `hasMore:true`인 목록을 전체 이력으로 해석하면 안 된다. 기존 소유권·인증·CSRF·수강 Accept 조건을 유지하고, 작업의 추가 확인용 행은 응답이나 결과 캐시 갱신에 포함하지 않는다. 학교의 `/v1/tasks` TODO와 전체 과제 `/assignments`의 기존 계약은 별개다.

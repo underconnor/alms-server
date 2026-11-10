@@ -53,7 +53,7 @@ export interface SchoolPlaybackDependencies<Source, Admission, FinalProof> {
   validateClaim(claim: SchoolPlaybackClaim, signal: AbortSignal): Promise<void>;
   /** Final read/proof only, after confirmed runtime cleanup; may permit cancellation reconciliation. */
   validateFinalClaim(claim: SchoolPlaybackClaim, signal: AbortSignal): Promise<void>;
-  createAdmission(scope: { userId: string } & Target, value: SessionProof): Admission;
+  createAdmission(scope: { userId: string } & Target, value: SessionProof, durationSeconds?: number): Admission;
   createFinalProof(claim: SchoolPlaybackClaim, value: SessionProof): FinalProof;
   /** Atomic exact-claim reservation. Null means a legacy job with no start consent. */
   reservePlaybackStart?(claim: SchoolPlaybackClaim, signal: AbortSignal): Promise<PlaybackStartReservation | null>;
@@ -202,7 +202,7 @@ export function createSchoolPlayback<Source, Admission, FinalProof>(dependencies
           signal.throwIfAborted();
           await driver.prepareMedia(options.validate, signal);
           const proof = await driver.authority(options.validate, signal); signal.throwIfAborted();
-          return dependencies.createAdmission({ userId: context.userId, ...target }, proof);
+          return dependencies.createAdmission({ userId: context.userId, ...target }, proof, driver.durationSeconds);
         } finally { driver.close(); }
       }, { signal: options.signal, timeoutMs: 90_000 });
     },

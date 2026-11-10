@@ -11,7 +11,7 @@ const claimedHandles = new WeakSet<object>();
 export const workerJobLimits = { operationMs: 5000, preparationMs: 90_000, resultMs: 90_000, cleanupMs: 10_000, finalizationMs: 10_000 };
 type Limits = typeof workerJobLimits;
 
-export async function executeJob(id: string, store: Store, provider: SchoolProvider, shutdown?: AbortSignal, pollMs = 1000, overrides: Partial<Limits> = {}) {
+export async function executeJob(id: string, store: Store, provider: SchoolProvider, shutdown?: AbortSignal, pollMs = 1000, overrides: Partial<Limits> = {}, queueDeliveryId?: string) {
   const limits = { ...workerJobLimits, ...overrides };
   if (Object.values(limits).some(value => !Number.isSafeInteger(value) || value < 1)) throw new Error('INVALID_WORKER_LIMIT');
   const controller = new AbortController();
@@ -23,7 +23,7 @@ export async function executeJob(id: string, store: Store, provider: SchoolProvi
   const db = <T>(run: (operation: WorkerOperation) => Promise<T>, signal = controller.signal) =>
     boundedWorkerOperation(inner => run({ signal: inner, timeoutMs: limits.operationMs }), { signal, timeoutMs: limits.operationMs });
   let job: Job | null = null;
-  try { job = await db(operation => store.claimJob(id, operation)); }
+  try { job = await db(operation => store.claimJob(id, operation, queueDeliveryId)); }
   catch { shutdown?.removeEventListener('abort', stop); return; }
   if (!job) { shutdown?.removeEventListener('abort', stop); return; }
   const claimed = job;

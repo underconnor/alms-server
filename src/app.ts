@@ -23,6 +23,7 @@ import type { Config } from './config.js';
 import type { Job, Session } from './domain.js';
 import { boundedWorkerOperation, WorkerDeadlineError } from './worker-bounds.js';
 import { publicJob } from './domain.js';
+import { publicPlaybackQueue } from './playback-queue.js';
 import { AppError, notFound, unavailable } from './errors.js';
 import { materialViewFailureDiagnostic } from './material-view-diagnostics.js';
 import { assignmentReadFailureDiagnostic, rememberAssignmentReadFailure, type AssignmentReadFailureStage } from './assignment-read-diagnostics.js';
@@ -476,6 +477,17 @@ export async function buildApp(config: Config, store: Store, provider: SchoolPro
     requirePlaybackClient(request, jobs.some(job => job.acceptedGeneration != null));
     await refreshJobResults(request, reply, jobs);
     return { items: (await withPlaybackContinuationState(store, config.sessionEncryptionKey, owner(request), jobs)).map(publicJob), complete: !hasMore, hasMore, limit };
+  });
+  app.get('/v1/jobs/queue',protectedRoute,async request => {
+    const query = z.object({ courseId: identifier.optional() }).strict().parse(request.query);
+    requirePlaybackClient(request, provider.capabilities.playback);
+    const worker = !provider.capabilities.playback ? 'disabled'
+      : await playbackIsReady(playbackReadiness) ? 'ready' : 'unavailable';
+    const snapshot = await store.getJobQueueSnapshot(owner(request), query.courseId);
+    requirePlaybackClient(request, snapshot.jobs.some(job => job.acceptedGeneration != null));
+    // Stored owner state only: do not call refreshJobResults or any school adapter.
+    const jobs = await withPlaybackContinuationState(store, config.sessionEncryptionKey, owner(request), snapshot.jobs);
+    return publicPlaybackQueue({ ...snapshot, jobs }, worker);
   });
   app.get('/v1/jobs/:id',protectedRoute,async (request, reply) => {
     const job = await store.getJob(owner(request),paramId(request)); if (!job) throw notFound();

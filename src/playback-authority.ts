@@ -11,7 +11,7 @@ type Scope = z.infer<typeof scopeSchema>;
 const brand: unique symbol = Symbol('PlaybackAuthority');
 export interface PlaybackAdmission { readonly [brand]: 'admission' }
 export interface PlaybackFinalProof { readonly [brand]: 'final' }
-type AdmissionData = Readonly<Scope & { generation: string; encryptedSession: string; expiresAt: number }>;
+type AdmissionData = Readonly<Scope & { generation: string; encryptedSession: string; expiresAt: number; durationSeconds: number | null }>;
 type FinalData = Readonly<{ claim: WorkerClaim; generation: string; encryptedSession: string; expiresAt: number }>;
 const admissions = new WeakMap<PlaybackAdmission, AdmissionData>();
 const finals = new WeakMap<PlaybackFinalProof, FinalData>();
@@ -24,9 +24,10 @@ function handle<T extends 'admission' | 'final'>(kind: T) {
     [inspect.custom]: () => 'PlaybackAuthority { private }' });
 }
 /** Adapter-only proof after fresh school reads and its final cookie-jar CAS. Never serialize its inspected data. */
-export function createPlaybackAdmission(scope: Scope, value: { generation: string; encryptedSession: string }): PlaybackAdmission {
+export function createPlaybackAdmission(scope: Scope, value: { generation: string; encryptedSession: string }, durationSeconds?: number): PlaybackAdmission {
   const result = handle('admission');
-  admissions.set(result, Object.freeze({ ...scopeSchema.strict().parse(scope), ...session(value), expiresAt: Date.now() + 30_000 }));
+  const duration = durationSeconds === undefined ? null : z.number().finite().positive().max(14400).parse(durationSeconds);
+  admissions.set(result, Object.freeze({ ...scopeSchema.strict().parse(scope), ...session(value), durationSeconds: duration, expiresAt: Date.now() + 30_000 }));
   return result;
 }
 export function inspectPlaybackAdmission(value: PlaybackAdmission, scope: Scope): AdmissionData {

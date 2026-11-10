@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { randomUUID,randomBytes,randomInt } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Pool } from 'pg';
+import { PgBoss } from 'pg-boss';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../../src/app.js';
 import { loadConfig } from '../../src/config.js';
@@ -14,7 +15,7 @@ import { migrate } from '../../src/migrations.js';
 import { executeJob } from '../../src/job-runner.js';
 import { workerTransaction, workerPgOptions } from '../../src/worker-bounds.js';
 import { unavailableSchoolProvider,type SchoolProvider } from '../../src/provider.js';
-import { createQueueClient,startWorker,QUEUE } from '../../src/queue.js';
+import { startWorker } from '../../src/queue.js';
 import { decryptSchoolSession } from '../../src/crypto.js';
 import { AppError } from '../../src/errors.js';
 import { createSchoolProvider } from '../../src/school-adapter.js';
@@ -68,12 +69,8 @@ describe('real PostgreSQL: migrations, auth, ownership and durable jobs',{ skip:
     if (pool) {
       if (a && b) {
         const owners=[a.user.id,b.user.id,...authUsers];
-        const jobs=await pool.query('SELECT id FROM playback_jobs WHERE user_id=ANY($1::uuid[])',[owners]);
-        if (jobs.rowCount) {
-          const cleanupQueue=createQueueClient(databaseUrl!); cleanupQueue.on('error',() => {});
-          try { await cleanupQueue.start(); await cleanupQueue.deleteJob(QUEUE,jobs.rows.map(row => row.id)); }
-          finally { await cleanupQueue.stop(); }
-        }
+        // The only actual broker consumer below owns and drops its isolated schema.
+        // Direct worker fixtures never create a queue in the shared schema.
         await pool.query('DELETE FROM users WHERE id=ANY($1::uuid[])',[owners]);
       }
       await pool.end();
@@ -290,11 +287,32 @@ describe('real PostgreSQL: migrations, auth, ownership and durable jobs',{ skip:
     assert.equal(played,false); assert.equal((await store.getJob(a.user.id,job.id))?.status,'needs_verification');
   });
   it('pg-boss consumes the actual SQL outbox and records unavailable provider failure',async () => {
-    const job = await makeJob(); const boss = createQueueClient(databaseUrl!); const controller = new AbortController();
-    let queueError=false; boss.on('error',() => { queueError=true; });
-    const stop = await startWorker(store,boss,unavailableSchoolProvider,controller.signal);
-    try { await waitFor(async () => (await store.getJob(a.user.id,job.id))?.status==='failed',10000); assert.equal(queueError,false); }
-    finally { controller.abort(); await stop(); }
+    // Previous cancellation-CAS fixtures intentionally retain reconciling rows.
+    // The global execution fence must keep respecting them; use an independent
+    // schema/real broker here instead of bypassing that fence or deleting evidence.
+    const schema = 'qa_consumer_' + randomUUID().replaceAll('-', '');
+    await pool.query(`CREATE SCHEMA ${schema}`);
+    const isolatedPool = new Pool({ connectionString: databaseUrl, max: 8, options: `-c search_path=${schema}` });
+    const isolatedStore = new PgStore(isolatedPool), controller = new AbortController();
+    const boss = new PgBoss({ connectionString: databaseUrl, schema, supervise: false, schedule: false });
+    let queueError=false, stop: (() => Promise<void>) | undefined; boss.on('error',() => { queueError=true; });
+    try {
+      await migrate(isolatedPool);
+      const session = await isolatedStore.issueVerifiedSession({ provider: 'consumer-qa', subject: randomUUID() }, 3600,
+        { provider: 'ssu', seal: () => 'synthetic-isolated-consumer' });
+      const target = { courseId: '10', lectureId: '20' };
+      const job = await isolatedStore.createJob(session.user.id, { ...target, scheduledFor: new Date().toISOString(),
+        idempotencyKey: randomUUID(), requestHash: 'synthetic-consumer' }, { almsTokenHash: hashToken(session.token),
+        admission: createPlaybackAdmission({ userId: session.user.id, ...target }, { generation: randomUUID(), encryptedSession: 'synthetic-isolated-consumer' }) });
+      stop = await startWorker(isolatedStore,boss,unavailableSchoolProvider,controller.signal);
+      await waitFor(async () => (await isolatedStore.getJob(session.user.id,job.id))?.status==='failed',10000);
+      assert.equal(queueError,false);
+      const failed = await isolatedStore.getJob(session.user.id,job.id);
+      assert.equal(failed?.errorCode,'PLAYBACK_UNAVAILABLE'); assert.equal(failed?.schoolResult,null);
+    } finally {
+      controller.abort(); if (stop) await stop(); else await boss.stop({ graceful: false });
+      await isolatedPool.end(); await pool.query(`DROP SCHEMA ${schema} CASCADE`);
+    }
   });
   it('SSO callback consumes a browser-bound nonce, verifies identity and encrypts the session in SQL',async () => {
     const encryptionKey = randomBytes(32);

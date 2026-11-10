@@ -77,6 +77,17 @@ test('enabled playback rejects old job admission before school preparation or DB
   } finally { await app.close(); }
 });
 
+test('caller supplied queue duration or dispatch metadata is rejected before school admission', async () => {
+  const f = fixture(true, false), app = await buildApp(config, f.store, f.provider, undefined, undefined, { isReady: async () => true });
+  try {
+    for (const extra of [{ durationSeconds: 1 }, { dispatchId: randomUUID() }, { position: 1 }]) {
+      const response = await app.inject({ method: 'POST', url: '/v1/jobs', headers: { ...headers, accept: playbackClientAccept },
+        payload: { courseId: '10', lectureId: '20', ...extra } });
+      assert.equal(response.statusCode, 400);
+    }
+    assert.deepEqual(f.counts(), { schoolReads: 0, jobWrites: 0 });
+  } finally { await app.close(); }
+});
 test('new clients preserve completed as a separate state and retain normal admission, cancellation and verification', async () => {
   const f = fixture(true, true), app = await buildApp(config, f.store, f.provider, undefined, undefined, { isReady: async () => true }), modern = { ...headers, accept: playbackClientAccept };
   try {
