@@ -11,6 +11,14 @@ const school = { generation: randomUUID(), encryptedSession: 'private-sealed-sch
 const claim: WorkerClaim = { ...scope, jobId: 'private-job', acceptedGeneration: school.generation, executionTokenHash: 'b'.repeat(64) };
 const changed = (error: unknown) => error instanceof Error && error.message === '학교 인증이나 작업 상태가 바뀌었습니다. 다시 확인해 주세요.';
 
+test('duration is adapter-only private admission metadata with finite bounded validation', () => {
+  const proof = createPlaybackAdmission(scope, school, 365.67);
+  assert.equal(inspectPlaybackAdmission(proof, scope).durationSeconds, 365.67);
+  assert.equal(inspectPlaybackAdmission(createPlaybackAdmission(scope, school), scope).durationSeconds, null);
+  assert.doesNotMatch(JSON.stringify(proof) + inspect(proof), /365\.67|durationSeconds/);
+  for (const duration of [0, -1, NaN, Infinity, 14400.1]) assert.throws(() => createPlaybackAdmission(scope, school, duration));
+});
+
 test('admission is opaque and cannot be reconstructed from JSON or moved to another owner/target', () => {
   const proof = createPlaybackAdmission(scope,school);
   assert.equal(Object.isFrozen(proof),true);

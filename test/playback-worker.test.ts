@@ -80,13 +80,13 @@ function provider(overrides: Partial<SchoolProvider> = {}): SchoolProvider {
 }
 
 async function queueFixture(store: PgStore, school: SchoolProvider, shutdown: AbortSignal) {
-  let handler!: (jobs: Array<{ data: { jobId: string }; signal: AbortSignal }>) => Promise<void>;
+  let handler!: (jobs: Array<{ id: string; data: { jobId: string }; signal: AbortSignal }>) => Promise<void>;
   const boss = {
     async start() {}, async createQueue() {}, async stop() {},
     async work(_name: string, _options: unknown, callback: typeof handler) { handler = callback; },
   } as unknown as PgBoss;
   const stop = await startWorker(store, boss, school, shutdown);
-  return { stop, deliver: (signal: AbortSignal) => handler([{ data: { jobId: 'synthetic-job' }, signal }]) };
+  return { stop, deliver: (signal: AbortSignal) => handler([{ id: 'synthetic-delivery', data: { jobId: 'synthetic-job' }, signal }]) };
 }
 
 test('recovery during playback preparation prevents the old worker from starting the runtime', async () => {

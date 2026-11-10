@@ -162,7 +162,7 @@ describe('job admission and execution authority in isolated PostgreSQL', { skip:
     assert.equal(await store.quarantineLegacyJobs(),4);
     // Other tests have current queued jobs; only this fixture's legacy IDs must never be dispatched.
     const sent: string[] = [];
-    await dispatchOutbox(store,{send:async (_queue:unknown,payload:{jobId:string})=>{sent.push(payload.jobId);return payload.jobId;}} as unknown as PgBoss);
+    await dispatchOutbox(store,{send:async (_queue:unknown,payload:{jobId:string},options:{id:string})=>{sent.push(payload.jobId);return options.id;}} as unknown as PgBoss);
     assert.equal(sent.some(id=>ids.includes(id)),false);
     const rows=await pool.query('SELECT status,accepted_generation,execution_token_hash,execution_outcome,school_result FROM playback_jobs WHERE user_id=$1 ORDER BY created_at',[f.userId]);
     assert.equal(rows.rows.filter(row=>row.status==='needs_reauthentication').length,2);

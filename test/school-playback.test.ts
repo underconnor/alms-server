@@ -63,7 +63,8 @@ function fixture(reportFailure?: (diagnostic: ReturnType<typeof workerVideoRepor
       dispose: async () => { disposeCalls++; await disposeHook(); } },
     validateClaim: async (claim, supplied) => { await validate(claim, supplied); if (status !== 'running') throw new AppError(409, 'PLAYBACK_AUTHORITY_CHANGED', 'not executing'); },
     validateFinalClaim: async (claim, supplied) => { await validate(claim, supplied); finalChecks++; if (!['running', 'reconciling', 'cancel_requested'].includes(status)) throw new AppError(409, 'PLAYBACK_AUTHORITY_CHANGED', 'not reconciling'); },
-    createAdmission: (scope, value) => { assert.deepEqual(scope, { userId: claim.userId, ...target }); assert.equal(value.generation, generation); return { kind: 'admission' as const }; },
+    createAdmission: (scope, value, duration) => { assert.deepEqual(scope, { userId: claim.userId, ...target }); assert.equal(value.generation, generation);
+      assert.equal(duration, driver.durationSeconds); return { kind: 'admission' as const }; },
     createFinalProof: (scope, value) => { assert.deepEqual(scope, claim); assert.equal(value.generation, generation); return { kind: 'final' as const }; },
     reportFailure: diagnostic => { diagnostics.push(diagnostic); reportFailure?.(diagnostic); },
     reportAcknowledged: diagnostic => { acknowledgements.push(diagnostic); },

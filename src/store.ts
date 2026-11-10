@@ -16,6 +16,8 @@ import type { LoginClientContext } from './frontend-clients.js';
 import { publicPlaybackProgress, validPlaybackObservation, validPlaybackReportAck, type PlaybackObservation, type PlaybackReportAck } from './playback-progress.js';
 import type { SchoolSessionLockRunner } from './school-session-lock.js';
 import type { AuthenticationWaitReason } from './playback-auth-wait.js';
+import { activePlaybackQueueStatuses, pendingPlaybackQueueStatuses, playbackQueueLimit, type PlaybackQueueSnapshot } from './playback-queue.js';
+import { playbackQueueLock, playbackQueueHead, playbackQueueBusy, readyPlaybackQueueJob, untouchedPlaybackQueueJob, deferUntouchedPlaybackDelivery } from './playback-queue-policy.js';
 
 const iso = (value: Date | string): string => new Date(value).toISOString();
 type Row = Record<string, any>;
@@ -104,6 +106,7 @@ export interface Store {
   updateTodo(userId: string, id: string, input: { title?: string; completed?: boolean; dueAt?: string | null }): Promise<Todo>;
   deleteTodo(userId: string, id: string): Promise<void>;
   listJobs(userId: string,courseId?: string,limit?: number): Promise<Job[]>;
+  getJobQueueSnapshot(userId: string, courseId?: string): Promise<PlaybackQueueSnapshot>;
   getJob(userId: string, id: string): Promise<Job | null>;
   getJobRequest?(owner:string,key:string,auth:ConsentAuthorization,operation?:WorkerOperation,inspection?:{startConsentId?:string;encryptionKey?:Buffer}):Promise<Job|NotAdmittedJobRequest|null>;
   findPlaybackStartConsent?(owner:string,requestKey:string,auth:ConsentAuthorization,operation:WorkerOperation,requestHash?:string):Promise<PlaybackStartConsentReceipt|null>;
@@ -116,7 +119,7 @@ export interface Store {
   continueJob?(userId: string, id: string, idempotencyKey: string, requestHash: string, authorization: JobContinuationAuthorization, operation?: WorkerOperation): Promise<JobContinuationResult>;
   cancelJob(userId: string, id: string): Promise<Job>;
   settleJob?(userId: string, id: string, expectedUpdatedAt: string, authorization: JobSettlementAuthorization, operation?: WorkerOperation): Promise<Job>;
-  claimJob(id: string, operation?: WorkerOperation): Promise<Job | null>;
+  claimJob(id: string, operation?: WorkerOperation, queueDeliveryId?: string): Promise<Job | null>;
   getWorkerJob(claim: WorkerClaim, operation?: WorkerOperation): Promise<Job | null>;
   transitionJob(claim: WorkerClaim, from: JobStatus[], to: JobStatus, result?: SchoolResult | null, error?: string | null, options?: JobTransitionOptions, operation?: WorkerOperation): Promise<Job | null>;
   heartbeat(claim: WorkerClaim, operation?: WorkerOperation): Promise<boolean>;
@@ -140,8 +143,8 @@ export class PgStore implements Store {
     finally { c.release(); }
   }
   async health() {
-    const result = await this.query("SELECT 1 FROM schema_migrations WHERE name IN ('011-playback-job-settlement.sql','012-frontend-clients.sql','013-analytics-frontend-client.sql','014-assignment-operation-recovery.sql','016-playback-job-progress.sql','017-playback-auth-wait.sql','018-playback-start-consent.sql')");
-    if (result.rowCount !== 7) throw new Error('Database migrations are pending');
+    const result = await this.query("SELECT 1 FROM schema_migrations WHERE name IN ('011-playback-job-settlement.sql','012-frontend-clients.sql','013-analytics-frontend-client.sql','014-assignment-operation-recovery.sql','016-playback-job-progress.sql','017-playback-auth-wait.sql','018-playback-start-consent.sql','019-playback-queue-metadata.sql')");
+    if (result.rowCount !== 8) throw new Error('Database migrations are pending');
   }
   async getSession(tokenHash: string): Promise<Session | null> {
     const { rows: [r] } = await this.query(`SELECT s.*,u.display_name,u.analytics_id,u.analytics_enabled FROM sessions s JOIN users u ON u.id=s.user_id WHERE token_hash=$1 AND expires_at>now()`, [tokenHash]);
@@ -285,6 +288,66 @@ export class PgStore implements Store {
     if (!Number.isInteger(limit) || limit < 1 || limit > 201) throw new RangeError('Invalid job read limit');
     const { rows } = await this.query(`${jobRecoverySelect} WHERE job.user_id=$1 AND ($2::text IS NULL OR job.course_id=$2) ORDER BY job.created_at DESC,job.id DESC LIMIT $3`,[userId,courseId ?? null,limit]); return rows.map(jobFrom);
   }
+  async getJobQueueSnapshot(userId: string, courseId?: string): Promise<PlaybackQueueSnapshot> {
+    // One SQL statement gives counts and rows the same snapshot. It never refreshes
+    // school state, invalidates caches, dispatches work, or touches the old history.
+    const { rows: [snapshot] } = await this.query(`WITH owned AS (
+      ${jobRecoverySelect} WHERE job.user_id=$1 AND ($2::text IS NULL OR job.course_id=$2)
+    ), ready_global AS (
+      SELECT job.id,job.created_at,metadata.duration_seconds,
+        outbox.job_id IS NULL OR (metadata.job_id IS NULL AND outbox.dispatched_at IS NOT NULL) AS legacy,
+        consent.expires_at,COALESCE(consent.expires_at<=statement_timestamp() OR revoked.consent_id IS NOT NULL,false) AS permission_invalid
+      FROM playback_jobs job LEFT JOIN playback_queue_metadata metadata ON metadata.job_id=job.id
+      LEFT JOIN job_outbox outbox ON outbox.job_id=job.id
+      LEFT JOIN playback_job_start_consents binding ON binding.job_id=job.id
+      LEFT JOIN playback_start_consents consent ON consent.id=binding.consent_id
+      LEFT JOIN playback_start_consent_revocations revoked ON revoked.consent_id=consent.id
+      WHERE ${readyPlaybackQueueJob}
+    ), ranked AS (
+      SELECT id,(row_number() OVER current_order)::int AS queue_position,
+        COALESCE(sum(duration_seconds) OVER prior_order,0) AS prior_duration,
+        count(*) FILTER(WHERE duration_seconds IS NULL) OVER prior_order>0 AS unknown_prior,
+        bool_or(legacy) OVER current_order AS legacy,permission_invalid,
+        COALESCE(bool_or(permission_invalid) OVER prior_order,false) AS prior_permission_invalid,
+        min(expires_at) OVER prior_order AS minimum_prior_expiry
+      FROM ready_global
+      WINDOW current_order AS (ORDER BY created_at,id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+        prior_order AS (ORDER BY created_at,id ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
+    ), active_rows AS (
+      SELECT job.status,job.user_id,job.course_id,job.lecture_id,job.accepted_generation,job.execution_token_hash,progress.observation
+      FROM playback_jobs job LEFT JOIN playback_job_progress progress ON progress.job_id=job.id AND progress.execution_token_hash=job.execution_token_hash
+      WHERE job.execution_token_hash IS NOT NULL OR job.status=ANY($4::text[])
+    ), queue_items AS (
+      SELECT * FROM owned WHERE status=ANY($3::text[]) OR auth_wait_eligible
+    ), selected AS (
+      SELECT queue_items.*,ranked.queue_position,ranked.prior_duration,ranked.unknown_prior,ranked.legacy,
+        ranked.permission_invalid,ranked.prior_permission_invalid,ranked.minimum_prior_expiry
+      FROM queue_items LEFT JOIN ranked ON ranked.id=queue_items.id
+      ORDER BY (status=ANY($4::text[])) DESC,created_at ASC,queue_items.id ASC LIMIT $5
+    ) SELECT statement_timestamp() AS server_time,
+      (SELECT count(*)::int FROM queue_items) AS total,
+      (SELECT count(*)::int FROM queue_items WHERE status=ANY($4::text[])) AS active,
+      (SELECT count(*)::int FROM active_rows) AS global_active_count,
+      (SELECT status FROM active_rows LIMIT 1) AS global_active_status,
+      (SELECT observation FROM active_rows LIMIT 1) AS global_active_observation,
+      EXISTS(SELECT 1 FROM playback_execution_leases lease WHERE lease.expires_at>statement_timestamp()
+        AND NOT EXISTS(SELECT 1 FROM active_rows active WHERE lease.owner_kind='worker'
+          AND active.user_id=lease.user_id AND active.course_id=lease.course_id AND active.lecture_id=lease.module_item_id
+          AND active.accepted_generation=lease.generation AND active.execution_token_hash=lease.token_hash)) AS blocking_lease,
+      (SELECT COALESCE(json_agg(selected ORDER BY (status=ANY($4::text[])) DESC,created_at ASC,id ASC),'[]'::json) FROM selected) AS items`,
+    [userId, courseId ?? null, [...activePlaybackQueueStatuses, ...pendingPlaybackQueueStatuses], activePlaybackQueueStatuses, playbackQueueLimit]);
+    if (!snapshot) throw new Error('PLAYBACK_QUEUE_SNAPSHOT_MISSING');
+    const hasMore = snapshot.total > playbackQueueLimit;
+    return { jobs: snapshot.items.map(jobFrom), counts: { active: snapshot.active, waiting: snapshot.total - snapshot.active, total: snapshot.total },
+      serverTime: iso(snapshot.server_time), complete: !hasMore, hasMore, limit: playbackQueueLimit,
+      forecast: { activeCount: snapshot.global_active_count, activeStatus: snapshot.global_active_status,
+        activeObservation: snapshot.global_active_observation, blockingLease: snapshot.blocking_lease,
+        entries: Object.fromEntries(snapshot.items.filter((row: Row) => row.queue_position != null).map((row: Row) => [row.id, {
+          position: row.queue_position, priorDuration: row.prior_duration, unknownPrior: row.unknown_prior, legacy: row.legacy,
+          permissionInvalid: row.permission_invalid, priorPermissionInvalid: row.prior_permission_invalid,
+          minimumPriorExpiry: row.minimum_prior_expiry ? iso(row.minimum_prior_expiry) : null,
+        }])) } };
+  }
   async getJob(userId: string,id: string) { const { rows: [r] } = await this.query(`${jobRecoverySelect} WHERE job.user_id=$1 AND job.id=$2`,[userId,id]); return r ? jobFrom(r) : null; }
   findPlaybackStartConsent(owner:string,requestKey:string,auth:ConsentAuthorization,operation:WorkerOperation,requestHash?:string){return this.playbackStartConsents.find(owner,requestKey,auth,operation,requestHash);}
   createPlaybackStartConsent(owner:string,input:PlaybackStartConsentInput,requestKey:string,requestHash:string,auth:ConsentSchoolAuthorization,operation:WorkerOperation){return this.playbackStartConsents.create(owner,input,requestKey,requestHash,auth,operation);}
@@ -333,9 +396,10 @@ export class PgStore implements Store {
     return jobFrom(row);
   }
   async createJob(userId: string, input: NewJobInput, authorization: JobAdmissionAuthorization, operation: WorkerOperation = { timeoutMs: 5000 }) {
-    if(input.startConsentId)operation={...operation,readCommitted:true};
+    operation={...operation,readCommitted:true};
     try {
       return await this.workerTransaction(async query => {
+        await query(playbackQueueLock);
         await query(playbackAccountLock, [playbackAccountLockKey(userId)]);
         await query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [userId + ':' + input.idempotencyKey]);
         const session = await query('SELECT token_hash FROM sessions WHERE user_id=$1 AND token_hash=$2 AND expires_at>clock_timestamp() FOR SHARE', [userId, authorization?.almsTokenHash]);
@@ -353,13 +417,14 @@ export class PgStore implements Store {
         if (!school.rowCount) throw authorityChanged();
         const id = randomUUID();
         const status = new Date(input.scheduledFor).getTime() > Date.now() + 1000 ? 'scheduled' : 'queued';
-        const { rows: [r] } = await query<Row>(`INSERT INTO playback_jobs(id,user_id,course_id,lecture_id,status,scheduled_for,idempotency_key,request_hash,accepted_generation)
-          SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9 WHERE clock_timestamp()<to_timestamp($10::double precision/1000)
+        const { rows: [r] } = await query<Row>(`INSERT INTO playback_jobs(id,user_id,course_id,lecture_id,status,scheduled_for,idempotency_key,request_hash,accepted_generation,created_at)
+          SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,clock_timestamp() WHERE clock_timestamp()<to_timestamp($10::double precision/1000)
             AND EXISTS(SELECT 1 FROM sessions WHERE user_id=$2 AND token_hash=$11 AND expires_at>clock_timestamp()) RETURNING *`,
           [id,userId,input.courseId,input.lectureId,status,input.scheduledFor,input.idempotencyKey,input.requestHash,proof.generation,proof.expiresAt,authorization.almsTokenHash]);
         if (!r) throw authorityChanged();
         if(input.startConsentId)await bindPlaybackStartConsent(query,userId,id,input,input.startConsentId,proof.generation,{almsTokenHash:authorization.almsTokenHash,csrfToken:authorization.csrfToken??'',clientId:authorization.clientId??null});
         await query('INSERT INTO job_outbox(job_id) VALUES($1)', [id]);
+        await query('INSERT INTO playback_queue_metadata(job_id,duration_seconds,dispatch_id) VALUES($1,$2,$3)', [id, proof.durationSeconds, randomUUID()]);
         if(input.startConsentId){
           await this.continuationSession(query,userId,{almsTokenHash:authorization.almsTokenHash,csrfToken:authorization.csrfToken??'',clientId:authorization.clientId??null});
           const final=await query('SELECT clock_timestamp()<to_timestamp($1::double precision/1000) AS valid',[proof.expiresAt]);if(final.rows[0]?.valid!==true)throw authorityChanged();
@@ -402,9 +467,10 @@ export class PgStore implements Store {
   /** Fresh admission and retirement commit together. The old generation is never rebound. */
   async continueJob(userId: string, id: string, idempotencyKey: string, requestHash: string,
     authorization: JobContinuationAuthorization & {startConsentId?:string}, operation: WorkerOperation = { timeoutMs: 5000 }): Promise<JobContinuationResult> {
-    if(authorization.startConsentId)operation={...operation,readCommitted:true};
+    operation={...operation,readCommitted:true};
     try {
       return await this.workerTransaction(async query => {
+        await query(playbackQueueLock);
         await query(playbackAccountLock, [playbackAccountLockKey(userId)]);
         await query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [userId + ':' + idempotencyKey]);
         await this.continuationSession(query, userId, authorization);
@@ -440,14 +506,15 @@ export class PgStore implements Store {
         if (retired.rowCount !== 1) throw authorityChanged();
         const childId = randomUUID(), scheduledFor = new Date(Math.max(Date.now(), new Date(old.scheduled_for).getTime())).toISOString();
         const status = Date.parse(scheduledFor) > Date.now() + 1000 ? 'scheduled' : 'queued';
-        const created = await query(`INSERT INTO playback_jobs(id,user_id,course_id,lecture_id,status,scheduled_for,idempotency_key,request_hash,accepted_generation)
-          SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9 WHERE clock_timestamp()<to_timestamp($10::double precision/1000)
+        const created = await query(`INSERT INTO playback_jobs(id,user_id,course_id,lecture_id,status,scheduled_for,idempotency_key,request_hash,accepted_generation,created_at)
+          SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,clock_timestamp() WHERE clock_timestamp()<to_timestamp($10::double precision/1000)
             AND EXISTS(SELECT 1 FROM sessions WHERE user_id=$2 AND token_hash=$11 AND csrf_token=$12 AND client_id IS NOT DISTINCT FROM $13::text AND expires_at>clock_timestamp()) RETURNING id`,
           [childId, userId, old.course_id, old.lecture_id, status, scheduledFor, idempotencyKey, requestHash, proof.generation, proof.expiresAt,
             authorization.almsTokenHash, authorization.csrfToken, authorization.clientId]);
         if (created.rowCount !== 1) throw authorityChanged();
         if(authorization.startConsentId)await bindPlaybackStartConsent(query,userId,childId,{courseId:old.course_id,lectureId:old.lecture_id,scheduledFor},authorization.startConsentId,proof.generation,authorization);
         await query('INSERT INTO job_outbox(job_id) VALUES($1)', [childId]);
+        await query('INSERT INTO playback_queue_metadata(job_id,duration_seconds,dispatch_id) VALUES($1,$2,$3)', [childId, proof.durationSeconds, randomUUID()]);
         const related = await query(`UPDATE playback_auth_waits SET continued_job_id=$2,continued_at=clock_timestamp()
           WHERE job_id=$1 AND continued_job_id IS NULL RETURNING job_id`, [id, childId]);
         if (related.rowCount !== 1) throw authorityChanged();
@@ -521,19 +588,33 @@ export class PgStore implements Store {
   private workerQuery(sql: string, params: unknown[], operation: WorkerOperation = { timeoutMs: 5000 }) {
     return workerTransaction(this.pool, query => query<Row>(sql, params), operation);
   }
-  async claimJob(id: string, operation?: WorkerOperation) {
+  async claimJob(id: string, operation?: WorkerOperation, queueDeliveryId?: string) {
     const tokenHash = hashToken(randomBytes(32).toString('base64url'));
     return this.workerTransaction(async query => {
+      if (queueDeliveryId !== undefined) await query(playbackQueueLock);
       const { rows: [scope] } = await query<Row>('SELECT user_id FROM playback_jobs WHERE id=$1', [id]);
       if (!scope) return null;
       await query(playbackAccountLock, [playbackAccountLockKey(scope.user_id)]);
+      if (queueDeliveryId !== undefined) {
+        const { rows: [metadata] } = await query<Row>('SELECT dispatch_id FROM playback_queue_metadata WHERE job_id=$1', [id]);
+        // Only the current durable message or the exact pre-migration legacy ID may claim.
+        if (metadata ? metadata.dispatch_id !== queueDeliveryId : id !== queueDeliveryId) return null;
+        const { rows: [head] } = await query<Row>(playbackQueueHead);
+        const { rows: [gate] } = await query<Row>(playbackQueueBusy);
+        if (head?.id !== id || gate?.busy !== false) {
+          await deferUntouchedPlaybackDelivery(query, id, queueDeliveryId);
+          return null;
+        }
+        const untouched = await query(`SELECT job.id FROM playback_jobs job WHERE job.id=$1 AND ${untouchedPlaybackQueueJob} FOR UPDATE`, [id]);
+        if (!untouched.rowCount) return null;
+      }
       const { rows: [r] } = await query<Row>(`UPDATE playback_jobs SET status='running',heartbeat_at=clock_timestamp(),updated_at=clock_timestamp(),
         execution_token_hash=$2,last_execution_token_hash=$2
         WHERE id=$1 AND status IN ('queued','scheduled') AND scheduled_for<=clock_timestamp() AND accepted_generation IS NOT NULL
           AND execution_token_hash IS NULL AND settled_at IS NULL
           AND NOT EXISTS(SELECT 1 FROM playback_auth_waits waiting WHERE waiting.job_id=playback_jobs.id AND waiting.continued_job_id IS NULL) RETURNING *`,[id,tokenHash]);
       return r ? jobFrom(r) : null;
-    }, operation ?? { timeoutMs: 5000 });
+    }, { ...(operation ?? { timeoutMs: 5000 }), readCommitted: true });
   }
   async getWorkerJob(claim: WorkerClaim, operation?: WorkerOperation) {
     const { rows: [r] } = await this.workerQuery(`SELECT * FROM playback_jobs WHERE ${claimWhere}`, claimValues(claim), operation);

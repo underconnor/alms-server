@@ -43,8 +43,11 @@ describe('durable authentication waits and explicit continuations in isolated Po
   const auth = (fresh: Awaited<ReturnType<Awaited<ReturnType<typeof fixture>>['login']>>, job: Job) => ({ admission: fresh.admission(job), almsTokenHash: fresh.tokenHash, csrfToken: fresh.csrfToken, clientId: fresh.clientId });
   it('marks only untouched same-owner/generation intents and blocks already-dispatched claims without rewriting pending rows', async () => {
     const f = await fixture(), before = await row(f.queued.id), other = await fixture();
-    const sent: string[] = [], boss = { send: async (_q: string, data: { jobId: string }) => { sent.push(data.jobId); return data.jobId; } } as unknown as PgBoss;
-    await dispatchOutbox(store, boss); assert.ok(sent.includes(f.queued.id)); await f.fail(); assert.deepEqual(await row(f.queued.id), before);
+    const sent: string[] = [], boss = { send: async (_q: string, data: { jobId: string }, options: { id: string }) => { sent.push(data.jobId); return options.id; } } as unknown as PgBoss;
+    // Reproduce a legacy delivery accepted before the current execution began.
+    // The new head-only dispatcher deliberately cannot dispatch another job while one runs.
+    await pool.query('UPDATE job_outbox SET dispatched_at=clock_timestamp() WHERE job_id=$1', [f.queued.id]);
+    await f.fail(); assert.deepEqual(await row(f.queued.id), before);
     assert.equal((await store.getJob(f.owner, f.queued.id))?.authWait?.reason, 'school_auth_required');
     assert.equal((await store.getJob(f.owner, f.queued.id))?.authWait?.canContinue, false);
     assert.equal((await store.getJob(f.owner, f.failed.id))?.authenticationContinuationEligible, true);
