@@ -845,7 +845,7 @@ describe('exact queue start consent and one-use attempts in isolated PostgreSQL'
     assert.equal((await store.getJob(f.owner, old.jobId))?.authWait?.continuedAsJobId, null);
     assert.equal((await pool.query('SELECT 1 FROM playback_jobs WHERE user_id=$1', [f.owner])).rowCount, 1);
   });
-  it('consent-backed operations override a repeatable-read pool before any snapshot while legacy keeps its default', async () => {
+  it('consent operations and FIFO admissions use read committed while ordinary transactions preserve the pool default', async () => {
     const f = await fixture(),
       rr = new Pool({ connectionString: url, max: 1, options: `-c search_path=${schema}` });
     try {
@@ -903,6 +903,12 @@ describe('exact queue start consent and one-use attempts in isolated PostgreSQL'
           ),
         },
       );
+      assert.equal(levels.at(-1), 'read committed');
+      // Queue admission now also needs a fresh snapshot after the scheduler lock.
+      // Generic transactions still inherit the configured pool isolation level.
+      await reader.workerTransaction(async query => {
+        assert.equal((await query('SHOW transaction_isolation')).rows[0]!.transaction_isolation, 'repeatable read');
+      }, op);
       assert.equal(levels.at(-1), 'repeatable read');
       assert.equal(
         (await rr.query('SHOW default_transaction_isolation')).rows[0].default_transaction_isolation,
