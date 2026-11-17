@@ -164,6 +164,28 @@ describe('operator-reviewed historical preplay retry in isolated PostgreSQL', { 
       assert.deepEqual(await row(f.parentId),before);
     }
   });
+  it('invalid consent returns the documented conflict before release insertion and preserves every queue record',async()=>{
+    for(const mode of ['expired','revoked','course','lecture','client','generation','missing'] as const){
+      const f=await fixture(),before=await row(f.parentId),consentId=randomUUID();
+      if(mode!=='missing'){
+        await pool.query(`WITH instant AS(SELECT clock_timestamp() AS t) INSERT INTO playback_start_consents
+          (id,user_id,client_id,generation,course_id,lecture_ids,idempotency_key,request_hash,created_at,expires_at)
+          SELECT $1,$2,$3,$4,$5,$6,$7,$8,t-interval '1 minute',
+            CASE WHEN $9::boolean THEN t-interval '1 second' ELSE t+interval '1 hour' END FROM instant`,
+          [consentId,f.owner,mode==='client'?'other-registered-client':null,mode==='generation'?f.previousGeneration:f.generation,
+            mode==='course'?'99':'10',mode==='lecture'?['99']:['20'],randomUUID(),hashToken('synthetic-invalid-consent'),mode==='expired']);
+        if(mode==='revoked')await store.revokePlaybackStartConsent(f.owner,consentId,f.auth,op);
+      }
+      const code=mode==='expired'?'PLAYBACK_START_CONSENT_EXPIRED':mode==='revoked'?'PLAYBACK_START_CONSENT_REVOKED':'PLAYBACK_START_CONSENT_INVALID';
+      await assert.rejects(store.retryReviewedPreplay(f.owner,f.parentId,{...f.input,startConsentId:consentId},f.authorization()),{statusCode:409,code});
+      assert.deepEqual(await row(f.parentId),before);
+      assert.equal((await pool.query('SELECT 1 FROM playback_preplay_releases WHERE parent_job_id=$1',[f.parentId])).rowCount,0);
+      assert.equal((await pool.query('SELECT 1 FROM playback_jobs WHERE user_id=$1',[f.owner])).rowCount,1);
+      assert.equal((await pool.query('SELECT 1 FROM job_outbox o JOIN playback_jobs j ON j.id=o.job_id WHERE j.user_id=$1',[f.owner])).rowCount,1);
+      for(const table of ['playback_queue_metadata','playback_job_start_consents'])
+        assert.equal((await pool.query(`SELECT 1 FROM ${table} record JOIN playback_jobs j ON j.id=record.job_id WHERE j.user_id=$1`,[f.owner])).rowCount,0);
+    }
+  });
   it('DB rejects marker forgery, release deletion and every later modification of released history',async()=>{
     const f=await fixture(), before=await row(f.parentId);
     await assert.rejects(pool.query('UPDATE playback_jobs SET reviewed_preplay_release_id=$2 WHERE id=$1',[f.parentId,randomUUID()]),{code:'23503'});

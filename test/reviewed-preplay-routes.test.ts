@@ -196,6 +196,20 @@ test('uncertain commit is inspected by exact key without new school calls or a s
   } finally { await app.close(); }
 });
 
+test('definite consent rejections remain actionable conflicts without ambiguous-admission recovery or child writes', async () => {
+  for (const code of ['PLAYBACK_START_CONSENT_EXPIRED','PLAYBACK_START_CONSENT_REVOKED','PLAYBACK_START_CONSENT_INVALID'] as const) {
+    const f = fixture(), before = clone(f.original);
+    f.store.retryReviewedPreplay = async () => { throw new AppError(409, code, 'fixed'); };
+    const app = await f.app();
+    try {
+      const response = await app.inject({ method: 'POST', url: f.url, headers: f.headers(), payload: f.payload });
+      assert.equal(response.statusCode, 409, response.body);
+      assert.equal(response.json().error.code, code);
+      assert.equal(f.counters().writes, 0); assert.equal(f.jobs.size, 1); assert.deepEqual(f.original, before);
+    } finally { await app.close(); }
+  }
+});
+
 test('same-key changed body conflicts and absent GET never performs admission', async () => {
   const f = fixture(), app = await f.app(), headers = f.headers();
   try {

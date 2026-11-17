@@ -7,7 +7,7 @@ import { inspectPlaybackAdmission, type PlaybackAdmission } from './playback-aut
 import { publicVerifiedSchoolResult } from './job-verification.js';
 import { playbackAccountLock, playbackAccountLockKey } from './playback-lock.js';
 import { playbackQueueLock } from './playback-queue-policy.js';
-import { bindPlaybackStartConsent, validateConsentSession } from './playback-start-consent-store.js';
+import { bindPlaybackStartConsent, validateConsentSession, validatePlaybackStartConsentBinding } from './playback-start-consent-store.js';
 import type { ConsentAuthorization } from './playback-start-consent.js';
 import { workerTransaction, type WorkerOperation, type WorkerQuery } from './worker-bounds.js';
 
@@ -149,6 +149,8 @@ export class PgReviewedPreplayRepository {
         const childId = randomUUID(), releaseId = randomUUID();
         const scheduledFor = new Date(Math.max(Date.now(), new Date(old.scheduled_for).getTime())).toISOString();
         const status = Date.parse(scheduledFor) > Date.now() + 1000 ? 'scheduled' : 'queued';
+        await validatePlaybackStartConsentBinding(query,owner,{courseId:old.course_id,lectureId:old.lecture_id,scheduledFor},
+          input.startConsentId,proof.generation,auth);
         await query(`INSERT INTO playback_preplay_releases
           (id,parent_job_id,child_job_id,permit_id,user_id,course_id,lecture_id,previous_generation,current_generation,client_id,start_consent_id,request_key,request_hash)
           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
