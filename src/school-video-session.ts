@@ -27,8 +27,9 @@ export type SchoolVideoSessionStore = { getEncryptedSchoolSession(owner: string,
 const changed = () => new AppError(409, 'SCHOOL_SESSION_CHANGED', '학교 인증이 변경됐습니다. 다시 확인해 주세요.');
 const required = () => new AppError(401, 'SCHOOL_AUTH_REQUIRED', '학교 인증을 다시 확인해 주세요.');
 type Session = z.infer<typeof stored>;
-type Connection = { client: LearningxClient; http: SchoolHttpClient; session: Session; current: () => Promise<void> };
-type ReportAttempt = { phase: VideoReportPhase; transportEntered: boolean; freshReadFinished: boolean };
+type Connection = { client: LearningxClient; http: SchoolHttpClient; session: Session; current: () => Promise<void>;
+  readRecovery: { guardFailed: boolean; retryableResponses: number } };
+type ReportAttempt = { phase: VideoReportPhase; transportEntered: boolean; transportAcknowledged: boolean; freshReadFinished: boolean };
 
 /** Fresh, account-scoped school preparation and reporting. Handles and URLs remain in this process only. */
 export interface SchoolVideoTarget { owner: string; courseId: string; moduleItemId: string }
@@ -68,18 +69,28 @@ export function createSchoolVideoSessions(store: SchoolVideoSessionStore, key: B
       signal.throwIfAborted(); await validate(); signal.throwIfAborted();
       const before = expected ? await sameSession(owner, expected, signal) : await readSession(owner, signal);
       if (expectedGeneration !== undefined && before.value.generation !== expectedGeneration) throw changed();
-      const current = async () => { signal.throwIfAborted(); await validate(); await sameSession(owner, before.value, signal); signal.throwIfAborted(); };
+      // The SDK normalizes fetcher failures. Retain guard provenance even if a
+      // later authority check succeeds, rather than treating it as school I/O.
+      const readRecovery = { guardFailed: false, retryableResponses: 0 };
+      const current = async () => {
+        try { signal.throwIfAborted(); await validate(); await sameSession(owner, before.value, signal); signal.throwIfAborted(); }
+        catch (error) { readRecovery.guardFailed = true; throw error; }
+      };
       let requests = 0;
       const guardedFetch: typeof fetch = async (input, init) => {
-        await current(); if (++requests > 24) throw new SchoolError('unsupported');
-        const response = await fetcher(input, { ...init, signal: AbortSignal.any([signal, ...(init?.signal ? [init.signal] : [])]) });
-        try { await current(); return response; }
+        await current(); if (++requests > 24) { readRecovery.guardFailed = true; throw new SchoolError('unsupported'); }
+        const requestSignal = AbortSignal.any([signal, ...(init?.signal ? [init.signal] : [])]);
+        const response = await fetcher(input, { ...init, signal: requestSignal });
+        try { await current();
+          if (!requestSignal.aborted && response.status >= 500 && response.status < 600
+            && !response.headers.has('retry-after')) readRecovery.retryableResponses++;
+          return response; }
         catch (error) { void response.body?.cancel().catch(() => {}); throw error; }
       };
       const http = SchoolHttpClient.fromSessionJar(before.value.jar, guardedFetch);
       try {
       const client = await initializeLearningxClient(http, before.value.identity.studentId); await current();
-      const value = await run({ client, http, session: before.value, current }); await current();
+      const value = await run({ client, http, session: before.value, current, readRecovery }); await current();
       const encrypted = encryptSchoolSession({ ...before.value, jar: await http.jar.serialize() }, key, owner, 'ssu');
       await boundedWorkerOperation(async bounded => {
         bounded.throwIfAborted();
@@ -158,7 +169,23 @@ export function createSchoolVideoSessions(store: SchoolVideoSessionStore, key: B
         if (!active) throw new SchoolError('unsupported');
         const current = active;
         current.attempt.phase = 'fresh_read';
-        const result = await current.connection.client.moduleLearningStatus(context.courseId, context.moduleItemId, AbortSignal.any([sdkSignal, current.signal]));
+        const readSignal = AbortSignal.any([sdkSignal, current.signal]);
+        const before = current.connection.readRecovery.retryableResponses;
+        const read = () => current.connection.client.moduleLearningStatus(context.courseId, context.moduleItemId, readSignal);
+        let result: Awaited<ReturnType<typeof read>>;
+        try { result = await read(); }
+        catch (error) {
+          // Recover only a received 5xx status read after a strict native ACK.
+          // Generic fetch/jar failures and any normalized guard failure stay terminal.
+          if (!current.attempt.transportAcknowledged || !(error instanceof SchoolError)
+            || error.code !== 'upstream_unavailable' || error.retryable !== true
+            || current.connection.readRecovery.guardFailed || current.connection.readRecovery.retryableResponses === before) throw error;
+          if (active !== current) throw new SchoolError('unsupported');
+          readSignal.throwIfAborted(); await current.validate(); await current.connection.current(); readSignal.throwIfAborted();
+          // One extra status operation, in the same execution/jar/deadline. Never
+          // resend the report or retry a failed guard/CAS or a successful stale result.
+          result = await read();
+        }
         current.attempt.freshReadFinished = true;
         return result;
       },
@@ -280,7 +307,7 @@ export function createSchoolVideoSessions(store: SchoolVideoSessionStore, key: B
       report: async (event, current, reportSignal) => {
         let stage: VideoReportPreparationStage = 'guard', mayHaveWritten = false;
         let transmission: VideoReportTransmission | undefined;
-        const attempt: ReportAttempt = { phase: 'preflight', transportEntered: false, freshReadFinished: false };
+        const attempt: ReportAttempt = { phase: 'preflight', transportEntered: false, transportAcknowledged: false, freshReadFinished: false };
         const rememberFailure = (error: unknown) => {
           // Existing unsent preflight diagnostics remain unchanged; these facts describe
           // the attempted transport and subsequent checks only.
@@ -323,8 +350,10 @@ export function createSchoolVideoSessions(store: SchoolVideoSessionStore, key: B
                   attempt.transportEntered = true; attempt.phase = 'transmission';
                   try {
                     const response = await connection.http.forwardVideoReport(request, sdkSignal);
-                    // This receipt records only the strict HTTP parser's fact. A later SDK
-                    // refresh/CAS/guard failure still fails normally and must never be retried.
+                    // This receipt records only the strict HTTP parser's fact. Only
+                    // readFresh may recover one received 5xx; the write, guards
+                    // and CAS are never repeated after a later failure.
+                    attempt.transportAcknowledged = response?.acknowledged === true;
                     transmission = response?.acknowledged === true
                       ? Object.freeze({ outcome: 'acknowledged', code: 'none' })
                       : Object.freeze({ outcome: 'failed', code: 'unexpected_response' });

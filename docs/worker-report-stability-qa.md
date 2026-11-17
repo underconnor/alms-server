@@ -24,6 +24,10 @@ Worker 실패 진단은 학교 URL·원문·토큰·학생·작업 식별자 대
 - `reportFailure`: 실패 경계의 처리 구간과 report/lifetime 취소 여부. 취소 이유 문자열이나 원본 오류는 기록하지 않는다.
 - `runtimeFirstFailure`와 `runtimeFirstFailureOrigin`: 실행 중 최초 중단 코드와 고정 원인 구간. 진행 중인 보고의 취소 또는 정리 오류가 최초 중단을 가리지 않게 한다. 학교 측 거절 원인을 대신하지 않는다.
 
-전송 ACK가 확인돼도 fresh 결과·권한 검사가 실패하면 기존 미확정 처리와 무재전송 정책을 유지한다. 명시적 새 시작 ACK, 일반 `playing/update/ended` 보고 ACK, 학교 완료·개별 영상 출석·차시 출결은 각각 확인한다. 진단을 이유로 첫 일반 보고를 생략하거나 ACK parser를 완화하지 않는다.
+엄격한 일반 보고 ACK 뒤 첫 fresh 조회에서 실제 HTTP 5xx와 retryable `upstream_unavailable`이 함께 관찰된 경우에만 상태 조회를 최대 한 번 추가한다. 같은 실행·owner·generation·대상·jar·취소 신호·요청 한도를 유지하며, 각 조회는 캐시 없이 신원·수강권한·module/detail의 다섯 GET을 수행한다. 권한 검사나 요청 한도 실패가 한 번이라도 발생했거나 요청 신호가 취소된 응답이면 추가 조회하지 않는다. 일반 fetch/jar 오류, 다른 HTTP 오류, 파싱 오류, 정상적으로 반환된 미완료 결과도 대상이 아니다. 429와 `Retry-After`가 있는 응답은 서버 대기 지시를 즉시 재요청으로 넘기지 않고 기존 실패 경로를 따른다.
+
+보고·새 시작·후속 권한 검사·jar CAS는 재시도하지 않는다. 추가 조회 뒤에도 fresh 결과·권한 검사·저장이 실패하면 기존 미확정 처리를 유지하며, 과거 미확정 작업을 다시 실행하지 않는다. 명시적 새 시작 ACK, 일반 `playing/update/ended` 보고 ACK, 학교 완료·개별 영상 출석·차시 출결은 각각 확인한다. 상태 조회 복구나 진단을 이유로 첫 일반 보고를 생략하거나 ACK parser를 완화하지 않는다. `refresh/upstream_unavailable` 로그에 원래 HTTP 상태 근거가 없다면 이 복구 경로의 적용 대상이었다고 단정할 수 없다.
 
 [`test/video-report-refresh-diagnostics.test.ts`](../test/video-report-refresh-diagnostics.test.ts)는 포함된 SDK로 ACK·거절 뒤 fresh read/CAS/캐시 실패를 구분한다. runtime·보고 동시 실패는 controlled runtime 및 school playback 회귀로 검사한다. 이 합성 검사들은 운영 수강 완료의 근거가 아니다.
+
+[`test/video-report-status-read-recovery.test.ts`](../test/video-report-status-read-recovery.test.ts)는 같은 SDK의 Commons·Readystream·Everlec 보고에서 503 후 조회 복구와 보고 1회·같은 신호·저장 1회를 확인한다. 반복 503, 401/404/429, 서버 대기 지시, schema/fetch 오류, ACK 거절·손상, 취소·generation 변경, 일시적인 권한 검사 실패, 후속 CAS 실패에서는 허용 범위를 넘는 조회나 보고를 하지 않는지 검사한다.
