@@ -20,6 +20,7 @@ export async function fixture(options: { durationSeconds?: number; allowPlayback
   const reset = () => { generation = randomUUID(); encrypted = encryptSchoolSession({ version: 1, generation, identity: { studentId: '90000001' }, jar }, key, owner, 'ssu'); }; reset();
   let owned = true, profile = true, details: Record<string, unknown> = {}, requests = 0, reports = 0, starts = 0, beforeReturn = async () => {}, cas = true, progress = 0, pureCanvas: boolean | null = true, xmlOverride: string | undefined;
   let reportResponse: ((callback: string) => Response) | undefined;
+  let postReportReadResponse: ((url: URL, value: unknown) => Response | undefined) | undefined;
   let invalidationError: unknown;
   const paths: string[] = [];
   const store = { getEncryptedSchoolSession: async () => encrypted,
@@ -60,6 +61,9 @@ export async function fixture(options: { durationSeconds?: number; allowPlayback
     } else throw new Error('Unexpected synthetic request');
     await beforeReturn();
     if (url.pathname.endsWith('/progress') && reportResponse) return reportResponse(url.searchParams.get('callback')!);
+    if (reports > 0 && !url.pathname.endsWith('/progress')) {
+      const response = postReportReadResponse?.(url, value); if (response) return response;
+    }
     return new Response(body ?? JSON.stringify(value), { status: url.pathname.endsWith('/progress') ? reportStatus : 200, headers: { 'content-type': mime } });
   };
   const invalidate = async () => { released++; if (invalidationError) throw invalidationError; };
@@ -73,6 +77,7 @@ export async function fixture(options: { durationSeconds?: number; allowPlayback
     setType: (v: string) => { rawType = v; }, setAck: (v: boolean) => { ack = v; }, setCas: (v: boolean) => { cas = v; },
     setReportStatus: (value: number) => { reportStatus = value; },
     setReportResponse: (value: (callback: string) => Response) => { reportResponse = value; },
+    setPostReportReadResponse: (value: (url: URL, body: unknown) => Response | undefined) => { postReportReadResponse = value; },
     setInvalidationError: (value: unknown) => { invalidationError = value; },
     setProgress: (value: number) => { progress = value; },
     onReturn: (fn: () => Promise<void>) => { beforeReturn = fn; }, prepare: () => school.prepare({ ...context, owner }, noop, signal()) };
