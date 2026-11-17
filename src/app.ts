@@ -1,4 +1,5 @@
 import { registerPlaybackStartConsents } from './playback-start-consent-routes.js';
+import { registerReviewedPreplayRoutes } from './reviewed-preplay-routes.js';
 import { registerPlaybackContinuation } from './playback-continuation-routes.js';
 import { withPlaybackContinuationState } from './playback-auth-wait.js';
 import { registerJobSettlement } from './job-settlement.js';
@@ -170,6 +171,7 @@ export async function buildApp(config: Config, store: Store, provider: SchoolPro
   registerJobVerification(app, store, provider, authenticate);
   registerPlaybackContinuation(app, store, provider, authenticate, config.sessionEncryptionKey, playbackReadiness);
   registerPlaybackStartConsents(app, store, provider, authenticate, config.sessionEncryptionKey, playbackReadiness);
+  registerReviewedPreplayRoutes(app, store, provider, authenticate, config.sessionEncryptionKey, playbackReadiness);
   registerActivityLearningStatus(app, store, provider, authenticate);
   registerPersonalCompletion(app, store, provider, authenticate);
   const owner = (request: FastifyRequest) => request.session!.user.id;

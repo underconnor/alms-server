@@ -1,0 +1,19 @@
+# Reviewed historical preplay retries
+
+This path creates a new, explicitly authorized playback request for a privately reviewed historical request that did not reach the trusted worker's play call. It does not retry an old report, reconcile a school result, create a termination attestation, or backfill an authentication wait.
+
+Migration020 creates empty review/release tables. Ordinary `not_started` jobs remain blocked. A trusted operator must first independently review the exact approved parent IDs and existing-row fingerprints against the pinned v65 source archive, manifest, worker image and contemporaneous deployment evidence. The private `PgStore.registerReviewedPreplayPermit` method accepts those explicit inputs; it is deliberately absent from the public Store interface, HTTP and MCP. Public source contains no account-specific job allowlist. The evidence digest identifies the reviewed private evidence bundle; it is not a newly observed runtime attestation.
+
+An operator obtains the fingerprint with `reviewed_preplay_job_fingerprint(job)` and the microsecond UTC version exposed as the job's recovery version. The SQL fingerprint covers every existing job column except the newly added release marker. Source pins are exported as `reviewedPreplaySource`; supplying matching pins alone does not constitute an operator review. Review permits last at most 24 hours. An expired permit is retained; a fresh operator review can append another permit for the unchanged, still-unreleased parent. Neither expired permissions nor historical status values cause automatic recovery.
+
+The authenticated retry requires the current session, registered client and CSRF protection; a fresh, incomplete school result; an exact, current-generation admission; and a new explicit start consent covering the target. The current generation must differ from the historical one. Existing unsafe/manual leases or stale execution claims block admission. A proven current-generation worker may run ahead of the new request under the existing FIFO policy.
+
+The transaction takes the existing queue and account locks and uses READ COMMITTED, even with a repeatable-read pool default. It rechecks the parent version, full fingerprint, review deadline, school seal and consent, then creates one immutable release, sets only the parent release marker, creates the normal child, binds its consent and inserts its outbox and queue metadata. Deferred scope/child/binding FKs prohibit a committed release without its exact child and consent. Final wall-clock authority checks precede commit. Any failure rolls back the marker and all new records. Different request keys cannot create a second child; exact-key readback is authenticated and needs no school call or new playback authority.
+
+The original status, error, outcome, timestamps, accepted generation, result and execution evidence remain unchanged. A released parent's facts and marker become immutable. The active-job unique index keeps its existing active-state predicate and exempts a historical unknown only when its validated release marker exists. Other unknowns, including a new child whose execution becomes uncertain, still block normal duplicate admission.
+
+The separate `reviewedPreplay` projection describes eligibility and the new-child relation. Existing settlement/termination fields retain their original meaning. A missing request lookup is not proof of non-admission and does not authorize a new key or automatic resend after ambiguous transport.
+
+Preservation checks must compare the explicit pre-migration column projection. Adding a nullable column changes `row_to_json` hashes even for otherwise untouched rows. Report the original-facts hashes and the separately authorized marker/immutable-record additions independently.
+
+All automated tests use synthetic accounts and isolated PostgreSQL schemas. They do not demonstrate live school playback, completion or attendance.

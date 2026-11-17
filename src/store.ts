@@ -18,6 +18,7 @@ import type { SchoolSessionLockRunner } from './school-session-lock.js';
 import type { AuthenticationWaitReason } from './playback-auth-wait.js';
 import { activePlaybackQueueStatuses, pendingPlaybackQueueStatuses, playbackQueueLimit, type PlaybackQueueSnapshot } from './playback-queue.js';
 import { playbackQueueLock, playbackQueueHead, playbackQueueBusy, readyPlaybackQueueJob, untouchedPlaybackQueueJob, deferUntouchedPlaybackDelivery } from './playback-queue-policy.js';
+import { PgReviewedPreplayRepository, type ReviewedPreplayPermitInput, type ReviewedPreplayRetryInput, type ReviewedPreplayAuthorization, type ReviewedPreplayRetryResult, type ReviewedPreplayEligibility } from './reviewed-preplay.js';
 
 const iso = (value: Date | string): string => new Date(value).toISOString();
 type Row = Record<string, any>;
@@ -27,6 +28,7 @@ const completionFrom = (r: Row): PersonalCompletion => ({ courseId: r.course_id,
 const jobFrom = (r: Row): Job => ({ id: r.id, userId: r.user_id, courseId: r.course_id, lectureId: r.lecture_id, status: r.status, scheduledFor: iso(r.scheduled_for), createdAt: iso(r.created_at), updatedAt: iso(r.updated_at), schoolResult: r.school_result, errorCode: r.error_code, idempotencyKey: r.idempotency_key, requestHash: r.request_hash, acceptedGeneration: r.accepted_generation ?? null, executionTokenHash: r.execution_token_hash ?? null, executionOutcome: r.execution_outcome ?? null,
   playbackProgress: publicPlaybackProgress(r.playback_observation, r.playback_report_ack),
   authenticationContinuationEligible: r.auth_wait_eligible === true,
+  reviewedPreplay: r.preplay_permit_id ? { eligible: r.preplay_eligible === true, version: r.recovery_version ?? iso(r.updated_at), retriedAsJobId: r.preplay_child_id ?? null } : null,
   startConsent: r.start_consent_id ? { id:r.start_consent_id,expiresAt:iso(r.start_consent_expires),attempt:r.start_attempt_state??'not_attempted' } : null,
   authWait: r.auth_wait_since && (r.auth_wait_eligible === true || r.continued_as_job_id) ? { waitingSince: iso(r.auth_wait_since), reason: r.auth_wait_reason, canContinue: false, continuedAsJobId: r.continued_as_job_id ?? null } : null,
   lastExecutionTokenHash: r.last_execution_token_hash ?? null, settledAt: r.settled_at ? iso(r.settled_at) : null,
@@ -62,6 +64,11 @@ const jobRecoverySelect = `SELECT job.*, settlement.school_result AS settlement_
   auth_wait.waiting_since AS auth_wait_since, auth_wait.reason AS auth_wait_reason, auth_wait.continued_job_id AS continued_as_job_id,
   (${continuationEligible}) AS auth_wait_eligible,
   progress.observation AS playback_observation, progress.report_ack AS playback_report_ack,
+  preplay_permit.id AS preplay_permit_id,preplay_release.child_job_id AS preplay_child_id,
+  CASE WHEN preplay_permit.id IS NOT NULL AND preplay_release.id IS NULL AND preplay_permit.expires_at>clock_timestamp()
+    THEN validate_reviewed_preplay_parent(job) AND preplay_permit.original_version=job.updated_at
+      AND preplay_permit.original_fingerprint=reviewed_preplay_job_fingerprint(job)
+    ELSE false END AS preplay_eligible,
   to_char(job.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS recovery_version,
   CASE WHEN job.settled_at IS NOT NULL THEN 'already_settled'
     WHEN job.status<>'needs_verification' OR job.execution_outcome IS DISTINCT FROM 'interrupted' THEN 'not_interrupted'
@@ -79,6 +86,9 @@ const jobRecoverySelect = `SELECT job.*, settlement.school_result AS settlement_
   LEFT JOIN playback_start_consents consent ON consent.id=start_binding.consent_id
   LEFT JOIN playback_start_attempts start_attempt ON start_attempt.job_id=job.id
   LEFT JOIN playback_auth_waits auth_wait ON auth_wait.job_id=job.id
+  LEFT JOIN LATERAL (SELECT permit.* FROM playback_preplay_review_permits permit WHERE permit.parent_job_id=job.id
+    ORDER BY permit.created_at DESC,permit.id DESC LIMIT 1) preplay_permit ON true
+  LEFT JOIN playback_preplay_releases preplay_release ON preplay_release.id=job.reviewed_preplay_release_id
   LEFT JOIN playback_job_progress progress ON progress.job_id=job.id
     AND progress.execution_token_hash=COALESCE(job.execution_token_hash,job.last_execution_token_hash)`;
 
@@ -117,6 +127,9 @@ export interface Store {
   createJob(userId: string, input: NewJobInput, authorization: JobAdmissionAuthorization, operation?: WorkerOperation): Promise<Job>;
   findJobContinuation?(userId: string, id: string, idempotencyKey: string, requestHash: string, authorization: Pick<JobContinuationAuthorization, 'almsTokenHash' | 'csrfToken' | 'clientId'>, operation?: WorkerOperation): Promise<JobContinuationResult | null>;
   continueJob?(userId: string, id: string, idempotencyKey: string, requestHash: string, authorization: JobContinuationAuthorization, operation?: WorkerOperation): Promise<JobContinuationResult>;
+  getReviewedPreplayEligibility?(owner: string, parentId: string, auth: ConsentAuthorization, operation?: WorkerOperation): Promise<ReviewedPreplayEligibility | null>;
+  findReviewedPreplayRetry?(owner: string, parentId: string, key: string, auth: ConsentAuthorization, operation?: WorkerOperation, requestHash?: string): Promise<ReviewedPreplayRetryResult | null>;
+  retryReviewedPreplay?(owner: string, parentId: string, input: ReviewedPreplayRetryInput, auth: ReviewedPreplayAuthorization, operation?: WorkerOperation): Promise<ReviewedPreplayRetryResult>;
   cancelJob(userId: string, id: string): Promise<Job>;
   settleJob?(userId: string, id: string, expectedUpdatedAt: string, authorization: JobSettlementAuthorization, operation?: WorkerOperation): Promise<Job>;
   claimJob(id: string, operation?: WorkerOperation, queueDeliveryId?: string): Promise<Job | null>;
@@ -130,9 +143,14 @@ export interface Store {
 export class PgStore implements Store {
   readonly analytics: PgAnalyticsStore;
   readonly playbackStartConsents: PgPlaybackStartConsentRepository;
+  private readonly reviewedPreplay: PgReviewedPreplayRepository;
   readonly runWithSchoolSessionLock?: SchoolSessionLockRunner;
   constructor(public pool: Pool, options: { runWithSchoolSessionLock?: SchoolSessionLockRunner } = {}) {
     this.playbackStartConsents = new PgPlaybackStartConsentRepository(pool);
+    this.reviewedPreplay = new PgReviewedPreplayRepository(pool, async (query, owner, id) => {
+      const { rows: [row] } = await query<Row>(`${jobRecoverySelect} WHERE job.user_id=$1 AND job.id=$2`, [owner, id]);
+      return row ? jobFrom(row) : null;
+    });
     this.analytics = new PgAnalyticsStore(pool); this.runWithSchoolSessionLock = options.runWithSchoolSessionLock;
   }
   async query<T extends QueryResultRow = Row>(sql: string, params: unknown[] = []) { return this.pool.query<T>(sql, params); }
@@ -143,9 +161,14 @@ export class PgStore implements Store {
     finally { c.release(); }
   }
   async health() {
-    const result = await this.query("SELECT 1 FROM schema_migrations WHERE name IN ('011-playback-job-settlement.sql','012-frontend-clients.sql','013-analytics-frontend-client.sql','014-assignment-operation-recovery.sql','016-playback-job-progress.sql','017-playback-auth-wait.sql','018-playback-start-consent.sql','019-playback-queue-metadata.sql')");
-    if (result.rowCount !== 8) throw new Error('Database migrations are pending');
+    const result = await this.query("SELECT 1 FROM schema_migrations WHERE name IN ('011-playback-job-settlement.sql','012-frontend-clients.sql','013-analytics-frontend-client.sql','014-assignment-operation-recovery.sql','016-playback-job-progress.sql','017-playback-auth-wait.sql','018-playback-start-consent.sql','019-playback-queue-metadata.sql','020-reviewed-preplay-retry.sql')");
+    if (result.rowCount !== 9) throw new Error('Database migrations are pending');
   }
+  /** Private operator review only; intentionally absent from the public Store interface. */
+  registerReviewedPreplayPermit(input: ReviewedPreplayPermitInput, operation?: WorkerOperation) { return this.reviewedPreplay.registerPermit(input, operation); }
+  getReviewedPreplayEligibility(owner: string, parentId: string, auth: ConsentAuthorization, operation?: WorkerOperation) { return this.reviewedPreplay.eligibility(owner, parentId, auth, operation); }
+  findReviewedPreplayRetry(owner: string, parentId: string, key: string, auth: ConsentAuthorization, operation?: WorkerOperation, requestHash?: string) { return this.reviewedPreplay.find(owner, parentId, key, auth, operation, requestHash); }
+  retryReviewedPreplay(owner: string, parentId: string, input: ReviewedPreplayRetryInput, auth: ReviewedPreplayAuthorization, operation?: WorkerOperation) { return this.reviewedPreplay.retry(owner, parentId, input, auth, operation); }
   async getSession(tokenHash: string): Promise<Session | null> {
     const { rows: [r] } = await this.query(`SELECT s.*,u.display_name,u.analytics_id,u.analytics_enabled FROM sessions s JOIN users u ON u.id=s.user_id WHERE token_hash=$1 AND expires_at>now()`, [tokenHash]);
     return r ? { tokenHash: r.token_hash, csrfToken: r.csrf_token, analyticsSessionId: r.analytics_session_id, expiresAt: iso(r.expires_at), user: userFrom(r), clientId: r.client_id ?? null } : null;
