@@ -17366,7 +17366,7 @@
       "post": {
         "operationId": "post_v1_jobs",
         "summary": "Accept a separate server lecture job",
-        "description": "Schedule at most1year ahead; consent-backed scheduledFor must strictly precede consent.expiresAt or409PLAYBACK_START_CONSENT_SCHEDULE_INVALID rolls back admission. Admission checks live worker readiness, school ownership and generation;202 is not completion. Readystream additionally requires confirmed pureCanvas and an exact opaque-launch proof for a supported single-story video1 UPF/MP4; slides, multiple stories/media, HLS and unknown manifests are rejected before acceptance. Read jobs on uncertain acceptance; never automatically replay an uncertain school write.",
+        "description": "Schedule at most1year ahead; consent-backed scheduledFor must strictly precede consent.expiresAt or409PLAYBACK_START_CONSENT_SCHEDULE_INVALID rolls back admission. Admission checks live worker readiness, school ownership and generation;202 is not completion. Readystream and Everlec additionally require confirmed pureCanvas and an exact opaque-launch proof for a supported single-story video1 UPF/MP4; slides, multiple stories/media, HLS and unknown manifests are rejected before acceptance. Read jobs on uncertain acceptance; never automatically replay an uncertain school write.",
         "security": [
           {
             "cookieSession": []
@@ -21277,6 +21277,7 @@
                 "enum": [
                   "movie",
                   "readystream",
+                  "everlec",
                   "pdf",
                   "file"
                 ]
@@ -21298,7 +21299,7 @@
           },
           "playbackAvailable": {
             "type": "boolean",
-            "description": "Selection eligibility only. Readystream requires confirmed pureCanvas course metadata; admission independently verifies a fresh owned launch and supported single-story video1 UPF/MP4 media. It is not a playback, progress or attendance guarantee."
+            "description": "Selection eligibility only. Readystream and Everlec require confirmed pureCanvas course metadata; admission independently verifies a fresh owned launch and supported single-story video1 UPF/MP4 media. It is not a playback, progress or attendance guarantee."
           },
           "progressPercent": {
             "anyOf": [
@@ -23856,6 +23857,7 @@
             "enum": [
               "movie",
               "readystream",
+              "everlec",
               "pdf",
               "file"
             ]
@@ -26468,6 +26470,7 @@
                 "enum": [
                   "movie",
                   "readystream",
+                  "everlec",
                   "pdf",
                   "file"
                 ]

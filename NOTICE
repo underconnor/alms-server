@@ -15,7 +15,8 @@ Third-party components retain their own licenses and notices.
    LICENSES/Playwright-Apache-2.0.txt and LICENSES/Playwright-NOTICE.txt.
 
 2. ALMS SSU SDK
-   vendor/alms-ssu-api-0.3.39.tgz contains @alms/ssu-api 0.3.39 under MIT.
+   vendor/alms-ssu-api-0.3.40.tgz contains @alms/ssu-api 0.3.40 under MIT.
+   The previously vendored 0.3.39 archive retains the same license.
    Its original package/LICENSE is preserved inside the unmodified archive
    and copied to LICENSES/SSU-SDK-MIT.txt for convenient inspection.
 

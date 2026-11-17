@@ -1,4 +1,5 @@
 import { readystreamXml } from './readystream-fixture.js';
+import { everlecXml } from './everlec-fixture.js';
 import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { SchoolHttpClient } from '@alms/ssu-api';
@@ -9,7 +10,7 @@ import { createSchoolVideoSessions } from '../../src/school-video-session.js';
 export const noop = async () => {}, signal = () => AbortSignal.timeout(5_000);
 export const context = { owner: 'synthetic-owner', sessionHash: 'a'.repeat(64), courseId: '10', moduleItemId: '20' };
 export const observation = { positionSeconds: 0, durationSeconds: 600, playbackRate: 1, paused: false, ended: false, seeking: false, visible: true };
-export async function fixture(options: { durationSeconds?: number; allowPlaybackStart?: boolean; workerOnly?: boolean; allowReadystreamWorker?: boolean; owner?: string } = {}) {
+export async function fixture(options: { durationSeconds?: number; allowPlaybackStart?: boolean; workerOnly?: boolean; allowReadystreamWorker?: boolean; allowEverlecWorker?: boolean; owner?: string } = {}) {
   const duration = options.durationSeconds ?? 600;
   const owner = options.owner ?? context.owner;
   const key = randomBytes(32), seed = new SchoolHttpClient();
@@ -31,7 +32,7 @@ export async function fixture(options: { durationSeconds?: number; allowPlayback
       assert.equal(new Headers(init?.headers).get('cookie'), null); assert.equal(new Headers(init?.headers).get('authorization'), null);
       body = '<script>var contentUri = "https://commons.ssu.ac.kr/viewer/ssplayer/uniplayer_support/content.php?content_id=synthetic-video";</script>'; mime = 'text/html';
     } else if (url.pathname.endsWith('/content.php')) {
-      body = rawType === 'readystream' ? xmlOverride ?? readystreamXml('synthetic-video', duration) : '<content><content_playing_info><content_id>synthetic-video</content_id><content_type>video1</content_type>'
+      body = rawType === 'readystream' || rawType === 'everlec' ? xmlOverride ?? (rawType === 'everlec' ? everlecXml : readystreamXml)('synthetic-video', duration) : '<content><content_playing_info><content_id>synthetic-video</content_id><content_type>video1</content_type>'
         + '<content_uri>https://commons.ssu.ac.kr/contents31/ssu1000001/synthetic-video/contents/</content_uri><content_duration>' + duration + '</content_duration>'
         + '<main_media><desktop><html5><method>progressive</method><media_uri>https://ssuin-object.commonscdn.com/ssu-contents/contents31/ssu1000001/synthetic-video/contents/media_files/mobile/video.mp4</media_uri></html5></desktop></main_media>'
         + '</content_playing_info></content>'; mime = 'text/xml';
@@ -64,7 +65,8 @@ export async function fixture(options: { durationSeconds?: number; allowPlayback
   const invalidate = async () => { released++; if (invalidationError) throw invalidationError; };
   const school = createManualVideoSchool(store, key, invalidate, fetcher);
   const sessions = createSchoolVideoSessions(store, key, invalidate, fetcher, { allowReadystreamManual: options.workerOnly !== true,
-    allowReadystreamWorker: options.allowReadystreamWorker === true });
+    allowReadystreamWorker: options.allowReadystreamWorker === true, allowEverlecManual: options.workerOnly !== true,
+    allowEverlecWorker: options.allowEverlecWorker === true });
   return { sessions, generation: () => generation, encrypted: () => encrypted, school, store, fetcher, key, reset, paths, counts: () => ({ requests, reports, starts, invalidated: released }),
     setPureCanvas: (v: boolean | null) => { pureCanvas = v; }, setXml: (v: string) => { xmlOverride = v; },
     setOwned: (v: boolean) => { owned = v; }, setProfile: (v: boolean) => { profile = v; }, setDetails: (v: Record<string, unknown>) => { details = v; },

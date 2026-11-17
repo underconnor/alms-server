@@ -1,4 +1,5 @@
 import { verifiedVideoMedia } from './verified-video-media.js';
+import { requiresVerifiedVideoMedia } from './video-policy.js';
 import { z } from 'zod';
 import { rememberVideoReportPreparation, rememberVideoReportResult, rememberVideoReportTransmission, rememberVideoReportFailureContext, videoReportDiagnostic,
   type VideoReportPreparationStage, type VideoReportContext, type VideoReportTransmission, type VideoReportPhase } from './video-report-diagnostics.js';
@@ -46,7 +47,9 @@ export interface SchoolVideoSessions {
 }
 export function createSchoolVideoSessions(store: SchoolVideoSessionStore, key: Buffer,
   invalidate: (owner: string, courseId: string, activityId: string) => Promise<void>, fetcher: typeof fetch = fetch,
-  options: { allowReadystreamManual?: boolean; allowReadystreamWorker?: boolean } = {}): SchoolVideoSessions {
+  options: { allowReadystreamManual?: boolean; allowReadystreamWorker?: boolean;
+    allowEverlecManual?: boolean; allowEverlecWorker?: boolean } = {}): SchoolVideoSessions {
+  const workerMode = options.allowReadystreamWorker === true || options.allowEverlecWorker === true;
   const readSession = async (owner: string, signal: AbortSignal) => boundedWorkerOperation(async bounded => {
     const raw = await store.getEncryptedSchoolSession(owner, 'ssu'); bounded.throwIfAborted();
     if (!raw) throw required();
@@ -107,7 +110,7 @@ export function createSchoolVideoSessions(store: SchoolVideoSessionStore, key: B
     const launch = await client.moduleActivityVideoLaunch(courseId, activityId), data = inspectSchoolVideoLaunch(launch);
     if (data.detail.courseId !== courseId || data.detail.moduleItemId !== activityId || data.detail.published !== true
       || data.detail.opened !== true || data.detail.omitProgress !== false || typeof data.detail.useAttendance !== 'boolean') throw new SchoolError('unsupported');
-    if (data.contentType === 'readystream' && courses.find(course => course.id === courseId)?.usePureCanvas !== true) throw new SchoolError('unsupported');
+    if (requiresVerifiedVideoMedia(data.contentType) && courses.find(course => course.id === courseId)?.usePureCanvas !== true) throw new SchoolError('unsupported');
     await connection.current(); return { launch, data, login: identity.login_id, userId: identity.id };
   }
   const sameLaunch = (left: SchoolVideoLaunchData, right: SchoolVideoLaunchData) => {
@@ -123,13 +126,17 @@ export function createSchoolVideoSessions(store: SchoolVideoSessionStore, key: B
     signal.throwIfAborted();
     // Only trusted process wiring opts into a reporting mode. Both paths still require the
     // same fresh ownership/pureCanvas checks and exact single-video SDK media proof below.
-    if (prepared.value.data.contentType === 'readystream'
-      && options.allowReadystreamManual !== true && options.allowReadystreamWorker !== true) throw new SchoolError('unsupported');
+    if (requiresVerifiedVideoMedia(prepared.value.data.contentType)) {
+      const allowed = prepared.value.data.contentType === 'readystream'
+        ? options.allowReadystreamManual === true || options.allowReadystreamWorker === true
+        : options.allowEverlecManual === true || options.allowEverlecWorker === true;
+      if (!allowed) throw new SchoolError('unsupported');
+    }
     const lifetime = new AbortController();
     let original = prepared.value;
     const currentPrepared = async () => { signal.throwIfAborted(); await validate(); await sameSession(context.owner, prepared.session, signal); signal.throwIfAborted(); };
-    // Readystream's SDK proof belongs to this exact opaque launch, before any callback/controller exists.
-    const initialMedia = original.data.contentType === 'readystream'
+    // The SDK proof belongs to this exact opaque launch, before any callback/controller exists.
+    const initialMedia = requiresVerifiedVideoMedia(original.data.contentType)
       ? await verifiedVideoMedia(context.owner, prepared.session.generation, original.launch, currentPrepared, signal, fetcher) : null;
     if (initialMedia) original = { ...original, launch: initialMedia.launch, data: inspectSchoolVideoLaunch(initialMedia.launch) };
     let preparedMedia: Awaited<ReturnType<typeof verifiedVideoMedia>> | null = initialMedia;
@@ -187,11 +194,11 @@ export function createSchoolVideoSessions(store: SchoolVideoSessionStore, key: B
         await current();
         preparedMedia = resolved;
         return { contentId: resolved.media.contentId, mediaUrl: resolved.media.mediaUrl, validate: current,
-          ...(resolved.media.detail.resourceType === 'readystream' ? { resourceType: 'readystream' as const } : {}) };
+          ...(requiresVerifiedVideoMedia(resolved.media.detail.resourceType) ? { resourceType: resolved.media.detail.resourceType } : {}) };
       },
       confirmStart: async (observation, validate, currentSignal, observeTransportAck) => {
         if (startConsumed || reporting || lifetime.signal.aborted) throw new SchoolError('unsupported');
-        if (options.allowReadystreamWorker === true && !preparedMedia) throw new SchoolError('unsupported');
+        if (workerMode && !preparedMedia) throw new SchoolError('unsupported');
         startConsumed = true;
         let mayHaveWritten = false;
         let transmissionDiagnostic: PlaybackStartFailureDiagnostic | undefined;
@@ -202,9 +209,9 @@ export function createSchoolVideoSessions(store: SchoolVideoSessionStore, key: B
           const result = await execute(context.owner, prepared.session, validate, combined, async connection => {
             const fresh = await ownedLaunch(connection, context.courseId, context.moduleItemId, combined);
             if (fresh.login !== original.login || fresh.userId !== original.userId || !sameLaunch(original.data, fresh.data)) throw new SchoolError('forbidden_target');
-            if (options.allowReadystreamWorker === true && fresh.data.detail.attendance.completed === true)
+            if (workerMode && fresh.data.detail.attendance.completed === true)
               throw new AppError(409, 'PLAYBACK_ALREADY_COMPLETED', '학교에서 이미 완료한 영상은 다시 자동수강하지 않습니다.');
-            const verifiedStart = fresh.data.contentType === 'readystream'
+            const verifiedStart = requiresVerifiedVideoMedia(fresh.data.contentType)
               ? await verifiedVideoMedia(context.owner, prepared.session.generation, fresh.launch, connection.current, combined, fetcher) : null;
             await connection.current();
             const start = createSchoolVideoPlaybackStartController(prepareSchoolVideoCallbackBinding(verifiedStart?.launch ?? fresh.launch, fresh.login), {
@@ -229,7 +236,7 @@ export function createSchoolVideoSessions(store: SchoolVideoSessionStore, key: B
               const returned = { transport: result.transport, school: projectLearningStatus(result.school, context.courseId, context.moduleItemId) };
               if (result.transport === 'unknown') rememberPlaybackStartDiagnostic(returned,
                 transmissionDiagnostic ?? playbackStartFailureDiagnostic(undefined, 'transmission', mayHaveWritten));
-              if (result.transport === 'acknowledged' && options.allowReadystreamWorker === true) {
+              if (result.transport === 'acknowledged' && workerMode) {
                 // A start ACK never substitutes for an ordinary playing ACK. Rebind only from
                 // a fresh, exact owned launch/baseline; the next actual playing still reports.
                 const next = await ownedLaunch(connection, context.courseId, context.moduleItemId, combined);

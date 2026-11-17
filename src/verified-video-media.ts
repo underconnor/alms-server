@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { SchoolHttpClient, SchoolError, inspectSchoolVideoLaunch, resolveSchoolVideoMedia, inspectSchoolVideoMedia,
   type SchoolVideoLaunch, type SchoolVideoMediaData } from '@alms/ssu-api';
+import { requiresVerifiedVideoMedia } from './video-policy.js';
 
 type Operations = { resolve: typeof resolveSchoolVideoMedia; inspect: typeof inspectSchoolVideoMedia };
 type Verified = { launch: SchoolVideoLaunch; media: SchoolVideoMediaData };
@@ -13,11 +14,11 @@ export function createVerifiedVideoMediaCache(operations: Operations = { resolve
     signal: AbortSignal, fetcher: typeof fetch = fetch): Promise<Verified> => {
     const current = async () => { signal.throwIfAborted(); await validate(); signal.throwIfAborted(); };
     await current();
-    const data = inspectSchoolVideoLaunch(launch), readystream = data.contentType === 'readystream';
+    const data = inspectSchoolVideoLaunch(launch), cacheable = requiresVerifiedVideoMedia(data.contentType);
     // Include the complete viewer/target, flags and attendance baseline. A new launch never inherits proof.
     const key = createHash('sha256').update(JSON.stringify([owner, generation, data])).digest('hex');
     for (const [key, value] of entries) if (value.expiresAt <= now()) entries.delete(key);
-    const hit = readystream ? entries.get(key) : undefined;
+    const hit = cacheable ? entries.get(key) : undefined;
     if (hit) { await current(); return hit.value; }
     // Pending work is deliberately not shared: cancellation and authority belong to this caller.
     const anonymous = new SchoolHttpClient(undefined, async (input, init) => {
@@ -37,7 +38,7 @@ export function createVerifiedVideoMediaCache(operations: Operations = { resolve
       || media.mimeType !== 'video/mp4' || media.delivery !== 'progressive' || media.callbackVerified !== false)
       throw new SchoolError('forbidden_target');
     const value = { launch, media };
-    if (readystream) {
+    if (cacheable) {
       if (!entries.has(key) && entries.size >= (limits.entries ?? 100)) entries.delete(entries.keys().next().value!);
       entries.set(key, { expiresAt: now() + (limits.ttlMs ?? 30_000), value });
     }

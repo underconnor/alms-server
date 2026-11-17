@@ -11,6 +11,7 @@ import { currentSchoolWeek } from './current-school-week.js';
 import type { AssignmentFileData } from './assignment-files.js';
 import { publicAssignmentHistory, type AssignmentHistoryData } from './assignment-history.js';
 import { featureSupport, type FeatureReason } from './feature-support.js';
+import { requiresVerifiedVideoMedia } from './video-policy.js';
 
 export type Course = { id: string; title: string; professor: string | null; term: string | null; sourceUrl: string | null;
   termId?: string; ended?: boolean | null; schoolDefaultTerm?: boolean; todoCounts?: SchoolCourseTodos['activities'] };
@@ -19,13 +20,14 @@ export type Catalog = { courses: Course[]; term: string | null; termIds: string[
   // Private school discriminator, retained with the owned catalog rather than exposed in Course DTOs.
   commonsModes?: Record<string, boolean | null> };
 export type CourseRead = { course: Course; modules: SchoolModule[]; observedAt: string; lessons?: SchoolLessonWeek[] | null;
-  assignmentMappingVersion?: 1; commonsMappingVersion?: 1 | 2 | 3; usePureCanvas?: boolean | null };
-export type ActivityRead = { course: Course; detail: SchoolActivityDetail; observedAt: string; readystreamMediaVerified?: boolean };
+  assignmentMappingVersion?: 1; commonsMappingVersion?: 1 | 2 | 3 | 4; usePureCanvas?: boolean | null };
+export type ActivityRead = { course: Course; detail: SchoolActivityDetail; observedAt: string;
+  readystreamMediaVerified?: boolean; everlecMediaVerified?: boolean };
 export type SyllabusRead = { courseId: string; bytes: Buffer; documentVersion: string; pageCount: number };
 export type MaterialViewRead = ActivityRead & { report: 'recorded' | 'already_completed'; moduleCompleted?: boolean | null };
 export type TasksRead = { catalog: Catalog; groups: SchoolCourseTodos[]; observedAt: string;
   taskMappingVersion?: 1 | 2 | 3 | 4; mappingGeneration?: string;
-  moduleProofs?: Array<{ courseId: string; modules: SchoolModule[]; usePureCanvas?: boolean | null; commonsMappingVersion?: 1 | 2 | 3 }> };
+  moduleProofs?: Array<{ courseId: string; modules: SchoolModule[]; usePureCanvas?: boolean | null; commonsMappingVersion?: 1 | 2 | 3 | 4 }> };
 export type CalendarRead = CalendarData & { mappingGeneration?: string;
   moduleProofs?: Array<{ courseId: string; modules: SchoolModule[] }> };
 export type AttendanceRead = { courses: Array<{ course: Course; lessons: SchoolLessonWeek[]; attendances: SchoolLessonAttendance[] }>; observedAt: string };
@@ -100,10 +102,13 @@ function classDate(value: string | null | undefined): string | null {
 function stableId(parts: Array<string | number | null>): string {
   return createHash('sha256').update(JSON.stringify(parts)).digest('hex').slice(0, 32);
 }
+function publicResourceType(value: string | null | undefined) {
+  return value === 'movie' || value === 'readystream' || value === 'everlec' || value === 'pdf' || value === 'file' ? value : null;
+}
 function moduleType(item: ObservedModuleItem): ActivityType {
   if (item.contentType === 'assignment') return 'assignment';
   if (item.contentType === 'attendance_item' && item.itemContentType === 'commons') {
-    if (['movie', 'readystream'].includes(item.resourceType ?? '')) return 'video';
+    if (['movie', 'readystream', 'everlec'].includes(item.resourceType ?? '')) return 'video';
     if (item.resourceType === 'pdf' || item.resourceType === 'file') return 'material';
   }
   return 'other';
@@ -140,11 +145,11 @@ function taskModuleLink(value: TasksRead, courseId: string, todo: SchoolCourseTo
   const currentCommons = proof[0]!.usePureCanvas === true && value.catalog.commonsModes?.[courseId] === true;
   const commons = todo.componentType === 'commons' && ['movie', 'mp4', 'pdf', 'file'].includes(todo.commonsType ?? '')
     && todo.componentId && [2, 3, 4].includes(value.taskMappingVersion ?? 0)
-    && [1, 2, 3].includes(proof[0]!.commonsMappingVersion ?? 0) && currentCommons;
+    && [1, 2, 3, 4].includes(proof[0]!.commonsMappingVersion ?? 0) && currentCommons;
   // Exact metadata relations do not authorize manual reports or server playback.
   const readystream = todo.componentType === 'commons' && todo.commonsType === 'readystream'
     && typeof todo.componentId === 'string' && /^[1-9]\d{0,15}$/.test(todo.componentId)
-    && value.taskMappingVersion === 4 && proof[0]!.commonsMappingVersion === 3 && currentCommons;
+    && value.taskMappingVersion === 4 && [3, 4].includes(proof[0]!.commonsMappingVersion ?? 0) && currentCommons;
   if (!assignment && !commons && !readystream) return {};
   const matches = proof[0]!.modules.flatMap(module => module.items
     .filter(item => assignment ? item.assignmentId === todo.assignmentId
@@ -259,9 +264,12 @@ export async function readLmsDashboard(reader: DashboardReader, userId: string) 
   return { courses: catalog.courses, term: catalog.term, upcomingTasks: [], coursesAvailable: true, tasksAvailable: false };
 }
 
-function publicActivityDetail(detail: SchoolActivityDetail, observedAt: string, reader: LearningxReader, course?: Course, readystreamMediaVerified = false) {
+function publicActivityDetail(detail: SchoolActivityDetail, observedAt: string, reader: LearningxReader, course?: Course,
+  readystreamMediaVerified = false, everlecMediaVerified = false) {
   const material = ['pdf','file'].includes(detail.resourceType ?? '');
-  const manualVideoAvailable = Boolean(reader.readVideo && (detail.resourceType === 'movie' || detail.resourceType === 'readystream' && readystreamMediaVerified) && detail.published === true
+  const mediaVerified = requiresVerifiedVideoMedia(detail.resourceType)
+    && (detail.resourceType === 'readystream' ? readystreamMediaVerified : everlecMediaVerified);
+  const manualVideoAvailable = Boolean(reader.readVideo && (detail.resourceType === 'movie' || mediaVerified) && detail.published === true
     && detail.opened === true && typeof detail.useAttendance === 'boolean');
   const writableCourse = course?.schoolDefaultTerm !== false && course?.ended !== true;
   const knownWritableCourse = course?.schoolDefaultTerm === true && course?.ended === false;
@@ -273,7 +281,7 @@ function publicActivityDetail(detail: SchoolActivityDetail, observedAt: string, 
     progressFlag?: boolean | null) => {
     const permitted = available && (!write || knownWritableCourse);
     const reason: FeatureReason | null = permitted ? null : !installed ? 'provider_unavailable'
-      : !(resource === 'video' ? ['movie', 'readystream'].includes(detail.resourceType ?? '') : detail.resourceType === resource) ? 'unsupported_resource' : write && !writableCourse ? 'course_read_only'
+      : !(resource === 'video' ? ['movie', 'readystream', 'everlec'].includes(detail.resourceType ?? '') : detail.resourceType === resource) ? 'unsupported_resource' : write && !writableCourse ? 'course_read_only'
       : detail.published === false ? 'not_published' : detail.opened === false ? 'not_opened'
       : progressFlag === false ? 'progress_not_applicable' : 'conditions_unknown';
     return featureSupport(installed, 'activity', { availability: permitted ? 'available' : reason === 'conditions_unknown' ? 'unknown' : 'unavailable',
@@ -339,9 +347,9 @@ export function createLearningxReads(reader: LearningxReader, playbackSelectable
           tasks: value.tasksAvailable ? 'available' : 'unavailable', currentActivities: 'unavailable' } };
     }),
     ...(reader.readActivity ? { activity: (context, courseId, moduleItemId) => read(async () => {
-      const {course, detail, observedAt, readystreamMediaVerified} = await reader.readActivity!(context.userId, courseId, moduleItemId);
+      const {course, detail, observedAt, readystreamMediaVerified, everlecMediaVerified} = await reader.readActivity!(context.userId, courseId, moduleItemId);
       if (detail.courseId !== courseId || detail.moduleItemId !== moduleItemId) throw new SchoolError('unexpected_response');
-      return publicActivityDetail(detail, observedAt, reader, course, readystreamMediaVerified);
+      return publicActivityDetail(detail, observedAt, reader, course, readystreamMediaVerified, everlecMediaVerified);
     }) } satisfies Pick<SchoolProvider, 'activity'> : {}),
     ...(reader.recordMaterialView ? { recordMaterialView: (context, courseId, moduleItemId, observation, validate) => read(async () => {
       const result = await reader.recordMaterialView!(context.userId, courseId, moduleItemId, observation, validate);
@@ -429,11 +437,11 @@ export function publicCourseContent({ course, modules, lessons, observedAt, useP
           // List metadata only permits selection. Admission independently revalidates identity,
           // ownership, opened/report flags and the supported media before accepting a job.
           const playbackAvailable = playbackSelectable && course.schoolDefaultTerm !== false && course.ended !== true && type === 'video'
-            && (item.resourceType !== 'readystream' || usePureCanvas === true) && detailAvailable
+            && (!requiresVerifiedVideoMedia(item.resourceType) || usePureCanvas === true) && detailAvailable
             && item.published === true && unlockAt !== null && Date.parse(unlockAt) <= now;
           const schoolAssignment = (item as ObservedModuleItem).assignmentId;
           return { id: item.id, courseId, title: item.title,
-            type, resourceType: ['movie', 'readystream', 'pdf', 'file'].includes(item.resourceType ?? '') ? item.resourceType as 'movie' | 'readystream' | 'pdf' | 'file' : null,
+            type, resourceType: publicResourceType(item.resourceType),
             sourceUrl: null, playbackAvailable, progressPercent: null, schoolStatus: null,
             assignmentId: type === 'assignment' && typeof schoolAssignment === 'string' && /^[1-9]\d{0,15}$/.test(schoolAssignment) ? schoolAssignment : null,
             dueAt: instant(item.dueAt), unlockAt,

@@ -19,7 +19,7 @@
     "contract:generate": "tsx scripts/generate-http-contract.ts"
   },
   "dependencies": {
-    "@alms/ssu-api": "file:vendor/alms-ssu-api-0.3.39.tgz",
+    "@alms/ssu-api": "file:vendor/alms-ssu-api-0.3.40.tgz",
     "@fastify/cookie": "11.1.2",
     "@fastify/cors": "11.3.0",
     "@fastify/formbody": "9.0.0",

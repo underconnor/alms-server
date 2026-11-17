@@ -1,4 +1,5 @@
 import { createVerifiedVideoMediaCache, verifiedVideoMedia } from './verified-video-media.js';
+import { requiresVerifiedVideoMedia } from './video-policy.js';
 import { progressCacheResources, type ProgressCacheTarget } from './school-progress-cache.js';
 import { createAssignmentFileCache, publicAssignmentFile, type AssignmentFileData } from './assignment-files.js';
 import { randomUUID } from 'node:crypto';
@@ -153,13 +154,13 @@ export function createLearningxReader(store: SessionStore, key: Buffer, connect:
     if (resource.startsWith('calendar-modules:')) {
       const course = value as CourseRead | null;
       return Boolean(course && courseCompatible(course.course) && course.assignmentMappingVersion === 1
-        && course.commonsMappingVersion === 3 && (course.usePureCanvas === null || typeof course.usePureCanvas === 'boolean')
+        && course.commonsMappingVersion === 4 && (course.usePureCanvas === null || typeof course.usePureCanvas === 'boolean')
         && Array.isArray(course.modules));
     }
     if (!resource.startsWith('course:') && !resource.startsWith('activity:')) return true;
     return Boolean(value && typeof value === 'object' && courseCompatible((value as CourseRead).course)
       && (!resource.startsWith('course:') || Object.hasOwn(value, 'lessons') && (value as CourseRead).assignmentMappingVersion === 1
-        && (value as CourseRead).commonsMappingVersion === 3
+        && (value as CourseRead).commonsMappingVersion === 4
         && ((value as CourseRead).usePureCanvas === null || typeof (value as CourseRead).usePureCanvas === 'boolean')));
   };
   async function sourceRead<T, O extends SourceReadOptions & TasksReadOptions>(owner: string, resource: string, options: O,
@@ -570,7 +571,7 @@ export function createLearningxReader(store: SessionStore, key: Buffer, connect:
           await options.validate(); options.signal.throwIfAborted();
           const modules = await client.modules(courseId); options.signal.throwIfAborted();
           return {course, modules, lessons: null, observedAt: new Date().toISOString(), assignmentMappingVersion: 1,
-            commonsMappingVersion: 3, usePureCanvas: catalog.commonsModes?.[courseId] ?? null};
+            commonsMappingVersion: 4, usePureCanvas: catalog.commonsModes?.[courseId] ?? null};
         }, generation, false, Boolean(options.refresh), options.signal, undefined, kind, 'default');
       }
       if (proof) modules.push({courseId, modules: proof.modules, usePureCanvas: proof.usePureCanvas, commonsMappingVersion: proof.commonsMappingVersion});
@@ -734,10 +735,10 @@ export function createLearningxReader(store: SessionStore, key: Buffer, connect:
       const course = ownedCourse(catalog, courseId);
       const source = await client.moduleActivityVideoLaunch(courseId, moduleItemId), data = inspectSchoolVideoLaunch(source), { detail } = data;
       if (detail.courseId !== courseId || detail.moduleItemId !== moduleItemId) throw new SchoolError('unexpected_response');
-      if (!['movie', 'readystream'].includes(detail.resourceType ?? '') || detail.published !== true
+      if (!['movie', 'readystream', 'everlec'].includes(detail.resourceType ?? '') || detail.published !== true
         || detail.opened !== true || typeof detail.useAttendance !== 'boolean')
         throw new AppError(503, 'VIDEO_UNAVAILABLE', '이 영상은 아직 ALMS에서 재생할 수 없습니다.');
-      if (detail.resourceType === 'readystream') {
+      if (requiresVerifiedVideoMedia(detail.resourceType)) {
         // A cached display catalog cannot authorize reuse of a learner-specific opaque proof.
         if (!connection.verifyVideoIdentity) throw new SchoolError('unsupported');
         await connection.verifyVideoIdentity(); signal.throwIfAborted();
@@ -772,23 +773,24 @@ export function createLearningxReader(store: SessionStore, key: Buffer, connect:
       const verified = await resolveVideo(owner, prepared.generation, prepared.source, prepared.validate, signal);
       await prepared.validate();
       return { contentId: verified.media.contentId, mediaUrl: verified.media.mediaUrl, validate: prepared.validate,
-        ...(verified.media.detail.resourceType === 'readystream' ? { resourceType: 'readystream' as const } : {}) };
+        ...(requiresVerifiedVideoMedia(verified.media.detail.resourceType) ? { resourceType: verified.media.detail.resourceType } : {}) };
     }, request);
   }
   async function selectedActivity(owner: string, courseId: string, moduleItemId: string) {
     const value = await activity(owner, courseId, moduleItemId);
-    if (value.detail.resourceType !== 'readystream' || value.detail.published !== true
+    if (!requiresVerifiedVideoMedia(value.detail.resourceType) || value.detail.published !== true
       || value.detail.opened !== true || typeof value.detail.useAttendance !== 'boolean') return value;
     const signal = AbortSignal.timeout(30_000), prepared = await videoLaunch(owner, courseId, moduleItemId, signal);
-    let readystreamMediaVerified = false;
-    try { await resolveVideo(owner, prepared.generation, prepared.source, prepared.validate, signal); readystreamMediaVerified = true; }
+    let mediaVerified = false;
+    try { await resolveVideo(owner, prepared.generation, prepared.source, prepared.validate, signal); mediaVerified = true; }
     catch (error) {
       await prepared.validate();
       // Unsupported manifests retain readable school metadata, with manual capabilities closed.
       if (!(error instanceof SchoolError && ['unsupported', 'unexpected_response', 'forbidden_target'].includes(error.code))) throw error;
     }
     await prepared.validate();
-    return { course: prepared.course, detail: prepared.data.detail, observedAt: new Date().toISOString(), readystreamMediaVerified };
+    return { course: prepared.course, detail: prepared.data.detail, observedAt: new Date().toISOString(),
+      ...(prepared.data.detail.resourceType === 'readystream' ? { readystreamMediaVerified: mediaVerified } : { everlecMediaVerified: mediaVerified }) };
   }
 
   function syllabus(owner: string, courseId: string, options: SyllabusReadOptions) {
@@ -943,7 +945,7 @@ export function createLearningxReader(store: SessionStore, key: Buffer, connect:
         // The module list remains usable when independent school lesson dates are unavailable.
       }
       return { course, modules, lessons, observedAt: new Date().toISOString(), assignmentMappingVersion: 1 as const,
-        commonsMappingVersion: 3 as const, usePureCanvas: catalog.commonsModes?.[courseId] ?? null };
+        commonsMappingVersion: 4 as const, usePureCanvas: catalog.commonsModes?.[courseId] ?? null };
     }, generation, false, Boolean(read.refresh), read.signal, undefined, undefined, undefined, undefined, read.refreshScope)
       .then(value => { if (!read.refresh) warmMaterials(owner, value); return value; })),
     readActivity: (owner, courseId, moduleItemId) => selectedActivity(owner, courseId, moduleItemId).then(value => { warmOpenedMaterial(owner, value); return value; }),

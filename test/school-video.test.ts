@@ -43,6 +43,8 @@ function fixture() {
     inspect: () => ({ ...inspectSchoolVideoLaunch(launch),
       mediaUrl: inspectSchoolVideoLaunch(launch).contentType === 'readystream'
         ? `https://ssu-toast.commonscdn.com/contents31/ssu1000001/${contentId}/contents/media_files/video(01).mp4`
+        : inspectSchoolVideoLaunch(launch).contentType === 'everlec'
+          ? `https://ssuin-object.commonscdn.com/ssu-contents/contents31/ssu1000001/${contentId}/contents/media_files/video-01.mp4`
         : `https://ssuin-object.commonscdn.com/ssu-contents/contents31/ssu1000001/${contentId}/contents/media_files/mobile/video.mp4`,
       mimeType: 'video/mp4' as const, delivery: 'progressive' as const,
       useAttendance: resolvedAttendance ?? inspectSchoolVideoLaunch(launch).detail.useAttendance as boolean,
@@ -139,32 +141,33 @@ test('closed, unpublished or absent manual provider details never advertise a ma
   }
 });
 
+for (const resourceType of ['readystream', 'everlec'] as const) {
 const readyDetails = { use_attendance: true, omit_progress: false,
-  item_content_data: { content_type: 'readystream', content_id: contentId, duration: 600 } };
-test('selected readystream detail verifies media privately and following byte requests reuse it after fresh authority reads', async () => {
+  item_content_data: { content_type: resourceType, content_id: contentId, duration: 600 } };
+test(`selected ${resourceType} detail verifies media privately and following byte requests reuse it after fresh authority reads`, async () => {
   const f = fixture(); f.setDetails(readyDetails);
   const reads = createLearningxReads(f.reader);
   for (let i = 0; i < 2; i++) {
     const value = await reads.activity!({ userId: 'owner' }, '10', '20') as Record<string, unknown>;
-    assert.equal(value.resourceType, 'readystream'); assert.equal(value.type, 'video');
+    assert.equal(value.resourceType, resourceType); assert.equal(value.type, 'video');
     assert.equal(value.manualVideoAvailable, true); assert.equal(value.manualVideoReportAvailable, true);
     assert.equal(value.manualVideoProgressMode, 'untracked');
-    assert.doesNotMatch(JSON.stringify(value), /readystreamMediaVerified|viewerUrl|mediaUrl|synthetic-secret|commonscdn/);
+    assert.doesNotMatch(JSON.stringify(value), /readystreamMediaVerified|everlecMediaVerified|viewerUrl|mediaUrl|synthetic-secret|commonscdn/);
   }
   await f.reader.readVideo!('owner', '10', '20', request());
   assert.equal(f.identityCount(), 3); assert.deepEqual(f.counts(), { launches: 3, resolutions: 1, fetches: 1 });
   assert.deepEqual(f.writes, ['catalog:all', 'activity:10:20']);
 });
-test('unsupported readystream manifests keep readable body metadata and close manual capabilities', async () => {
+test(`unsupported ${resourceType} manifests keep readable body metadata and close manual capabilities`, async () => {
   const f = fixture(); f.setDetails(readyDetails); f.onResolve(async () => { throw new SchoolError('unsupported'); });
   const value = await createLearningxReads(f.reader).activity!({ userId: 'owner' }, '10', '20') as Record<string, unknown>;
-  assert.equal(value.title, '합성 참고 영상'); assert.equal(value.resourceType, 'readystream');
+  assert.equal(value.title, '합성 참고 영상'); assert.equal(value.resourceType, resourceType);
   assert.equal(value.manualVideoAvailable, false); assert.equal(value.manualVideoReportAvailable, false); assert.equal(value.manualVideoProgressMode, null);
   f.onResolve(async () => {});
   assert.equal((await createLearningxReads(f.reader).activity!({ userId: 'owner' }, '10', '20') as Record<string, unknown>).manualVideoAvailable, true);
   assert.equal(f.counts().resolutions, 2);
 });
-test('readystream cache hits cannot bypass fresh native identity, pureCanvas mode, enrollment or generation', async () => {
+test(`${resourceType} cache hits cannot bypass fresh native identity, pureCanvas mode, enrollment or generation`, async () => {
   for (const mode of ['identity', 'enrollment', 'legacy', 'unknown', 'generation']) {
     const f = fixture(); f.setDetails(readyDetails); await f.reader.readVideo!('owner', '10', '20', request());
     if (mode === 'identity') f.setIdentity(false); if (mode === 'enrollment') f.setEnrolled(false);
@@ -173,3 +176,5 @@ test('readystream cache hits cannot bypass fresh native identity, pureCanvas mod
     else { await assert.rejects(f.reader.readVideo!('owner', '10', '20', request())); assert.equal(f.counts().resolutions, 1); }
   }
 });
+
+}

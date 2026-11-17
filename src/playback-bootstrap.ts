@@ -27,7 +27,7 @@ export function withSchoolPlayback(provider: SchoolProvider, store: PgStore, key
   const runtime = createControlledPlaybackRuntime();
   const progress = createPlaybackProgressRecorder(store);
   const playback = createSchoolPlayback({
-    school: createSchoolVideoSessions(store, key, invalidate, undefined, { allowReadystreamWorker: true }),
+    school: createSchoolVideoSessions(store, key, invalidate, undefined, { allowReadystreamWorker: true, allowEverlecWorker: true }),
     leases: new PgPlaybackLeaseRepository(store.pool),
     validateClaim: createWorkerClaimValidator(store, 'execution',key),
     validateFinalClaim: createWorkerClaimValidator(store, 'final'),

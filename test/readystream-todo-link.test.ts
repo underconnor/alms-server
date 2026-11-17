@@ -32,6 +32,14 @@ test('canonical readystream TODO and course metadata agree on video without infe
   assert.equal(activity.detailAvailable, true); assert.equal(activity.playbackAvailable, false); assert.equal(activity.progressPercent, null);
 });
 
+test('new Commons parsing keeps existing Readystream task proof and does not authorize Everlec TODO links', () => {
+  const next: TasksRead = { ...data, moduleProofs: [{ ...data.moduleProofs![0]!, commonsMappingVersion: 4 }] };
+  assert.deepEqual(publicTasks(next), publicTasks(data));
+  const unreviewed = { ...next, groups: [{ ...data.groups[0]!, items: [{ ...todo, commonsType: 'everlec' }] }] };
+  const item = publicTasks(unreviewed)[0]!;
+  assert.equal(item.type, 'other'); assert.equal(item.moduleItemId, undefined); assert.equal(item.playbackAvailable, false);
+});
+
 test('readystream refuses stale proofs, unsupported variants, malformed IDs and ambiguous course/module/item relations', () => {
   const variants: Array<[string, TasksRead]> = [
     ...[undefined, 1, 2, 3].map(version => ['old task proof', {...data, taskMappingVersion: version}] as [string, TasksRead]),

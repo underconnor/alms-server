@@ -4,7 +4,7 @@ import type { ManualVideoSchool } from './manual-video-types.js';
 /** Browser manual playback retains its existing request/session guard. Worker authority is separate. */
 export function createManualVideoSchool(store: SchoolVideoSessionStore, key: Buffer,
   invalidate: (owner: string, courseId: string, activityId: string) => Promise<void>, fetcher: typeof fetch = fetch): ManualVideoSchool {
-  const sessions = createSchoolVideoSessions(store, key, invalidate, fetcher, { allowReadystreamManual: true });
+  const sessions = createSchoolVideoSessions(store, key, invalidate, fetcher, { allowReadystreamManual: true, allowEverlecManual: true });
   return { prepare: async (context, validate, signal) => {
     const prepared = await sessions.prepare(context, validate, signal);
     let closed = false;
