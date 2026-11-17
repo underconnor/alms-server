@@ -61,7 +61,7 @@ test('migration019 preserves all prior catalog objects and histories and creates
     }
     assert.equal((await pool.query('SELECT count(*)::int AS count FROM playback_queue_metadata')).rows[0].count, 0);
     assert.equal((await pool.query('SELECT count(*)::int AS count FROM schema_migrations')).rows[0].count, 19);
-    await store.health();
+    await assert.rejects(store.health(), /migrations are pending/); // Current code also requires additive migration020.
     assert.equal(added.functions!.length, 0); assert.equal(added.policies!.length, 0);
     assert.deepEqual((added.indexes as Array<{ name: string }>).map(value => value.name).sort(),
       ['playback_queue_metadata_dispatch_id_key', 'playback_queue_metadata_pkey', 'playback_queue_ready_order_idx']);
@@ -69,7 +69,7 @@ test('migration019 preserves all prior catalog objects and histories and creates
     // Normalize only the generated isolated schema name for the release review.
     const normalized = JSON.parse(JSON.stringify({ before, after, added }).replaceAll(schema, 'public'));
     t.diagnostic('ALMS_QUEUE_019_CATALOG=' + JSON.stringify({ version: 1, actualPostgres: true, migrationCount: 19,
-      newMetadataCount: 0, health: 'passed', sourceSnapshotJsSha256: spec.sourceSnapshotJsSha256,
+      newMetadataCount: 0, health: 'current-code-requires-020', sourceSnapshotJsSha256: spec.sourceSnapshotJsSha256,
       migrationSha256: createHash('sha256').update(migration).digest('hex'), schemaNameNormalized: true, historiesBefore, historiesAfter: await histories(), ...normalized }));
   } finally {
     await pool?.end(); await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`); await admin.end();

@@ -2,6 +2,10 @@
 
 현재 요청·응답·헤더의 기준은 [HTTP 계약](http-contract.md)과 [OpenAPI](openapi.json)다. 이 공개 저장소의 릴리스부터 계약 변경과 필요한 클라이언트 이전 방법을 함께 기록한다.
 
+## 검토된 시작 전 실패의 명시적 새 접수
+
+`POST /v1/jobs/{id}/retry-reviewed-preplay`와 정확 요청 조회 `GET /v1/jobs/{id}/retry-reviewed-preplay/{requestKey}`를 추가했다. 서버에 별도 검토가 기록된 원래 요청만 정확 버전·새 동의·fresh 학교 미완료 확인 후 새 child를 접수한다. 기존 unknown/실패 이력은 유지한다. 응답이 불명확하면 같은 원래 key로 조회하며 새 key나 자동 재접수를 만들지 않는다. 기존 continue·settle·일반 jobs 계약은 그대로다.
+
 ## 클라이언트가 구분해야 하는 값
 
 - 개인 TODO·작업 목록의 `complete/hasMore/limit`는 목록 잘림을 뜻하며 개별 작업의 완료나 학교 인정을 뜻하지 않는다.

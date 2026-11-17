@@ -36,10 +36,10 @@ function validConsent(r: Row | undefined, generation: string, clientId?: string 
   if (r.revoked === true) throw consentFailure('PLAYBACK_START_CONSENT_REVOKED');
   if (r.valid !== true) throw consentFailure('PLAYBACK_START_CONSENT_EXPIRED');
 }
-export async function bindPlaybackStartConsent(
+/** Lock the immutable receipt, then inspect revocation and expiry in a fresh statement snapshot. */
+export async function validatePlaybackStartConsentBinding(
   query: WorkerQuery,
   owner: string,
-  jobId: string,
   target: { courseId: string; lectureId: string; scheduledFor: string },
   consentId: string,
   generation: string,
@@ -69,6 +69,17 @@ export async function bindPlaybackStartConsent(
     ).rowCount
   )
     throw consentFailure('PLAYBACK_START_CONSENT_USED');
+}
+export async function bindPlaybackStartConsent(
+  query: WorkerQuery,
+  owner: string,
+  jobId: string,
+  target: { courseId: string; lectureId: string; scheduledFor: string },
+  consentId: string,
+  generation: string,
+  auth: ConsentAuthorization,
+) {
+  await validatePlaybackStartConsentBinding(query, owner, target, consentId, generation, auth);
   const bound = await query(
     `INSERT INTO playback_job_start_consents(job_id,consent_id,course_id,lecture_id)
   SELECT $1,$2,$3,$4 WHERE EXISTS(SELECT 1 FROM playback_start_consents c WHERE c.id=$2 AND c.user_id=$5

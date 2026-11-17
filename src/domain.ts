@@ -1,4 +1,5 @@
 import { publicStartConsent, type JobStartConsent } from './playback-start-consent.js';
+import { z } from 'zod';
 import { publicJobPlaybackProgress, type PlaybackProgress } from './playback-progress.js';
 import { publicPlaybackAuthWait, type PlaybackAuthWait } from './playback-auth-wait.js';
 export type JobStatus = 'queued' | 'scheduled' | 'running' | 'pause_requested' | 'paused' |
@@ -21,6 +22,8 @@ export interface Job {
   playbackProgress?: PlaybackProgress | null;
   authWait?: PlaybackAuthWait | null;
   startConsent?: JobStartConsent | null;
+  /** Separate reviewed pre-play retry metadata; never general settlement permission. */
+  reviewedPreplay?: JobReviewedPreplay | null;
   /** Internal proven-before-play eligibility; fresh school authentication is checked separately. */
   authenticationContinuationEligible?: boolean;
   idempotencyKey: string; requestHash: string;
@@ -35,6 +38,13 @@ export interface Job {
 }
 export type JobRecoveryReason = 'eligible' | 'already_settled' | 'not_interrupted' | 'termination_unconfirmed' | 'execution_active' | 'lease_active';
 export interface JobRecovery { eligible: boolean; reason: JobRecoveryReason; version: string }
+export interface JobReviewedPreplay { eligible: boolean; version: string; retriedAsJobId: string | null }
+const reviewedPreplaySchema = z.object({ eligible: z.boolean(), version: z.iso.datetime({ offset: true }),
+  retriedAsJobId: z.uuid().nullable() }).strict().refine(value => !value.eligible || value.retriedAsJobId === null);
+export function publicReviewedPreplay(value: unknown): JobReviewedPreplay | null {
+  const parsed = reviewedPreplaySchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
 export interface JobSettlement { settledAt: string; schoolResult: SchoolResult }
 export type ExecutionOutcome = 'not_started' | 'ended' | 'interrupted';
 export interface Todo {
@@ -73,6 +83,7 @@ export function publicJob(job: Job) {
     scheduledFor: job.scheduledFor, createdAt: job.createdAt, updatedAt: job.updatedAt,
     schoolResult: job.schoolResult, errorCode: job.errorCode, executionOutcome: job.executionOutcome ?? null,
     ...(job.startConsent !== undefined ? { startConsent: publicStartConsent(job.startConsent) } : {}),
+    ...(job.reviewedPreplay !== undefined ? { reviewedPreplay: publicReviewedPreplay(job.reviewedPreplay) } : {}),
     ...(job.authWait !== undefined ? { authWait: publicPlaybackAuthWait(job.authWait) } : {}),
     ...(job.playbackProgress !== undefined ? { playbackProgress: publicJobPlaybackProgress(job.playbackProgress) } : {}),
     ...(job.recovery ? { settledAt: job.settledAt ?? null, settlement: job.settlement ?? null, recovery: job.recovery } : {}) };
