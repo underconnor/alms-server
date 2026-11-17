@@ -3,48 +3,51 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { fixture, context, noop, observation, signal } from './helpers/school-video-fixture.js';
 import { readystreamXml } from './helpers/readystream-fixture.js';
+import { everlecXml } from './helpers/everlec-fixture.js';
 import { createVideoStreamer, type PreparedVideoSource } from '../src/video-stream.js';
 
-test('readystream verifies single-UPF media before manual binding and reuses proof for unchanged fresh launches', async () => {
-  const f = await fixture(); f.setType('readystream');
+for (const resourceType of ['readystream', 'everlec'] as const) {
+const mediaXml = resourceType === 'everlec' ? everlecXml : readystreamXml;
+test(`${resourceType} verifies single-UPF media before manual binding and reuses proof for unchanged fresh launches`, async () => {
+  const f = await fixture(); f.setType(resourceType);
   const driver = await f.sessions.prepare(context, noop, signal());
   try {
     assert.equal(f.counts().requests, 9); assert.equal(f.counts().reports, 0);
     const media = await driver.prepareMedia(noop, signal());
-    assert.equal(media.resourceType, 'readystream'); assert.match(media.mediaUrl, /synthetic_video\(01\)-part_1.mp4$/);
+    assert.equal(media.resourceType, resourceType); assert.match(media.mediaUrl, resourceType === 'readystream' ? /synthetic_video\(01\)-part_1.mp4$/ : /synthetic_video-01.mp4$/);
     assert.equal(f.counts().requests, 9);
     const second = await f.sessions.prepare(context, noop, signal());
     assert.equal(f.paths.filter(path => path === '/em/synthetic-video').length, 1); second.close();
     driver.observe(observation);
     const result = await driver.report('playing', noop, signal());
-    assert.equal(result.transport, 'acknowledged'); assert.equal(result.school.evidence?.resourceType, 'readystream');
+    assert.equal(result.transport, 'acknowledged'); assert.equal(result.school.evidence?.resourceType, resourceType);
     assert.equal(result.school.evidence?.schoolAttendanceStatus, 'none'); assert.equal(result.school.recognized, null);
     assert.equal(f.counts().reports, 1);
     assert.doesNotMatch(JSON.stringify(result), /https|contentId|viewer|90000001|synthetic-video/);
   } finally { driver.close(); }
 });
 
-test('readystream direct worker preparation rejects before metadata, lease admission or reporting', async () => {
-  const f = await fixture({ workerOnly: true }); f.setType('readystream');
+test(`${resourceType} direct worker preparation rejects before metadata, lease admission or reporting`, async () => {
+  const f = await fixture({ workerOnly: true }); f.setType(resourceType);
   await assert.rejects(f.sessions.prepare(context, noop, signal()), { code: 'unsupported' });
   assert.equal(f.paths.some(path => path.startsWith('/em/')), false); assert.equal(f.counts().reports, 0);
 });
 
-test('readystream unknown or legacy course mode, ambiguous media and source drift never open manual reports', async () => {
+test(`${resourceType} unknown or legacy course mode, ambiguous media and source drift never open manual reports`, async () => {
   for (const mode of ['legacy', 'unknown', 'slides', 'duration', 'foreign']) {
-    const f = await fixture(); f.setType('readystream');
+    const f = await fixture(); f.setType(resourceType);
     if (mode === 'legacy') f.setPureCanvas(false);
     if (mode === 'unknown') f.setPureCanvas(null);
-    if (mode === 'slides') f.setXml(readystreamXml().replace('</story>', '<slides/></story>'));
-    if (mode === 'duration') f.setXml(readystreamXml('synthetic-video', 601));
-    if (mode === 'foreign') f.setXml(readystreamXml('foreign-video'));
+    if (mode === 'slides') f.setXml(mediaXml().replace('</story>', '<slides/></story>'));
+    if (mode === 'duration') f.setXml(mediaXml('synthetic-video', 601));
+    if (mode === 'foreign') f.setXml(mediaXml('foreign-video'));
     await assert.rejects(f.sessions.prepare(context, noop, signal()), undefined, mode);
     assert.equal(f.counts().reports, 0);
   }
 });
 
-test('readystream changed baseline obtains a new proof; logout and changed native identity reject cache hits', async () => {
-  const f = await fixture(); f.setType('readystream');
+test(`${resourceType} changed baseline obtains a new proof; logout and changed native identity reject cache hits`, async () => {
+  const f = await fixture(); f.setType(resourceType);
   (await f.sessions.prepare(context, noop, signal())).close(); f.setProgress(2);
   (await f.sessions.prepare(context, noop, signal())).close();
   assert.equal(f.paths.filter(path => path === '/em/synthetic-video').length, 2);
@@ -54,16 +57,42 @@ test('readystream changed baseline obtains a new proof; logout and changed nativ
   assert.equal(f.paths.filter(path => path === '/em/synthetic-video').length, 3); assert.equal(f.counts().reports, 0);
 });
 
-test('explicit readystream school start binds the fresh proven launch and preserves native report type', async () => {
-  const f = await fixture({ allowPlaybackStart: true }); f.setType('readystream');
+test(`explicit ${resourceType} school start binds the fresh proven launch and preserves native report type`, async () => {
+  const f = await fixture({ allowPlaybackStart: true }); f.setType(resourceType);
   const driver = await f.sessions.prepare(context, noop, signal());
   try {
     const result = await driver.confirmStart!({ ...observation, paused: true }, noop, signal());
-    assert.equal(result.transport, 'acknowledged'); assert.equal(result.school.evidence?.resourceType, 'readystream');
+    assert.equal(result.transport, 'acknowledged'); assert.equal(result.school.evidence?.resourceType, resourceType);
     assert.equal(f.counts().starts, 1); assert.equal(f.counts().reports, 0);
     assert.equal(f.paths.filter(path => path === '/em/synthetic-video').length, 1);
   } finally { driver.close(); }
 });
+
+test(`strict ${resourceType} worker start rebinds proven fresh media before the separate playing report`, async () => {
+  const f = await fixture({ allowPlaybackStart: true, workerOnly: true, allowReadystreamWorker: true, allowEverlecWorker: true }); f.setType(resourceType);
+  const driver = await f.sessions.prepare(context, noop, signal());
+  try {
+    await driver.prepareMedia(noop, signal());
+    assert.equal((await driver.confirmStart!({ ...observation, paused: true }, noop, signal())).transport, 'acknowledged');
+    assert.equal(f.counts().starts, 1); assert.equal(f.counts().reports, 0);
+    driver.observe(observation);
+    const ordinary = await driver.report('playing', noop, signal());
+    assert.equal(ordinary.transport, 'acknowledged'); assert.equal(ordinary.school.evidence?.resourceType, resourceType);
+    assert.equal(f.counts().starts, 1); assert.equal(f.counts().reports, 1);
+  } finally { driver.close(); }
+});
+
+test(`fresh completion blocks ${resourceType} worker start without a start or ordinary report`, async () => {
+  const f = await fixture({ allowPlaybackStart: true, workerOnly: true, allowReadystreamWorker: true, allowEverlecWorker: true }); f.setType(resourceType);
+  const driver = await f.sessions.prepare(context, noop, signal());
+  try {
+    await driver.prepareMedia(noop, signal());
+    f.setDetails({ attendance_data: { progress: 600, last_at: 600, completed: true, attendance_status: 'attendance' } });
+    await assert.rejects(driver.confirmStart!({ ...observation, paused: true }, noop, signal()), { code: 'PLAYBACK_ALREADY_COMPLETED' });
+    assert.equal(f.counts().starts, 0); assert.equal(f.counts().reports, 0);
+  } finally { driver.close(); }
+});
+}
 
 const source = (url: string): PreparedVideoSource => ({ contentId: 'synthetic', mediaUrl: url, resourceType: 'readystream', validate: noop });
 const url = 'https://ssu-toast.commonscdn.com/contents31/ssu1000001/synthetic/contents/media_files/issued_video(01).mp4';

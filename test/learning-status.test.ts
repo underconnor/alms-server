@@ -90,13 +90,13 @@ test('known SDK failures are normalized without fake progress or success and ove
   } finally { wait.release(); clearTimeout(alive); }
 });
 
-test('canonical readystream preserves measured seconds and original school status without claiming recognition', () => {
-  const value = { ...statusFixture(), resourceType: 'readystream', durationSeconds: 1158.14, progressSeconds: 943.53,
+for (const resourceType of ['readystream', 'everlec']) test(`canonical ${resourceType} preserves measured seconds and original school status without claiming recognition`, () => {
+  const value = { ...statusFixture(), resourceType, durationSeconds: 1158.14, progressSeconds: 943.53,
     lastPositionSeconds: 943.539, progressPercent: 943.53 / 1158.14 * 100, completed: false, schoolAttendanceStatus: 'none' };
   const result = projectLearningStatus(value, '10', '90');
-  assert.equal(result.evidence?.resourceType, 'readystream'); assert.equal(result.evidence?.progressSeconds, 943.53);
+  assert.equal(result.evidence?.resourceType, resourceType); assert.equal(result.evidence?.progressSeconds, 943.53);
   assert.equal(result.evidence?.lastPositionSeconds, 943.539); assert.equal(result.evidence?.schoolAttendanceStatus, 'none');
   assert.equal(result.recognized, null); assert.equal(result.attendance, 'unknown');
-  for (const patch of [{progressPercent: 94.353}, {resourceType: 'Readystream'}, {recognized: true}])
+  for (const patch of [{progressPercent: 94.353}, {resourceType: resourceType.toUpperCase()}, {resourceType: `${resourceType} `}, {recognized: true}])
     assert.throws(() => projectLearningStatus({...value, ...patch}, '10', '90'));
 });

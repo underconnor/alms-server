@@ -45,8 +45,8 @@ test('a cancellation immediately blocks media/report authority while permitting 
   await createWorkerClaimValidator(store, 'final')(claim, new AbortController().signal);
 });
 
-test('trusted production bootstrap opts into proven Readystream admission without starting Chromium or querying a lease', async t => {
-  const f = await fixture({ workerOnly: true }); f.setType('readystream');
+for (const resourceType of ['readystream', 'everlec'] as const) test(`trusted production bootstrap opts into proven ${resourceType} admission without starting Chromium or querying a lease`, async t => {
+  const f = await fixture({ workerOnly: true }); f.setType(resourceType);
   t.mock.method(globalThis, 'fetch', f.fetcher);
   let databaseCalls = 0;
   const store = { ...f.store, pool: { query: () => { databaseCalls++; throw new Error('admission must not query worker leases'); } } };

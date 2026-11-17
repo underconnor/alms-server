@@ -7,12 +7,15 @@ import { createSchoolPlayback, type SchoolPlaybackClaim, type SchoolPlaybackInpu
 import { inspectPlaybackTerminationProof } from '../src/playback-termination.js';
 import { fixture, context, noop, observation, signal } from './helpers/school-video-fixture.js';
 import { readystreamXml } from './helpers/readystream-fixture.js';
+import { everlecXml } from './helpers/everlec-fixture.js';
 
 const target = { courseId: context.courseId, lectureId: context.moduleItemId };
 const ended = { ended: true as const, browserClosed: true as const, processExited: true as const };
+for (const resourceType of ['readystream', 'everlec'] as const) {
+const mediaXml = resourceType === 'everlec' ? everlecXml : readystreamXml;
 async function worker(options: { acknowledge?: (value: WorkerVideoReportAcknowledgement) => void } = {}) {
   const owner = randomUUID();
-  const school = await fixture({ workerOnly: true, allowReadystreamWorker: true, owner }); school.setType('readystream');
+  const school = await fixture({ workerOnly: true, allowReadystreamWorker: true, allowEverlecWorker: true, owner }); school.setType(resourceType);
   const claim: SchoolPlaybackClaim = { jobId: randomUUID(), userId: owner, ...target,
     acceptedGeneration: school.generation(), executionTokenHash: 'c'.repeat(64) };
   let current = true, leaseAvailable = true, admissions = 0, acquired = 0, released = 0, created = 0, disposed = 0;
@@ -47,7 +50,7 @@ async function worker(options: { acknowledge?: (value: WorkerVideoReportAcknowle
     prepare: () => adapter.preparePlayback({ userId: owner, claim }, target, signal()) };
 }
 
-test('trusted worker admission validates Readystream media without opening a lease, runtime or school report', async () => {
+test(`trusted worker admission validates ${resourceType} media without opening a lease, runtime or school report`, async () => {
   const f = await worker();
   assert.deepEqual(await f.admit(), { admitted: true });
   assert.deepEqual(f.counts(), { admissions: 1, acquired: 0, released: 0, created: 0, disposed: 0 });
@@ -56,7 +59,7 @@ test('trusted worker admission validates Readystream media without opening a lea
   assert.deepEqual(f.acknowledgements, []);
 });
 
-test('Readystream SDK reports start, five-minute update and actual terminal observation before fresh school reconciliation', async t => {
+test(`${resourceType} SDK reports start, five-minute update and actual terminal observation before fresh school reconciliation`, async t => {
   let now = 0; t.mock.method(performance, 'now', () => now);
   const f = await worker();
   f.setPlay(async (input, supplied) => {
@@ -73,14 +76,14 @@ test('Readystream SDK reports start, five-minute update and actual terminal obse
   await f.adapter.play(prepared, signal());
   assert.equal(f.school.counts().reports, 3); assert.equal(f.school.counts().starts, 0);
   assert.deepEqual(f.acknowledgements, ['playing', 'update', 'ended'].map(reportEvent => ({
-    event: 'worker_video_report_acknowledged', reportEvent, resourceType: 'readystream',
+    event: 'worker_video_report_acknowledged', reportEvent, resourceType,
     controllerState: reportEvent === 'ended' ? 'closed' : 'ready', transport: 'acknowledged' })));
   assert.ok(f.acknowledgements.every(Object.isFrozen));
   assert.doesNotMatch(JSON.stringify(f.acknowledgements), /synthetic|https|token|courseId|jobId|position|90000001/);
   f.school.setDetails({ attendance_data: { progress: 600, last_at: 600, completed: true, attendance_status: 'attendance' } });
   const fresh = await f.adapter.playbackLearningStatus(prepared, signal());
   assert.equal(fresh.progressPercent, 100); assert.equal(fresh.evidence?.completed, true);
-  assert.equal(fresh.evidence?.resourceType, 'readystream'); assert.equal(fresh.evidence?.schoolAttendanceStatus, 'attendance');
+  assert.equal(fresh.evidence?.resourceType, resourceType); assert.equal(fresh.evidence?.schoolAttendanceStatus, 'attendance');
   assert.equal(fresh.attendance, 'unknown'); assert.equal(fresh.recognized, null);
   assert.deepEqual(f.counts(), { admissions: 0, acquired: 1, released: 1, created: 1, disposed: 1 });
   inspectPlaybackTerminationProof(prepared.terminationProof!(), f.claim);
@@ -88,7 +91,7 @@ test('Readystream SDK reports start, five-minute update and actual terminal obse
   assert.equal(f.school.counts().reports, 3);
 });
 
-test('unknown Readystream acknowledgement never emits success, retries or frees the possibly active lease', async () => {
+test(`unknown ${resourceType} acknowledgement never emits success, retries or frees the possibly active lease`, async () => {
   const f = await worker(); f.school.setAck(false);
   f.setPlay(async (input, supplied) => { input.observe(observation); await input.report('playing', supplied); return ended; });
   const prepared = await f.prepare();
@@ -99,14 +102,14 @@ test('unknown Readystream acknowledgement never emits success, retries or frees 
   assert.equal((await f.adapter.playbackLearningStatus(prepared, signal())).recognized, null);
 });
 
-test('trusted worker still rejects unproven course, media, identity and enrollment before admission or execution', async () => {
+test(`trusted worker still rejects unproven course, media, identity and enrollment before admission or execution`, async () => {
   for (const mode of ['legacy', 'unknown', 'slides', 'duration', 'foreign', 'identity', 'enrollment']) {
     const f = await worker();
     if (mode === 'legacy') f.school.setPureCanvas(false);
     if (mode === 'unknown') f.school.setPureCanvas(null);
-    if (mode === 'slides') f.school.setXml(readystreamXml().replace('</story>', '<slides/></story>'));
-    if (mode === 'duration') f.school.setXml(readystreamXml('synthetic-video', 601));
-    if (mode === 'foreign') f.school.setXml(readystreamXml('other-video'));
+    if (mode === 'slides') f.school.setXml(mediaXml().replace('</story>', '<slides/></story>'));
+    if (mode === 'duration') f.school.setXml(mediaXml('synthetic-video', 601));
+    if (mode === 'foreign') f.school.setXml(mediaXml('other-video'));
     if (mode === 'identity') f.school.setProfile(false);
     if (mode === 'enrollment') f.school.setOwned(false);
     await assert.rejects(f.admit(), undefined, mode);
@@ -115,7 +118,7 @@ test('trusted worker still rejects unproven course, media, identity and enrollme
   }
 });
 
-test('Readystream owner lease conflict and changed school generation prevent every school report', async () => {
+test(`${resourceType} owner lease conflict and changed school generation prevent every school report`, async () => {
   const conflict = await worker(); conflict.conflict();
   await assert.rejects(conflict.prepare(), { code: 'PLAYBACK_BUSY' });
   assert.equal(conflict.counts().created, 0); assert.equal(conflict.counts().released, 0);
@@ -127,7 +130,7 @@ test('Readystream owner lease conflict and changed school generation prevent eve
   assert.equal(changed.school.counts().reports, 0); assert.deepEqual(changed.acknowledgements, []);
 });
 
-test('Readystream admission and execution cannot borrow another owner, target or revoked claim', async () => {
+test(`${resourceType} admission and execution cannot borrow another owner, target or revoked claim`, async () => {
   const f = await worker();
   await assert.rejects(f.adapter.authorizePlayback({ userId: randomUUID() }, target,
     { signal: signal(), validate: noop }), { code: 'SCHOOL_AUTH_REQUIRED' });
@@ -138,7 +141,7 @@ test('Readystream admission and execution cannot borrow another owner, target or
   assert.equal(f.school.counts().reports, 0); assert.deepEqual(f.acknowledgements, []);
 });
 
-test('a throwing acknowledged-report observer cannot change authority, terminal cleanup or school results', async t => {
+test(`a throwing acknowledged-report observer cannot change authority, terminal cleanup or school results`, async t => {
   let now = 0; t.mock.method(performance, 'now', () => now);
   const f = await worker({ acknowledge: () => { throw new Error('synthetic telemetry error'); } });
   f.setPlay(async (input, supplied) => {
@@ -154,3 +157,5 @@ test('a throwing acknowledged-report observer cannot change authority, terminal 
   assert.equal((await f.adapter.playbackLearningStatus(prepared, signal())).progressPercent, 100);
   assert.equal(f.acknowledgements.length, 2);
 });
+
+}

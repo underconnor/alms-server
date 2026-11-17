@@ -80,6 +80,22 @@ function fixture() {
   return { reader: create(), create, state, records, scoped, seed, saved, personal, retainedFile, replaceLogin };
 }
 
+test('previous Commons parsing caches refresh selected modules while retaining unrelated owner and course data', async t => {
+  t.mock.method(Date, 'now', () => 1_900_000_000_000);
+  const f = fixture();
+  await f.reader.readCourse('a', '10'); await f.reader.readCourse('a', '11'); await f.reader.readCourse('b', '10');
+  const old = f.saved('a', 'course:10')!;
+  old.value = { ...await f.reader.readCourse('a', '10'), commonsMappingVersion: 3 };
+  const retained = [structuredClone(f.saved('a', 'course:11')), structuredClone(f.saved('b', 'course:10'))];
+  f.state.ids.push('91'); const before = f.state.calls.modules;
+  const current = await f.create().readCourse('a', '10');
+  assert.equal(current.commonsMappingVersion, 4); assert.equal(current.modules[0]!.items.length, 2);
+  assert.equal(f.state.calls.modules, before + 1);
+  assert.deepEqual([f.saved('a', 'course:11'), f.saved('b', 'course:10')], retained);
+  assert.equal((await f.create().readCourse('a', '10')).modules[0]!.items.length, 2);
+  assert.equal(f.state.calls.modules, before + 1);
+});
+
 test('fresh assignment discovery replaces linked course and TODO metadata within the same TTL', async t => {
   t.mock.method(Date, 'now', () => 1_900_000_000_000);
   const f = fixture();

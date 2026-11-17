@@ -19,7 +19,7 @@ export interface VideoResponse {
 export interface PreparedVideoSource {
   contentId: string;
   mediaUrl: string;
-  resourceType?: 'readystream';
+  resourceType?: 'readystream' | 'everlec';
   validate(): Promise<void>;
 }
 type Range = { start: number; end: number | null } | { suffix: number };
@@ -59,8 +59,9 @@ function safeMediaUrl(source: PreparedVideoSource): string {
   const { mediaUrl, contentId } = source;
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(contentId) || /[\\%\x00-\x20\x7f]/.test(mediaUrl)) throw unavailable();
   let url: URL; try { url = new URL(mediaUrl); } catch { throw unavailable(); }
-  const readystream = source.resourceType === 'readystream';
+  const readystream = source.resourceType === 'readystream', everlec = source.resourceType === 'everlec';
   const prefixes = readystream ? [`/contents31/ssu1000001/${contentId}/contents/media_files/`]
+    : everlec ? [`/ssu-contents/contents31/ssu1000001/${contentId}/contents/media_files/`]
     : [`/ssu-contents/contents31/ssu1000001/${contentId}/contents/media_files/mobile/`,
       `/ssu-contents/contents29/ssu1000001/${contentId}/contents/media_files/mobile/`,
       `/ssu-contents/contents/ssu1000001/${contentId}/contents/media_files/`];

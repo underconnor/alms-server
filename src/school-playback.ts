@@ -41,7 +41,7 @@ export interface SchoolPlaybackRuntime<Source> {
 export type WorkerVideoReportAcknowledgement = Readonly<{
   event: 'worker_video_report_acknowledged';
   reportEvent: 'playing' | 'update' | 'ended';
-  resourceType: 'movie' | 'readystream';
+  resourceType: 'movie' | 'readystream' | 'everlec';
   controllerState: 'ready' | 'closed';
   transport: 'acknowledged';
 }>;
@@ -265,7 +265,7 @@ export function createSchoolPlayback<Source, Admission, FinalProof>(dependencies
                 try { dependencies.progressReportAcknowledged?.(claim, event); } catch {}
                 // An observer cannot alter report authority, uncertainty, cleanup or retry policy.
                 try { dependencies.reportAcknowledged?.(Object.freeze({ event: 'worker_video_report_acknowledged',
-                  reportEvent: event, resourceType: media.resourceType === 'readystream' ? 'readystream' : 'movie',
+                  reportEvent: event, resourceType: media.resourceType ?? 'movie',
                   controllerState: result.state, transport: 'acknowledged' })); } catch {}
                 })();
                 owned.callbacks.add(callback);
