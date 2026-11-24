@@ -6,6 +6,7 @@ import { AppError } from './errors.js';
 import { normalizeSchoolReadError } from './school-read.js';
 import { withSchoolSessionLock, type SchoolSessionLockRunner } from './school-session-lock.js';
 import { schoolCacheTtl, type SchoolReadCache } from './school-read-cache.js';
+import { saintIdentityPage, verifySaintIdentityWithReread } from './saint-identity.js';
 
 const stateSchema = z.object({ version: z.literal(1), generation: z.uuid().optional(), identity: z.object({ studentId: z.string().regex(/^\d{6,12}$/) }).passthrough(), jar: z.unknown() }).passthrough();
 type Store = {
@@ -24,8 +25,8 @@ const open: Connector = async (state, signal) => {
     return response;
   } : undefined;
   const http = SchoolHttpClient.fromSessionJar(state.jar, scopedFetch);
-  const portal = await http.get('https://saint.ssu.ac.kr/webSSUMain/main_student.jsp');
-  parseUsaintIdentity(portal.body, state.identity.studentId);
+  const studentId = state.identity.studentId;
+  await verifySaintIdentityWithReread(http, studentId, async () => parseUsaintIdentity((await http.get(saintIdentityPage)).body, studentId));
   const timetable = await new SaintTimetableClient(http).read();
   return { timetable, jar: await http.jar.serialize() };
 };
