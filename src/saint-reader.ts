@@ -37,6 +37,7 @@ export function createSaintReader(store: Store, key: Buffer, connect: Connector 
   return { timetable(owner) {
     const active = pending.get(owner);
     if (active) return active;
+    let attemptedGeneration: string | undefined, attemptedSchoolState: string | undefined;
     const result = withSchoolSessionLock(owner, async signal => {
       signal.throwIfAborted();
       const encrypted = await store.getEncryptedSchoolSession(owner, 'ssu');
@@ -46,6 +47,7 @@ export function createSaintReader(store: Store, key: Buffer, connect: Connector 
       catch { throw new AppError(401, 'SCHOOL_AUTH_REQUIRED', '저장된 학교 세션을 확인할 수 없습니다. 다시 로그인해 주세요.'); }
       const existing = cache.get(owner);
       const generation = state.generation ?? randomUUID();
+      attemptedGeneration = generation; attemptedSchoolState = encrypted;
       const scope = (encryptedSession: string) => ({ owner, provider: 'ssu', generation, resource: 'saint:timetable', encryptedSession });
       const currentSession = async (expected: string) => {
         signal.throwIfAborted();
@@ -68,6 +70,7 @@ export function createSaintReader(store: Store, key: Buffer, connect: Connector 
       if (!await store.replaceEncryptedSchoolSession(owner, 'ssu', encrypted, updated)) {
         throw new AppError(409, 'SCHOOL_SESSION_CHANGED', '학교 세션이 갱신됐습니다. 다시 조회해 주세요.');
       }
+      attemptedSchoolState = updated;
       const term = `${response.timetable.selectedYear}년 ${semesters[response.timetable.selectedSemester]}`;
       const entries = response.timetable.entries.map((entry, index) => ({ ...entry, courseId: null,
         id: createHash('sha256').update(JSON.stringify([term, entry, index])).digest('hex').slice(0, 24) }));
@@ -78,7 +81,19 @@ export function createSaintReader(store: Store, key: Buffer, connect: Connector 
       if (cache.size >= 100) cache.delete(cache.keys().next().value!);
       cache.set(owner, { generation, expiresAt: Date.now() + 60_000, value });
       return value;
-    }, { coordinate: store.runWithSchoolSessionLock }).catch(async error => { cache.delete(owner); if (durable) await durable.delete(owner, 'ssu', 'saint:timetable').catch(() => {}); return normalizeSchoolReadError(error); }).finally(() => { pending.delete(owner); });
+    }, { coordinate: store.runWithSchoolSessionLock }).catch(async error => {
+      // Coordination failures say nothing about cached school data. A delayed source
+      // failure may only remove its own generation while its exact school seal is current.
+      const coordinationFailure = error instanceof AppError
+        && ['SCHOOL_SESSION_BUSY', 'SCHOOL_SESSION_LOCK_LOST', 'SCHOOL_SESSION_LOCK_REENTRANT'].includes(error.code);
+      if (!coordinationFailure && attemptedGeneration && attemptedSchoolState) {
+        let current = false;
+        try { current = await store.getEncryptedSchoolSession(owner, 'ssu') === attemptedSchoolState; } catch { /* Preserve data when authority cannot be checked. */ }
+        if (current && cache.get(owner)?.generation === attemptedGeneration) cache.delete(owner);
+        if (durable) await durable.delete(owner, 'ssu', 'saint:timetable', attemptedGeneration, attemptedSchoolState).catch(() => {});
+      }
+      return normalizeSchoolReadError(error);
+    }).finally(() => { pending.delete(owner); });
     pending.set(owner, result);
     return result;
   } };
