@@ -7,6 +7,7 @@ import { createCombinedDashboard } from './school-dashboard.js';
 import type { SaintReader } from './saint-reader.js';
 import { createLearningxReads, type LearningxReader } from './school-read.js';
 import { authFailureDiagnostic, rememberAuthFailure, rememberAuthContext, createAuthHttpTrace, type AuthFailureStage } from './auth-diagnostics.js';
+import { verifySaintIdentityWithReread } from './saint-identity.js';
 
 type AuthOperations = { prepare: typeof prepareLmsSso; exchange: typeof exchangeLmsSso; verify: typeof verifySchoolSso };
 const exchangeStage = z.enum(['preparation','certificate','canvas_frame','canvas_form','canvas_submit','bootstrap']);
@@ -98,7 +99,7 @@ export function createSchoolProvider(enabled: boolean, reader?: LearningxReader,
           }
           if (frameEvidence) lmsExchange.canvasFrameEvidence = frameEvidence;
           stage = 'school_identity';
-          const identity=await operations.verify(client,artifact);
+          const identity=await verifySaintIdentityWithReread(client, artifact.sIdno, () => operations.verify(client,artifact));
           stage = 'provider_session';
           const verified = {subject:identity.studentId,displayName:identity.displayName,
             schoolSession:{version:1,generation:randomUUID(),identity,jar:await client.jar.serialize(),lmsExchange}};

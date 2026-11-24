@@ -33,20 +33,53 @@ export function currentSchedule(entries: Schedule[], now: Date): Schedule | null
   const time = `${part('hour')}:${part('minute')}`;
   return entries.find(entry => entry.dayOfWeek === weekday && entry.startTime <= time && time < entry.endTime) ?? null;
 }
+
+const sourceReadTimeout = () => new AppError(502, 'SCHOOL_UPSTREAM_UNAVAILABLE', '일부 학교 정보를 불러오지 못했습니다. 다시 조회해 주세요.');
+
+// Once one source is usable, give the other a bounded window to complete it.
+// This only bounds what the response waits for; each connector still owns its
+// lock, deadline and error handling until its pending operation settles.
+async function settleDashboardOverview<A, B>(first: Promise<A>, second: Promise<B>, waitMs: number) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let done = false;
+  const timeout = new Promise<never>((_, reject) => {
+    void Promise.any([first, second]).then(() => {
+      if (!done) timer = setTimeout(() => reject(sourceReadTimeout()), waitMs);
+    }, () => {});
+  });
+  try { return await Promise.allSettled([Promise.race([first, timeout]), Promise.race([second, timeout])]); }
+  finally { done = true; clearTimeout(timer); }
+}
+
+async function optionalCatalog(lms: DashboardReader, owner: string, waitMs: number) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(() => lms.catalog(owner)).catch(() => null),
+      new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), waitMs); }),
+    ]);
+  } finally { clearTimeout(timer); }
+}
+
 /** Timetable remains usable when LMS fails; each empty section has explicit source availability. */
-export function createCombinedDashboard(saint: SaintReader, lms?: DashboardReader, now = () => new Date()): Pick<SchoolProvider, 'dashboard' | 'timetable'> {
+export function createCombinedDashboard(saint: SaintReader, lms?: DashboardReader, now = () => new Date(),
+  waits = { optionalCatalogMs: 2_000, overviewSourceMs: 5_000 }): Pick<SchoolProvider, 'dashboard' | 'timetable'> {
   return {
     timetable: async context => {
-      const [value, catalog] = await Promise.all([saint.timetable(context.userId), lms?.catalog(context.userId).catch(() => null)]);
+      const value = await saint.timetable(context.userId);
+      const catalog = lms && value.entries.length ? await optionalCatalog(lms, context.userId, waits.optionalCatalogMs) : null;
       return { items: mapScheduleCourses(value.entries, catalog?.courses ?? [], value.term), term: value.term };
     },
     dashboard: async (context, options) => {
       const overview = options?.detail === 'overview';
-      const [timetable, catalog] = await Promise.allSettled([
-        saint.timetable(context.userId),
-        lms ? overview ? lms.catalog(context.userId).then(value => ({ ...value, upcomingTasks: [], coursesAvailable: true, tasksAvailable: false }))
-          : readLmsDashboard(lms, context.userId) : Promise.reject(new AppError(503, 'SCHOOL_PROVIDER_UNAVAILABLE', 'LMS 조회를 준비하고 있습니다.')),
-      ]);
+      const saintRead = Promise.resolve().then(() => saint.timetable(context.userId));
+      const lmsRead = Promise.resolve().then(() => {
+        if (!lms) throw new AppError(503, 'SCHOOL_PROVIDER_UNAVAILABLE', 'LMS 조회를 준비하고 있습니다.');
+        return overview ? lms.catalog(context.userId).then(value => ({ ...value, upcomingTasks: [], coursesAvailable: true, tasksAvailable: false }))
+          : readLmsDashboard(lms, context.userId);
+      });
+      const [timetable, catalog] = overview ? await settleDashboardOverview(saintRead, lmsRead, waits.overviewSourceMs)
+        : await Promise.allSettled([saintRead, lmsRead]);
       if (timetable.status === 'rejected' && catalog.status === 'rejected') {
         if ([timetable.reason, catalog.reason].some(error => sourceError(error) === 'SCHOOL_AUTH_REQUIRED'))
           throw new AppError(401, 'SCHOOL_AUTH_REQUIRED', '학교 인증을 다시 확인해야 합니다. 통합 로그인으로 이어서 이용해 주세요.');

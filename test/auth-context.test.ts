@@ -70,8 +70,9 @@ const studentId = '90000001', artifact = {sIdno: studentId, sToken: 'private-cal
 const emptyPortalMarkup = {identityContainerPresent: false, studentRowPresent: false, studentValuePresent: false,
   nameValuePresent: false, passwordFormPresent: false};
 const identityHtml = `<div class="main_box09"><span>Synthetic님</span></div><ul class="main_box09_con"><li><dt>학번</dt><strong>${studentId}</strong></li></ul>`;
-async function callbackFixture(options: {exchangeFails?: boolean; identitySucceeds?: boolean; issueFails?: boolean; ssoStatus?: number; portalHtml?: string} = {}) {
+async function callbackFixture(options: {exchangeFails?: boolean; identitySucceeds?: boolean; issueFails?: boolean; ssoStatus?: number; portalHtml?: string; secondPortalHtml?: string; secondPortalRedirect?: boolean} = {}) {
   const calls: Array<{path: string; method: string}> = [], records: any[] = []; let issued = 0, consumed = false;
+  let portalReads = 0;
   const provider = createSchoolProvider(true, undefined, {
     prepare: async http => {await http.get('https://lms.ssu.ac.kr/mypage');},
     exchange: async http => {
@@ -81,10 +82,14 @@ async function callbackFixture(options: {exchangeFails?: boolean; identitySuccee
     },
     verify: verifySchoolSso,
   }, undefined, async (input, init) => {
-    const path = new URL(String(input)).pathname; calls.push({path, method: init?.method ?? 'GET'});
+    const target = new URL(String(input)), path = target.pathname; calls.push({path, method: init?.method ?? 'GET'});
     const status = path === '/webSSO/sso.jsp' ? options.ssoStatus ?? 200 : 200;
-    return new Response(path === '/webSSUMain/main_student.jsp' ? options.identitySucceeds ? identityHtml : options.portalHtml ?? 'private-school-body' : 'private-school-body',
-      {status, headers: {'content-type': 'text/html'}});
+    if (path !== '/webSSUMain/main_student.jsp') return new Response('private-school-body', {status, headers: {'content-type': 'text/html'}});
+    portalReads++;
+    assert.equal(target.search, '');
+    if (portalReads === 2 && options.secondPortalRedirect) return new Response(null, {status: 302, headers: {location: 'https://saint.ssu.ac.kr/webSSO/sso.jsp?discard=private-redirect'}});
+    return new Response(portalReads === 2 && options.secondPortalHtml !== undefined ? options.secondPortalHtml
+      : options.identitySucceeds ? identityHtml : options.portalHtml ?? 'private-school-body', {status, headers: {'content-type': 'text/html'}});
   });
   const store = {consumeLoginAttempt: async () => {if (consumed) return false; consumed = true; return true;},
     issueVerifiedSession: async () => {issued++; if (options.issueFails) throw new Error('private-database-error');
@@ -156,6 +161,31 @@ test('SSO HTTP failure is classified before portal parsing and does not repeat a
     assert.equal(f.records[0].schoolTrace.at(-1).status, 403); assert.equal(f.records[0].fetchDestination, 'empty');
     assert.deepEqual(f.calls.map(row => row.path), ['/mypage', '/login/canvas', '/webSSO/sso.jsp']);
   } finally {await f.app.close();}
+});
+
+test('the observed interim portal shell gets one fixed identity GET, never another SSO exchange', async () => {
+  const shell = '<script>if (shouldNavigate) { top.location.href="/webSSO/sso.jsp?discard=private-script"; }</script>';
+  for (const [expected, next] of [ [303, identityHtml], [401, shell], [401, identityHtml.replace(studentId, '90000002')] ] as const) {
+    const f = await callbackFixture({ portalHtml: shell, secondPortalHtml: next });
+    try {
+      const result = await f.callback('application/json', 'document');
+      assert.equal(result.statusCode, expected);
+      assert.equal(f.issued(), expected === 303 ? 1 : 0);
+      assert.deepEqual(f.calls.slice(-3), [ {path: '/webSSO/sso.jsp', method: 'GET'},
+        {path: '/webSSUMain/main_student.jsp', method: 'GET'}, {path: '/webSSUMain/main_student.jsp', method: 'GET'} ]);
+      assert.equal(f.calls.filter(call => call.path === '/webSSO/sso.jsp').length, 1);
+      assert.doesNotMatch(result.body + JSON.stringify(f.records), /private-script|90000002/);
+    } finally { await f.app.close(); }
+  }
+  const redirected = await callbackFixture({portalHtml: shell, secondPortalRedirect: true});
+  try {
+    const result = await redirected.callback('application/json', 'document');
+    assert.equal(result.statusCode, 502);
+    assert.equal(redirected.issued(), 0);
+    assert.equal(redirected.records[0].verificationStage, 'portal_page');
+    assert.equal(redirected.calls.filter(call => call.path === '/webSSO/sso.jsp').length, 1);
+    assert.doesNotMatch(result.body + JSON.stringify(redirected.records), /private-redirect/);
+  } finally { await redirected.app.close(); }
 });
 
 test('provider success context survives session issue failure but is absent from successful response/logs', async () => {
